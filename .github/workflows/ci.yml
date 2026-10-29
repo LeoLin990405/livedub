@@ -1,0 +1,47 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: test (node ${{ matrix.node }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node: [22, 24]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+
+      - name: Syntax check (all JS)
+        run: node scripts/lint.mjs
+
+      - name: Unit tests (offline, mock end-to-end)
+        run: npm test
+
+      - name: Doctor (environment probe, non-fatal)
+        run: node scripts/doctor.mjs --json || true
+
+      - name: Contract docs present
+        run: test -f docs/CONTRACTS.md && test -f docs/ARCHITECTURE.md && test -f LICENSE
+
+  secret-scan:
+    name: secret scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Basic leak scan (keys / personal paths)
+        run: |
+          set -e
+          ! git grep -nE 'sk-[A-Za-z0-9]{20,}|X-Api-Key:[[:space:]]*[A-Za-z0-9-]{20,}|/Users/[A-Za-z0-9._-]+/' -- . \
+            ':!*.md' ':!*.srt' ':!*.jsonl' ':!demo/**' ':!models/**'

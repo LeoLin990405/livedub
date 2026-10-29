@@ -85,7 +85,7 @@
 | `translation` | `id, text, final:true` | 该句译文最终 |
 | `dub` | `id, seq, startMs, sampleRate, format:"s16le", pcm:"<base64>", durationMs, voiceId, final:boolean` | 配音音频块；客户端按 startMs 尽量对齐播放，来不及就立即播 |
 | `voice` | `mode:"clone"\|"preset", voiceId, degraded?, reason?` | 音色切换/降级通知 |
-| `metrics` | `id, asrFinalMs, mtFirstMs, mtDoneMs, ttsFirstMs, e2eLagMs, ...` | 每句一条（可开关，默认开） |
+| `metrics` | `id, asrFinalMs, mtFirstMs, mtDoneMs, ttsFirstMs, e2eLagMs, e2eFromStartMs, ...` | 每句一条。定义：asrFinalMs=语音结束→ASR final；mtFirstMs=ASR 完成→译文首字；ttsFirstMs=翻译完成→配音首包；**e2eLagMs=语音结束→配音首包可播**（用户感知的同传滞后）；e2eFromStartMs 从语音开始算（诊断用） |
 | `error` | `scope:"asr"\|"translate"\|"tts"\|"voice"\|"session"\|"server", message, recoverable, segmentId?, code?` | 可恢复错误不终止会话 |
 | `pong` | `t` | 回 ping |
 | `bye` | `reason` | 引擎关闭会话 |
@@ -97,12 +97,14 @@
 
 ```js
 // ---- ASR ----
-createAsr({ config, log, onEvent }) -> {
+createAsr({ config, log, onEvent, onError? }) -> {
   name: string,
   push(pcm: Buffer, tMs: number): Promise<void>,   // 引擎收到一段音频就调用（顺序调用，不并发）
   flush(): Promise<void>,                          // 会话结束/暂停时把剩余语音落成 final
   close(): Promise<void>,
+  warmup?(): Promise<void>,                        // 可选：会话启动时后台预热（失败不致命）
 }
+// 额外可选：onError(info) 上报可恢复的识别错误；Session 会转成 error(scope:"asr") 事件，不中断会话。
 // onEvent 事件：
 //   { type:'partial', text, t0Ms, t1Ms }
 //   { type:'final',   text, t0Ms, t1Ms, lang }
@@ -117,9 +119,19 @@ createTranslator({ config, log }) -> {
 // onPartial(textSoFar) 每收到一段增量就调用；最终返回完整译文。
 // 失败必须 throw；由 Session 决定链式降级。
 
+// ---- 子句提取（翻译流式 x TTS 重叠，engine/translate/index.mjs 导出）----
+createClauseExtractor({ minClauseChars = 8, maxChunkChars = 80, stabilityMs = 250 } = {}) -> {
+  push(cumulativeText: string): string[],   // 输入覆盖式累计译文，返回本次新确认「稳定」的子句（0~N 个）
+  flush(finalText?: string): string[],      // 翻译结束时返回剩余未发子句；push+flush 必须覆盖最终译文
+  reset(): void,
+}
+// pipeline 在每个 translation partial 上调用 push，把已稳定子句立即送 TTS（不等整句翻译完成）；
+// 翻译完成后 flush 剩余子句。要求：不重复、不回退、不切断数字/代码/URL。
+
 // ---- TTS ----
 createTts({ config, log, fetchImpl? }) -> {
   name: string,
+  warmup?(): Promise<void>,                 // 可选：后台预热 provider/音色（失败不致命）
   synthesize({ text, voiceId, speed, signal }) -> Promise<{ pcm: Buffer, sampleRate: number, format:'s16le', durationMs?, voiceId? }>,
   synthesizeStream?({ text, voiceId, speed, signal }) -> AsyncIterable<{ pcm: Buffer, sampleRate, format:'s16le', durationMs? }>,
   listVoices() -> Promise<Array<{ id, label, gender?, cloned? }>>,
@@ -155,9 +167,13 @@ createScheduler({ config, log }) -> {
 
 ## 5. 配置（`config/livedub.config.json`，字段名即契约）
 
-关键字段：`asr.whisper.{bin,models,language,threads,vad.*,partial.*}`、`translate.{provider,chain,contextSegments,maxTokens,timeoutMs,style}`、
-`tts.{provider,model,sampleRate,voiceMode,presetVoices,clone.*,fallbacks,chunk.*}`、`dub.{enabled,duckOriginal,startBufferMs,maxLagMs,maxAccelerate}`、
+关键字段：`server.maxSessions`、`asr.whisper.{bin,models,language,threads,vad.*,partial.*,speculativeFinal}`、`translate.{provider,chain,contextSegments,maxTokens,timeoutMs,style,clauseStabilityMs}`、
+`tts.{provider,model,sampleRate,voiceMode,presetVoices,clone.*,fallbacks,chunk.*,cache}`、`dub.{enabled,duckOriginal,startBufferMs,maxLagMs,maxAccelerate,overlapStreaming}`、
 `subs.{bilingual,maxCps,maxCharsPerLine}`、`glossary`。provider 凭据从 `~/.sayless/config.json` 的 `providers.<name>` 只读解析（`config.mjs#resolveProvider`）。
+
+延迟相关默认值（v0.2 实测结论）：`asr.whisper.partial.enabled=false`（partial 会占用 whisper 串行队列，实测 +0.8s e2e）、
+`asr.whisper.speculativeFinal=false`（推理 1.4s ≫ 静音窗口，实测负收益）、`dub.overlapStreaming=true`；
+`LIVEDUB_PROFILE=fast` 会叠加 `config/livedub.fast.json`（small ASR 模型）。
 
 ## 6. 测试 & 质量
 

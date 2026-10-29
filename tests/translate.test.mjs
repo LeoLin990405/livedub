@@ -10,7 +10,12 @@ import path from 'node:path';
 // 指向不存在的目录即可保证单测完全不依赖本机 provider 凭据。
 process.env.SAYLESS_DIR = path.join('/tmp', `livedub-test-sayless-${process.pid}-missing`);
 
-import { createTranslator, buildTranslationMessages, cleanTranslation } from '../engine/translate/index.mjs';
+import {
+  createTranslator,
+  buildTranslationMessages,
+  cleanTranslation,
+  createClauseExtractor,
+} from '../engine/translate/index.mjs';
 import {
   formatSrt,
   formatSrtTime,
@@ -65,6 +70,20 @@ function responseFromByteChunks(byteChunks, { contentType = 'text/event-stream' 
     },
   });
   return new Response(stream, { status: 200, headers: { 'content-type': contentType } });
+}
+
+/** 按固定间隔逐帧吐 SSE，模拟真实流式节奏（用于「翻译流 -> 子句提取」集成时序测试） */
+function delayedSseResponse(parts, { delayMs = 0 } = {}) {
+  const stream = new ReadableStream({
+    async start(controller) {
+      for (let index = 0; index < parts.length; index += 1) {
+        if (index > 0 && delayMs > 0) await new Promise((resolve) => setTimeout(resolve, delayMs));
+        controller.enqueue(encoder.encode(parts[index]));
+      }
+      controller.close();
+    },
+  });
+  return new Response(stream, { status: 200, headers: { 'content-type': 'text/event-stream' } });
 }
 
 function recordFetch(handler) {
@@ -275,6 +294,12 @@ test('prompt 包含术语表强约束、最近双语上下文与教学同传要�
   assert.match(system.content, /术语表/);
   assert.match(system.content, /TTS/);
   assert.match(system.content, /只输出译文/);
+  // v0.2 口语化迭代：短句、去书面连接词、更严格保术语/公式/代码
+  assert.match(system.content, /短句/);
+  assert.match(system.content, /书面连接词/);
+  assert.match(system.content, /原样保留/);
+  assert.match(system.content, /不改大小写/);
+  assert.match(system.content, /逐字/);
 
   assert.equal(user.role, 'user');
   assert.match(user.content, /gradient descent = 梯度下降/);
@@ -534,6 +559,232 @@ test('空 onPartial / 缺失字段不崩溃', async () => {
     model: '',
     provider: 'deepseek',
   });
+});
+
+/* ------------------------------------------------------------------ *
+ * 增量子句提取器（v0.2：翻译流式输出时提前给 TTS 喂稳定子句）
+ * ------------------------------------------------------------------ */
+
+test('createClauseExtractor：契约形状（push/flush/reset）与默认参数', () => {
+  const extractor = createClauseExtractor();
+  assert.equal(typeof extractor.push, 'function');
+  assert.equal(typeof extractor.flush, 'function');
+  assert.equal(typeof extractor.reset, 'function');
+  assert.deepEqual(extractor.push(''), []);
+  assert.deepEqual(extractor.flush(), []);
+  assert.deepEqual(extractor.push('没有句末标点的半句'), []);
+  assert.deepEqual(extractor.flush(), ['没有句末标点的半句']);
+});
+
+test('extractor：文本连续稳定 stabilityMs 后才确认，重复 push 不重复发', () => {
+  let clock = 1000;
+  const extractor = createClauseExtractor({ stabilityMs: 250, now: () => clock });
+  const sentence = '今天我们来学习梯度下降。';
+
+  assert.deepEqual(extractor.push(sentence), []);
+  clock += 100;
+  assert.deepEqual(extractor.push(sentence), [], '未满 250ms 不确认');
+  clock += 200; // 距首次看到 300ms
+  assert.deepEqual(extractor.push(sentence), [sentence]);
+  assert.deepEqual(extractor.push(sentence), [], '已发子句不得重复');
+  clock += 500;
+  assert.deepEqual(extractor.push(sentence), []);
+  assert.deepEqual(extractor.flush(sentence), []);
+});
+
+test('extractor：流式增长时稳定前缀先确认，后续子句各自到点确认（0~N 个）', () => {
+  let clock = 0;
+  const extractor = createClauseExtractor({ stabilityMs: 250, now: () => clock });
+  const full = '今天我们来学习梯度下降。它是一种一阶迭代优化算法。我们反复朝着梯度的反方向迈步。';
+
+  assert.deepEqual(extractor.push('今天我们来学习梯度下降。'), []); // t=0 首次看到第一句
+  clock = 100;
+  assert.deepEqual(extractor.push(full), [], '后续追加不影响第一句的稳定计时，但未满 250ms');
+  clock = 300;
+  assert.deepEqual(extractor.push(full), ['今天我们来学习梯度下降。']);
+  clock = 600;
+  assert.deepEqual(extractor.push(full), ['它是一种一阶迭代优化算法。']);
+  clock = 900;
+  assert.deepEqual(extractor.push(full), ['我们反复朝着梯度的反方向迈步。']);
+  assert.deepEqual(extractor.push(full), []);
+  assert.deepEqual(extractor.flush(full), []);
+});
+
+test('extractor：partial 改写安全（不重复已发、不吐旧子句），flush 补齐尾巴', () => {
+  let clock = 0;
+  const extractor = createClauseExtractor({ stabilityMs: 100, minClauseChars: 8, now: () => clock });
+
+  clock = 0;
+  assert.deepEqual(extractor.push('今天我们来学习梯度下降。'), []);
+  clock = 200;
+  assert.deepEqual(extractor.push('今天我们来学习梯度下降。'), ['今天我们来学习梯度下降。']);
+
+  // 累计文本被改写：游标回退到公共前缀，不重复发已发内容；「法。」太短不单独确认
+  clock = 300;
+  assert.deepEqual(extractor.push('今天我们来学习梯度下降法。'), []);
+  clock = 500;
+  assert.deepEqual(extractor.push('今天我们来学习梯度下降法。'), []);
+  assert.deepEqual(extractor.flush('今天我们来学习梯度下降法。'), ['法。']);
+  assert.deepEqual(extractor.flush('今天我们来学习梯度下降法。'), [], '重复 flush 必须返回空');
+});
+
+test('extractor：累计文本变短（清洗截断）不重复发、不崩溃', () => {
+  let clock = 0;
+  const extractor = createClauseExtractor({ stabilityMs: 0, minClauseChars: 8, now: () => clock });
+  const full = '今天我们来学习梯度下降。它是优化算法。';
+  assert.deepEqual(extractor.push(full), ['今天我们来学习梯度下降。']);
+  // 清洗把尾部注释剥掉，累计文本变短（是已发内容的前缀）：不重复发、不崩溃
+  assert.deepEqual(extractor.push('今天我们来学习梯度下降'), []);
+  // 最终文本完整时，flush 只补未发尾巴（第一句不重复）
+  assert.deepEqual(extractor.flush(full), ['它是优化算法。']);
+  assert.deepEqual(extractor.flush(full), [], '重复 flush 必须返回空');
+});
+
+test('extractor：数字/代码标识符/URL 内部的点不当作句末，不切断', () => {
+  let clock = 0;
+  const extractor = createClauseExtractor({ stabilityMs: 0, minClauseChars: 8, now: () => clock });
+  const text =
+    '我们调用 msToSamples 处理 1,000 个样本，准确率 3.14%，详见 https://example.com/a.b。';
+  assert.deepEqual(extractor.push(text), [text], '只在一整句末尾确认，不在代码/数字/URL 处断句');
+
+  clock = 0;
+  const english = createClauseExtractor({ stabilityMs: 0, minClauseChars: 6, now: () => clock });
+  assert.deepEqual(english.push('Run msToSamples on node.js, then open https://example.com/a.b. It is safe!'), [
+    'Run msToSamples on node.js, then open https://example.com/a.b.',
+    'It is safe!',
+  ]);
+});
+
+test('extractor：中英句末标点确认，逗号/顿号不确认，短子句合并到后一句', () => {
+  let clock = 0;
+  const make = (options = {}) => createClauseExtractor({ stabilityMs: 0, now: () => clock, ...options });
+
+  const twoClauses = make({ minClauseChars: 8 });
+  assert.deepEqual(twoClauses.push('第一句话写得比较长。第二句话写得也不短。'), [
+    '第一句话写得比较长。',
+    '第二句话写得也不短。',
+  ]);
+
+  const shortFirst = make({ minClauseChars: 8 });
+  assert.deepEqual(shortFirst.push('好。今天我们来学习梯度下降。'), ['好。今天我们来学习梯度下降。']);
+
+  const commaInside = make({ minClauseChars: 8 });
+  assert.deepEqual(commaInside.push('今天我们学习梯度下降，然后学习反向传播。'), [
+    '今天我们学习梯度下降，然后学习反向传播。',
+  ]);
+
+  const english = make({ minClauseChars: 3 });
+  assert.deepEqual(english.push('First do this; then do that.'), ['First do this;', 'then do that.']);
+
+  const question = make({ minClauseChars: 3 });
+  assert.deepEqual(question.push('真的吗？太好了！'), ['真的吗？', '太好了！']);
+
+  const ellipsis = make({ minClauseChars: 3 });
+  assert.deepEqual(ellipsis.push('等一下……然后继续。'), ['等一下……', '然后继续。']);
+
+  // 短子句不足 minClauseChars 时留给 flush
+  const shortOnly = make({ minClauseChars: 8 });
+  assert.deepEqual(shortOnly.push('好。'), []);
+  assert.deepEqual(shortOnly.flush('好。'), ['好。']);
+});
+
+test('extractor：超长子句按标点/空格兜底切块，原子（数字/代码/URL）不被拆开', () => {
+  let clock = 0;
+  const extractor = createClauseExtractor({ stabilityMs: 0, minClauseChars: 8, maxChunkChars: 32, now: () => clock });
+  const text =
+    '我们调用 msToSamples 处理 1,000 个样本，准确率 3.14%，详见 https://example.com/a.b，然后继续训练模型。';
+  const chunks = extractor.push(text);
+  assert.ok(chunks.length > 1, '超长句应被切成多块');
+  for (const chunk of chunks) assert.ok(Array.from(chunk).length <= 34, `chunk 过长（标点悬挂允许 +2）: ${chunk}`);
+  for (const atom of ['msToSamples', '1,000', '3.14%', 'https://example.com/a.b']) {
+    assert.ok(chunks.some((chunk) => chunk.includes(atom)), `${atom} 应完整落在某一块`);
+  }
+  assert.equal(chunks.join('').replace(/\s+/g, ''), text.replace(/\s+/g, ''), '切块不丢内容');
+
+  // 单个原子本身超过 maxChunkChars（超长 URL）才硬拆兜底
+  const hardSplit = createClauseExtractor({ stabilityMs: 0, minClauseChars: 8, maxChunkChars: 12, now: () => clock });
+  const urlText = '参考 https://example.com/very/long/path/that/exceeds。';
+  const urlChunks = hardSplit.push(urlText);
+  for (const chunk of urlChunks) assert.ok(Array.from(chunk).length <= 14, `硬拆块过长: ${chunk}`);
+  assert.equal(urlChunks.join('').replace(/\s+/g, ''), urlText.replace(/\s+/g, ''), '兜底切块不丢内容');
+});
+
+test('extractor：push 发出的 + flush 的覆盖最终译文（含无 finalText 的 flush）', () => {
+  let clock = 0;
+  const extractor = createClauseExtractor({ stabilityMs: 0, minClauseChars: 8, now: () => clock });
+  const final =
+    '梯度下降是一种一阶迭代优化算法，它反复沿着梯度的反方向迈步。学习率控制每一步的大小，取值太大会让训练发散；取值太小又会让收敛变慢。';
+  const chunks = [];
+  const chars = Array.from(final);
+  for (let i = 1; i <= chars.length; i += 3) {
+    clock += 10;
+    chunks.push(...extractor.push(chars.slice(0, i).join('')));
+  }
+  clock += 10;
+  chunks.push(...extractor.push(final));
+  clock += 10;
+  chunks.push(...extractor.flush(final));
+
+  const squash = (value) => value.replace(/\s+/g, '');
+  assert.equal(squash(chunks.join('')), squash(final), 'push+flush 必须覆盖最终译文');
+  assert.deepEqual(extractor.flush(final), []);
+
+  // 省略 finalText 时 flush 用最近一次 push 的累计文本
+  let clock2 = 0;
+  const noFinal = createClauseExtractor({ stabilityMs: 0, minClauseChars: 8, now: () => clock2 });
+  assert.deepEqual(noFinal.push('梯度下降是一种一阶迭代优化算法，它反复迈步。学习率'), [
+    '梯度下降是一种一阶迭代优化算法，它反复迈步。',
+  ]);
+  assert.deepEqual(noFinal.flush(), ['学习率']);
+});
+
+test('extractor：reset 后可以复用（上一句状态不串场）', () => {
+  let clock = 0;
+  const extractor = createClauseExtractor({ stabilityMs: 0, minClauseChars: 8, now: () => clock });
+  assert.deepEqual(extractor.push('第一句话写得比较长。'), ['第一句话写得比较长。']);
+  extractor.reset();
+  assert.deepEqual(extractor.push('第二句话写得也比较长。'), ['第二句话写得也比较长。']);
+  extractor.reset();
+  assert.deepEqual(extractor.flush('第三句话可以直接输出。'), ['第三句话可以直接输出。']);
+});
+
+test('extractor：默认使用 Date.now 时钟（不注入 now 也能按真实时间稳定）', async () => {
+  const extractor = createClauseExtractor({ stabilityMs: 20, minClauseChars: 8 });
+  const sentence = '今天我们来学习梯度下降。';
+  assert.deepEqual(extractor.push(sentence), []);
+  await new Promise((resolve) => setTimeout(resolve, 40));
+  assert.deepEqual(extractor.push(sentence), [sentence]);
+});
+
+test('集成：翻译流式 partial 驱动子句提取器（首个子句先于整句完成确认）', async () => {
+  const first = '梯度下降是一种一阶迭代优化算法，它在当前点计算损失函数的梯度。';
+  const second = '学习率控制每一步的步长，取值太大会让训练发散。';
+  const fetchImpl = recordFetch(() =>
+    delayedSseResponse([sseLine(first), sseLine(second), SSE_DONE], { delayMs: 320 }),
+  );
+  const translator = createTranslator({ config: baseConfig({ partialThrottleMs: 0 }), fetchImpl });
+  const extractor = createClauseExtractor({ stabilityMs: 250, minClauseChars: 8, maxChunkChars: 80 });
+  const confirmed = [];
+  let resolved = false;
+
+  const result = await translator.translate({
+    text: 'Gradient descent is a first-order iterative optimization algorithm. The learning rate controls the step size.',
+    onPartial: (partial) => {
+      for (const clause of extractor.push(partial)) confirmed.push({ clause, resolved });
+    },
+  });
+  resolved = true;
+  confirmed.push(...extractor.flush(result.text).map((clause) => ({ clause, resolved: true })));
+
+  assert.ok(confirmed.length >= 2, `应至少确认两块：${JSON.stringify(confirmed)}`);
+  const firstClause = confirmed.find((item) => item.clause.includes('梯度下降'));
+  assert.ok(firstClause, '应确认第一个子句');
+  assert.equal(firstClause.resolved, false, '首个子句必须在整句翻译完成前就交给 TTS');
+  assert.equal(
+    confirmed.map((item) => item.clause).join('').replace(/\s+/g, ''),
+    result.text.replace(/\s+/g, ''),
+    'push 确认的子句 + flush 尾巴必须覆盖最终译文',
+  );
 });
 
 /* ------------------------------------------------------------------ *

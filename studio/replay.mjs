@@ -11,6 +11,7 @@
  * 事件顺序与 WS 下发一致，因此同一套解析逻辑也可以给 studio 的演示模式用。
  */
 import {
+  buildEventJsonl,
   buildSrt,
   decodePcmBase64,
   downloadTextFile,
@@ -19,6 +20,7 @@ import {
   parseSessionJsonl,
   stateAt,
 } from './session-parse.mjs';
+import { normalizeTheme } from './ui-kit.mjs';
 
 const $ = (id) => document.getElementById(id);
 
@@ -27,6 +29,11 @@ const els = {
   sessionSubtitle: $('sessionSubtitle'),
   replayBadge: $('replayBadge'),
   replayBadgeText: $('replayBadgeText'),
+  btnTheme: $('btnTheme'),
+  btnExportEvents: $('btnExportEvents'),
+  emptyTitle: $('emptyTitle'),
+  emptyText: $('emptyText'),
+  btnReload: $('btnReload'),
   replayModeTag: $('replayModeTag'),
   replayStage: $('replayStage'),
   video: $('video'),
@@ -126,6 +133,28 @@ function setBadge(tone, label) {
   els.replayBadgeText.textContent = label;
 }
 
+function applyTheme(theme) {
+  const next = normalizeTheme(theme, 'dark');
+  document.documentElement.dataset.theme = next;
+  els.btnTheme.title = next === 'light' ? '切换到暗色主题' : '切换到亮色主题';
+  els.btnTheme.setAttribute('aria-pressed', String(next === 'light'));
+  try {
+    const raw = localStorage.getItem('livedub.studio.v1');
+    const settings = raw ? JSON.parse(raw) : {};
+    settings.theme = next;
+    localStorage.setItem('livedub.studio.v1', JSON.stringify(settings));
+  } catch {
+    /* localStorage 不可用时忽略 */
+  }
+}
+
+function showEmpty(title, text) {
+  els.loading.hidden = true;
+  els.empty.hidden = false;
+  els.emptyTitle.textContent = String(title ?? '没有可回放的事件');
+  els.emptyText.textContent = String(text ?? '');
+}
+
 function providerName(value) {
   if (value == null) return '—';
   if (typeof value === 'string') return value;
@@ -156,15 +185,23 @@ function setupVideo(videoUrl) {
   els.video.addEventListener('loadedmetadata', () => {
     els.replayStage.classList.remove('no-video');
     els.mediaLabel.textContent = shorten(videoUrl.split('/').pop() ?? 'video', 36);
-    if (state.params.get('t')) setVideoTime(Number(state.params.get('t')) || 0);
+    // 首帧：t=0 时也 seek 到 40ms，避免 headless 截到纯黑的第一帧
+    const initial = Number(state.params.get('t'));
+    setVideoTime(Number.isFinite(initial) ? Math.max(initial, 0) : 40);
     updateDurationUi();
     setBadge('ok', '回放就绪');
   });
+  els.video.addEventListener('loadeddata', () => {
+    els.replayStage.classList.remove('no-video');
+    const initial = Number(state.params.get('t'));
+    setVideoTime(Number.isFinite(initial) ? initial : 40);
+  });
   els.video.addEventListener('error', () => {
     els.replayStage.classList.add('no-video');
-    els.mediaLabel.textContent = '视频加载失败，已回退纯字幕回放';
+    els.mediaLabel.textContent = '视频加载失败，已回退纯字幕回放（poster 可见）';
     toast('视频加载失败，回退为纯字幕回放', 'warn', 5000);
   });
+  els.video.poster = '/studio/assets/poster.jpg';
   els.video.src = videoUrl;
   els.video.load();
 }
@@ -215,6 +252,9 @@ function applyAt(tMs) {
 
   // HUD
   renderMetrics(snapshot.metrics);
+
+  // 首帧 / 拖动进度：非播放状态时把视频 seek 到当前时间点（截图与暂停态正确）
+  if (state.useVideo && !state.playing) setVideoTime(t);
 
   // 时间/进度
   els.timeCurrent.textContent = formatClock(t);
@@ -527,7 +567,38 @@ function bindUi() {
     }
   });
   els.btnExport.addEventListener('click', exportSrt);
+  els.btnExportEvents.addEventListener('click', exportEventsJsonl);
   els.btnCopySrt.addEventListener('click', copySrt);
+  els.btnReload.addEventListener('click', () => location.reload());
+  els.btnTheme.addEventListener('click', () => applyTheme(document.documentElement.dataset.theme === 'light' ? 'dark' : 'light'));
+  document.addEventListener('keydown', (event) => {
+    const tag = String(event.target?.tagName ?? '').toUpperCase();
+    if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || event.target?.isContentEditable) return;
+    if (event.ctrlKey || event.metaKey || event.altKey) return;
+    if (event.code === 'Space') {
+      event.preventDefault();
+      togglePlayback();
+    } else if (event.code === 'ArrowRight') {
+      event.preventDefault();
+      seekTo(Math.min(state.maxMs, state.clock + 5000));
+    } else if (event.code === 'ArrowLeft') {
+      event.preventDefault();
+      seekTo(Math.max(0, state.clock - 5000));
+    }
+  });
+}
+
+function exportEventsJsonl() {
+  const parsed = state.parsed;
+  if (!parsed || parsed.events.length === 0) {
+    toast('还没有可导出的事件', 'warn');
+    return;
+  }
+  const meta = { ...(parsed.meta ?? {}), exportedAt: new Date().toISOString() };
+  const jsonl = buildEventJsonl(parsed.events, { meta });
+  const base = String(parsed.meta?.title ?? 'livedub-replay').replace(/[\\/:*?"<>|]/g, '_');
+  downloadTextFile(`${base}-events.jsonl`, jsonl, 'application/x-ndjson;charset=utf-8');
+  toast(`事件 JSONL 已导出（${parsed.events.length} 个事件）`, 'ok');
 }
 
 function srtText() {
@@ -574,7 +645,7 @@ function applyMeta(parsed) {
   els.sessionTitle.textContent = shorten(title, 48);
   els.metaTitle.textContent = shorten(title, 22);
   els.sessionSubtitle.textContent = `离线回放 · ${meta.source ?? 'studio'} · ${parsed.events.length} 个事件`;
-  els.metaSource.textContent = String(meta.source ?? '—');
+  els.metaSource.textContent = String(meta.source ?? (meta.mock === false ? 'batch' : '—'));
   els.metaSessionId.textContent = shorten(String(ready.sessionId ?? meta.sessionId ?? '—'), 16);
   const langFrom = meta.langFrom ?? ready.limits?.langFrom ?? 'en';
   const langTo = meta.langTo ?? ready.limits?.langTo ?? 'zh';
@@ -600,19 +671,15 @@ function applyMeta(parsed) {
 async function bootstrap() {
   bindUi();
   updatePlayButton();
+  applyTheme(document.documentElement.dataset.theme || 'dark');
   const sessionUrl = state.params.get('session');
-  const videoUrl = state.params.get('video');
   if (!sessionUrl) {
-    els.loading.hidden = true;
-    els.empty.hidden = false;
+    showEmpty('缺少 session 参数', '用法：/replay/?session=/demo/session.jsonl&video=/demo/original.mp4&t=20000');
     els.sessionTitle.textContent = '缺少 session 参数';
-    els.sessionSubtitle.textContent = '用法：/replay/?session=/demo/session.jsonl&video=/demo/original.mp4';
+    els.sessionSubtitle.textContent = '离线回放 · 需要一个会话 JSONL';
     setBadge('warn', '缺少参数');
     return;
   }
-  state.useVideo = Boolean(videoUrl);
-  if (videoUrl) setupVideo(videoUrl);
-  state.videoReady = () => Boolean(els.video.src) && Number.isFinite(els.video.duration) && els.video.duration > 0;
 
   try {
     const response = await fetch(sessionUrl, { cache: 'no-store' });
@@ -621,11 +688,16 @@ async function bootstrap() {
     const parsed = parseSessionJsonl(text);
     state.parsed = parsed;
     if (parsed.events.length === 0) {
-      els.loading.hidden = true;
-      els.empty.hidden = false;
+      showEmpty('会话里没有事件', '这个 JSONL 没有可回放的引擎事件，检查导出流程或换一个会话。');
       setBadge('warn', '没有事件');
       return;
     }
+    const videoUrl = state.params.get('video') || parsed.meta?.video || '';
+    state.useVideo = Boolean(videoUrl);
+    state.videoReady = () => Boolean(els.video.src) && Number.isFinite(els.video.duration) && els.video.duration > 0;
+    if (videoUrl) setupVideo(videoUrl);
+    else els.replayStage.classList.add('no-video');
+
     let end = Number(parsed.meta?.durationMs) || 0;
     for (const segment of parsed.segments.values()) end = Math.max(end, segment.t1Ms);
     for (const dub of parsed.dubs) end = Math.max(end, dub.startMs + (dub.durationMs || 0));
@@ -633,14 +705,15 @@ async function bootstrap() {
     applyMeta(parsed);
     updateDurationUi();
     els.loading.hidden = true;
+    els.empty.hidden = true;
+    els.btnExportEvents.disabled = parsed.events.length === 0;
     const initial = Number(state.params.get('t'));
     stopPlayback();
     applyAt(Number.isFinite(initial) ? initial : 0);
     setBadge('ok', '回放就绪');
     if (state.params.get('autoplay') === '1') togglePlayback();
   } catch (err) {
-    els.loading.hidden = true;
-    els.empty.hidden = false;
+    showEmpty('加载会话失败', err.message);
     els.sessionTitle.textContent = '加载会话失败';
     els.sessionSubtitle.textContent = err.message;
     setBadge('err', '加载失败');

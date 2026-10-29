@@ -32,6 +32,7 @@ const opt = {
   dub: !argv.includes('--no-dub'),
   langFrom: arg('--lang-from', 'en'),
   langTo: arg('--lang-to', 'zh'),
+  ttsSpeed: Number(arg('--tts-speed', '1.15')) || 1.15,
 };
 
 function arg(name, fallback = null) {
@@ -151,7 +152,7 @@ function decodePcmBase64(b64) {
 /** 构造 48k stereo 输出：原声按配音区间自动压低（ducking）+ 混入中文配音 */
 function mixDubTrack({ original48Stereo, dubChunks, duckLevel, totalMs }) {
   const rate = 48000;
-  const frames = Math.max(msToSamples(totalMs + 1500, rate), Math.floor(original48Stereo.length / 4));
+  const frames = Math.max(msToSamples(totalMs, rate), Math.floor(original48Stereo.length / 4));
   const L = new Float32Array(frames);
   const R = new Float32Array(frames);
   for (let i = 0; i < frames; i++) {
@@ -207,6 +208,48 @@ function mixDubTrack({ original48Stereo, dubChunks, duckLevel, totalMs }) {
   return { pcm48Stereo: out, dubMs: (intervals.length ? Math.max(...intervals.map((x) => x.end)) / rate * 1000 : 0) };
 }
 
+/**
+ * 把 pipeline 产出的配音块重新排到视频时间轴上（离线批处理专用）。
+ *
+ * 背景：pipeline 的 dub.startMs 是「TTS 就绪时刻」（直播语义），实时喂入时可能晚于视频末尾，
+ * 直接用于成片/回放会导致最后几句配音越界。离线场景改为：每句配音尽量从「该句语音开始 + buffer」
+ * 处起播，并按全局游标顺序排列（不重叠），最后裁剪到视频时长内。
+ */
+function scheduleDubs({ segments, dubChunks, videoMs, startBufferMs = 320, minGapMs = 60 }) {
+  const orderedSegments = [...segments.values()].sort((a, b) => a.t0Ms - b.t0Ms);
+  const byId = new Map();
+  for (const chunk of dubChunks) {
+    if (!chunk.pcmData || chunk.pcmData.length === 0) continue;
+    if (!byId.has(chunk.id)) byId.set(chunk.id, []);
+    byId.get(chunk.id).push(chunk);
+  }
+  const schedule = new Map(); // `${id}:${seq}` -> startMs
+  const segmentEnd = new Map(); // id -> endMs
+  const chunksWithStart = [];
+  let cursorMs = 0;
+  for (const seg of orderedSegments) {
+    const chunks = byId.get(seg.id);
+    if (!chunks || chunks.length === 0) continue;
+    chunks.sort((a, b) => (a.seq ?? 0) - (b.seq ?? 0));
+    const sampleRate = Number(chunks[0].sampleRate) || 24000;
+    const totalDurMs = chunks.reduce((sum, c) => sum + pcmDurationMs(c.pcmData, Number(c.sampleRate) || sampleRate), 0);
+    let target = Math.max(seg.t0Ms + startBufferMs, cursorMs + minGapMs);
+    // 不越过视频结尾（留出 120ms 余量），过长则允许重叠/裁剪
+    target = Math.min(target, Math.max(0, videoMs - 120));
+    let offsetMs = 0;
+    for (const chunk of chunks) {
+      const dur = pcmDurationMs(chunk.pcmData, Number(chunk.sampleRate) || sampleRate);
+      const startMs = Math.round(target + offsetMs);
+      schedule.set(`${chunk.id}:${chunk.seq ?? 0}`, startMs);
+      chunksWithStart.push({ ...chunk, startMs, durationMs: dur });
+      offsetMs += dur;
+    }
+    segmentEnd.set(seg.id, Math.round(target + totalDurMs));
+    cursorMs = Math.round(target + totalDurMs);
+  }
+  return { schedule, segmentEnd, chunks: chunksWithStart, totalEndMs: cursorMs };
+}
+
 // ------------------------------------------------------------------ main
 
 async function main() {
@@ -219,7 +262,7 @@ async function main() {
   log(`\n▶ livedub batch`);
   log(`  video : ${path.relative(ROOT, opt.video)}`);
   log(`  out   : ${path.relative(ROOT, opt.out)}`);
-  log(`  mode  : ${opt.mock ? 'mock providers' : 'real providers'} | ${opt.langFrom} -> ${opt.langTo} | speed=${opt.speed}x\n`);
+  log(`  mode  : ${opt.mock ? 'mock providers' : 'real providers'} | ${opt.langFrom} -> ${opt.langTo} | feed=${opt.speed}x | ttsSpeed=${opt.ttsSpeed}\n`);
 
   const videoMs = await probeDurationMs(opt.video);
 
@@ -242,7 +285,12 @@ async function main() {
       dub: { enabled: opt.dub, catchUp: 'none' },
     });
   } else {
-    config = deepMerge(config, { session: { langFrom: opt.langFrom, langTo: opt.langTo }, dub: { enabled: opt.dub, catchUp: 'none' } });
+    config = deepMerge(config, {
+      session: { langFrom: opt.langFrom, langTo: opt.langTo },
+      dub: { enabled: opt.dub, catchUp: 'none' },
+      // 成片专用语速：中文配音通常比原声长 5-15%，略提速以避免最后几句被视频结尾裁掉（直播/工作台仍用 1.0）
+      tts: { speed: opt.ttsSpeed },
+    });
   }
 
   // 3) 跑管线
@@ -348,6 +396,34 @@ async function main() {
   writer.end();
   await new Promise((r) => writer.on('close', r));
 
+  // 4.5) 离线重排配音时间轴（按句对齐 + 不越界），并回写 session.jsonl 供回放使用
+  const scheduled = dubChunks.length
+    ? scheduleDubs({ segments, dubChunks, videoMs })
+    : { schedule: new Map(), segmentEnd: new Map(), chunks: [], totalEndMs: 0 };
+  if (dubChunks.length > 0) {
+    try {
+      const lines = fs.readFileSync(sessionJsonl, 'utf8').split('\n').filter(Boolean);
+      const rewritten = lines.map((line) => {
+        try {
+          const event = JSON.parse(line);
+          if (event.type === 'dub') {
+            const key = `${event.id}:${event.seq}`;
+            if (scheduled.schedule.has(key)) event.startMs = scheduled.schedule.get(key);
+            else if (event.final && scheduled.segmentEnd.has(event.id)) event.startMs = scheduled.segmentEnd.get(event.id);
+          }
+          return JSON.stringify(event);
+        } catch {
+          return line;
+        }
+      });
+      fs.writeFileSync(sessionJsonl, rewritten.join('\n') + '\n');
+    } catch (err) {
+      log(`  [warn] session.jsonl startMs 回写失败: ${err.message}`);
+    }
+    log(`  dub schedule: ${dubChunks.length} chunks, last dub ends at ${(scheduled.totalEndMs / 1000).toFixed(1)}s (video ${(videoMs / 1000).toFixed(1)}s)`);
+    if (scheduled.totalEndMs > videoMs + 200) log(`  [warn] 结尾配音超出视频 ${((scheduled.totalEndMs - videoMs) / 1000).toFixed(1)}s，混音时会裁剪（可缩短译文/提高 TTS 语速）`);
+  }
+
   // 5) SRT + metrics
   const cues = [...segments.values()]
     .sort((a, b) => a.t0Ms - b.t0Ms)
@@ -390,7 +466,7 @@ async function main() {
   if (opt.dub && dubChunks.length > 0) {
     const { pcm48Stereo: mixed } = mixDubTrack({
       original48Stereo: pcm48Stereo,
-      dubChunks,
+      dubChunks: scheduled.chunks,
       duckLevel: Number(config.dub?.duckOriginal ?? 0.18),
       totalMs: videoMs,
     });

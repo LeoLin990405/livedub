@@ -27,7 +27,9 @@ export function annotateTimeline(events) {
     const explicit = explicitEventMs(event);
     const atMs = explicit != null ? explicit : cursor;
     cursor = Math.max(cursor, atMs);
-    out.push({ ...event, atMs });
+    // inferred=true 表示事件本身没带时间戳（例如线上 translation），由顺序继承；
+    // parseSessionJsonl 会用同句 segment.t1Ms 再对齐一次。
+    out.push({ ...event, atMs, inferred: explicit == null });
   }
   return out;
 }
@@ -142,7 +144,65 @@ export function parseSessionJsonl(text) {
     }
   }
 
-  return { meta, ready, events, eventsWithTimeline, segments, dubs };
+  // 真实 batch 产物里 translation/metrics 没有显式时间戳（与线上 WS 一致），
+  // 这里绑定到同句 segment 的 t1Ms，使回放/演示的时间轴与字幕对齐；
+  // 排序后 stateAt 的顺序遍历才能正确 break。
+  const enriched = eventsWithTimeline.map((event) => {
+    if (event.type !== 'translation' && event.type !== 'metrics') return event;
+    if (!event.inferred) return event;
+    const segment = segments.get(String(event.id));
+    const t1Ms = Number(segment?.t1Ms);
+    if (!Number.isFinite(t1Ms) || t1Ms <= 0) return event;
+    return { ...event, atMs: Math.round(t1Ms) };
+  });
+  enriched.sort((a, b) => a.atMs - b.atMs);
+  return { meta, ready, events, eventsWithTimeline: enriched, segments, dubs };
+}
+
+/**
+ * 把引擎事件序列化为可回放的 JSONL 文本：首行可选 meta，其余每行一个事件。
+ * 内部标注字段 atMs 会被剔除；空输入返回空串。
+ * @param {object[]} events
+ * @param {{meta?: object|null}} [options]
+ */
+export function buildEventJsonl(events, { meta = null } = {}) {
+  const lines = [];
+  if (meta && typeof meta === 'object' && !Array.isArray(meta)) {
+    lines.push(JSON.stringify({ type: 'meta', ...meta }));
+  }
+  for (const event of events ?? []) {
+    if (!event || typeof event !== 'object' || Array.isArray(event)) continue;
+    const copy = { ...event };
+    delete copy.atMs;
+    delete copy.inferred;
+    lines.push(JSON.stringify(copy));
+  }
+  return lines.length ? `${lines.join('\n')}\n` : '';
+}
+
+/** 生成会话 meta 行（导出事件 JSONL 时用） */
+export function buildSessionMeta({
+  sessionId = null,
+  title = '',
+  video = '',
+  langFrom = 'en',
+  langTo = 'zh',
+  durationMs = 0,
+  source = 'studio',
+  generatedAt = null,
+  extra = {},
+} = {}) {
+  return {
+    sessionId: sessionId ?? null,
+    title: String(title ?? ''),
+    video: String(video ?? ''),
+    langFrom: String(langFrom ?? 'en'),
+    langTo: String(langTo ?? 'zh'),
+    durationMs: Math.max(0, Math.round(Number(durationMs) || 0)),
+    source: String(source ?? 'studio'),
+    generatedAt: generatedAt ?? new Date().toISOString(),
+    ...extra,
+  };
 }
 
 /**

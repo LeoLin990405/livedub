@@ -46,6 +46,18 @@ function truncate(text, max = 80) {
   return s.length <= max ? s : `${s.slice(0, max)}…`;
 }
 
+/**
+ * 估算 speculative final 省下的时间（相对「静音确认后才开始推理」的基线）。
+ * 实际 final 时间 = max(静音确认时刻, 推测推理完成时刻)；基线 = 静音确认时刻 + 推理耗时。
+ */
+function estimateSpeculationSavedMs(spec, confirmWall) {
+  const infer = Number.isFinite(spec?.inferMs) ? spec.inferMs : 0;
+  if (!Number.isFinite(confirmWall) || !Number.isFinite(spec?.finishedWall)) return 0;
+  const actual = Math.max(confirmWall, spec.finishedWall);
+  const baseline = confirmWall + infer;
+  return Math.max(0, Math.round(baseline - actual));
+}
+
 // `[00:00:00.000 --> 00:00:02.500]` 这类时间戳（whisper 某些输出格式会带）
 const TIMESTAMP_MARKER =
   /\[\s*\d{1,2}:\d{2}(?::\d{2})?(?:[.,]\d+)?\s*-->\s*\d{1,2}:\d{2}(?::\d{2})?(?:[.,]\d+)?\s*\]/g;
@@ -107,6 +119,18 @@ function createWhisperAsrSession({ config = {}, log = () => {}, onEvent = () => 
   const partialEnabled = partial.enabled !== false;
   const minPartialChars = Number.isFinite(Number(partial.minChars)) ? Math.max(1, Number(partial.minChars)) : 6;
   const skipWhileBusy = partial.skipWhileBusy !== false;
+  // speculative final：**默认关闭**（v0.2 实测：大模型推理 ~1.4s 时收益不稳定、取消的在途请求还会污染
+  // whisper 串行队列）。只有显式 `speculativeFinal: true` 才开启，且默认再叠加推理耗时门限。
+  const speculativeEnabled = whisper.speculativeFinal === true;
+  const speculativeAfterMs = Number.isFinite(Number(whisper.vad?.speculativeAfterMs))
+    ? Number(whisper.vad.speculativeAfterMs)
+    : Number.isFinite(Number(whisper.speculativeAfterMs))
+      ? Number(whisper.speculativeAfterMs)
+      : 120;
+  // 只有当最近一次 final 推理耗时 <= 该值时才继续推测（0 = 不限制；首次无测量时允许一次）
+  const speculationMinInferenceMs = Number.isFinite(Number(whisper.speculativeMinInferenceMs))
+    ? Number(whisper.speculativeMinInferenceMs)
+    : 250;
   const requestLanguage = String(whisper.language || 'en');
   const finalLang =
     requestLanguage === 'auto' ? String(config?.session?.langFrom ?? 'en') : requestLanguage;
@@ -134,6 +158,12 @@ function createWhisperAsrSession({ config = {}, log = () => {}, onEvent = () => 
   let lastFinalT1Ms = 0;
   let lastPartialText = '';
   let warmPromise = null;
+  /** @type {null | object} 当前在途的推测收句（同一时刻最多一个） */
+  let activeSpeculation = null;
+  let trailingSilence = false; // 是否处于「尾部静音 / 推测中」：期间跳过 partial
+  let speculationCancelsWithoutStart = 0;
+  let inferenceMsEma = null; // 最近 final 推理耗时 EMA（用于 speculative 门限）
+  let speculationGateLogged = false;
 
   const sessionStats = {
     finals: 0,
@@ -145,6 +175,17 @@ function createWhisperAsrSession({ config = {}, log = () => {}, onEvent = () => 
     avgFinalInferMs: null,
     finalSamples: 0,
     totalFinalInferMs: 0,
+    // speculative final
+    speculations: 0,
+    speculationHits: 0,
+    speculationCancels: 0,
+    speculationFailed: 0,
+    speculationMisses: 0,
+    speculationSavedMs: 0,
+    lastSpeculationSavedMs: null,
+    speculationGateBlocked: 0,
+    speculationAborts: 0,
+    skippedPartialsTail: 0,
   };
 
   function emit(ev) {
@@ -154,6 +195,23 @@ function createWhisperAsrSession({ config = {}, log = () => {}, onEvent = () => 
     } catch (err) {
       log(`[asr] onEvent 回调抛错：${err?.message ?? err}`);
     }
+  }
+
+  /** final 推理耗时 EMA（只统计真正产出 final 的推理，含推测复用的那次） */
+  function updateInferenceMs(inferMs) {
+    if (!Number.isFinite(inferMs) || inferMs <= 0) return;
+    inferenceMsEma = inferenceMsEma == null ? inferMs : inferenceMsEma * 0.6 + inferMs * 0.4;
+  }
+
+  /**
+   * speculative 门限：只有 opt-in 且实测推理足够快（<= speculativeMinInferenceMs）才继续推测。
+   * 没有测量值时允许一次（用户已显式 opt-in）；之后按实测推理耗时决定，避免大模型白白占用串行队列。
+   */
+  function speculationGateOpen() {
+    if (!speculativeEnabled) return false;
+    if (speculationMinInferenceMs <= 0) return true;
+    if (inferenceMsEma == null) return true;
+    return inferenceMsEma <= speculationMinInferenceMs;
   }
 
   function reportError(job, err) {
@@ -194,6 +252,7 @@ function createWhisperAsrSession({ config = {}, log = () => {}, onEvent = () => 
       try {
         if (job.type === 'final') await runFinal(job);
         else if (job.type === 'partial') await runPartial(job);
+        else if (job.type === 'speculate') await runSpeculation(job);
       } catch (err) {
         reportError(job, err);
       } finally {
@@ -217,12 +276,35 @@ function createWhisperAsrSession({ config = {}, log = () => {}, onEvent = () => 
 
   function enqueueFinal(ev) {
     if (closed || !ev?.pcm?.length) return;
-    queue.push({ type: 'final', t0Ms: ev.t0Ms, t1Ms: ev.t1Ms, pcm: ev.pcm });
+    const confirmedWall = Date.now();
+    const active = activeSpeculation;
+    let reuseSpec = null;
+    if (active) {
+      if (ev.speculated && active.id === ev.speculationId) {
+        reuseSpec = active; // 静音确认 -> 直接复用这次推测的推理结果
+        active.claimed = true;
+      } else {
+        // final 与推测不匹配（时间轴重置等异常路径）：作废，避免结果泄漏
+        active.canceled = true;
+        active.canceledWall = confirmedWall;
+        active.claimed = true;
+        sessionStats.speculationCancels += 1;
+        log(`[asr] 推测 id=${active.id} 未等到收句确认，作废`);
+      }
+    }
+    activeSpeculation = null;
+    trailingSilence = false;
+    queue.push({ type: 'final', t0Ms: ev.t0Ms, t1Ms: ev.t1Ms, pcm: ev.pcm, reuseSpec, confirmedWall });
     schedulePump();
   }
 
   function enqueuePartial(ev) {
     if (closed || !partialEnabled || !ev?.pcm?.length) return;
+    // 尾部静音 / 推测中：partial 已无意义，别抢推理资源
+    if (trailingSilence || activeSpeculation) {
+      sessionStats.skippedPartialsTail += 1;
+      return;
+    }
     const busy = Boolean(currentJob) || queue.length > 0;
     // partial 只是中间态：skipWhileBusy=true 时忙则跳过；=false 时允许排队（final 之后到达的会被丢弃）
     if (busy) {
@@ -240,20 +322,183 @@ function createWhisperAsrSession({ config = {}, log = () => {}, onEvent = () => 
     schedulePump();
   }
 
+  // ---- speculative final ----
+
+  /** 尾部静音开始：把当前句提前送去 whisper（高于 partial 的优先级；final 排队时排在推测之后） */
+  function onSpeculationStart(ev) {
+    if (closed || !speculativeEnabled || !ev?.pcm?.length) return;
+    if (!speculationGateOpen()) {
+      sessionStats.speculationGateBlocked += 1;
+      if (!speculationGateLogged) {
+        speculationGateLogged = true;
+        log(
+          `[asr] speculative final 已按推理耗时关闭（EMA=${Math.round(inferenceMsEma ?? 0)}ms > speculativeMinInferenceMs=${speculationMinInferenceMs}ms）；` +
+            `本会话后续不再推测，如需强制可设 speculativeMinInferenceMs=0`,
+        );
+      }
+      return;
+    }
+    if (activeSpeculation) {
+      // 防御：同一时刻只保留一个推测（正常不会发生）
+      activeSpeculation.canceled = true;
+      sessionStats.speculationCancels += 1;
+    }
+    let resolveDone = null;
+    const donePromise = new Promise((resolve) => {
+      resolveDone = resolve;
+    });
+    const spec = {
+      id: ev.id,
+      t0Ms: ev.t0Ms,
+      t1Ms: ev.t1Ms,
+      pcm: ev.pcm,
+      status: 'queued', // queued | running | done | failed | skipped
+      text: null,
+      inferMs: null,
+      audioMs: null,
+      error: null,
+      canceled: false,
+      claimed: false,
+      queuedWall: Date.now(),
+      startedWall: null,
+      finishedWall: null,
+      canceledWall: null,
+      donePromise,
+      _resolveDone: () => resolveDone?.(),
+    };
+    activeSpeculation = spec;
+    trailingSilence = true;
+    sessionStats.speculations += 1;
+    // 尾部静音开始：清掉仍在排队的 partial，让推测先跑
+    for (let i = queue.length - 1; i >= 0; i -= 1) {
+      if (queue[i]?.type === 'partial') queue.splice(i, 1);
+    }
+    queue.unshift({ type: 'speculate', spec });
+    schedulePump();
+    log(
+      `[asr] 推测收句开始 id=${spec.id} ${spec.t0Ms}-${spec.t1Ms}ms（${pcmDurationMs(spec.pcm, sampleRate)}ms 音频）`,
+    );
+  }
+
+  /** 推测作废（语音恢复）：丢弃在途结果，不发任何事件 */
+  function onSpeculationCancel(ev) {
+    const spec = activeSpeculation;
+    if (!spec || (ev?.id != null && spec.id !== ev.id)) return;
+    activeSpeculation = null;
+    trailingSilence = false;
+    spec.canceled = true;
+    spec.canceledWall = Date.now();
+    sessionStats.speculationCancels += 1;
+    // 在途请求真正 abort：立刻释放本会话的队列，不让作废的推测阻塞后续 final
+    if (spec.status === 'running' && spec.controller && !spec.controller.signal.aborted) {
+      sessionStats.speculationAborts += 1;
+      spec.abortedWall = Date.now();
+      try {
+        spec.controller.abort();
+      } catch {
+        /* ignore */
+      }
+    }
+    log(`[asr] 推测作废 id=${spec.id}（${ev?.reason ?? 'speech resumed'}${spec.status === 'running' ? '，已 abort 在途请求' : ''}）`);
+  }
+
+  async function runSpeculation(job) {
+    const spec = job.spec;
+    if (spec.canceled) {
+      // 还没开始推理就作废了：直接跳过（不浪费一次推理）
+      spec.status = 'skipped';
+      speculationCancelsWithoutStart += 1;
+      spec._resolveDone?.();
+      log(`[asr] 推测 id=${spec.id} 开始前已作废，跳过推理`);
+      return;
+    }
+    spec.status = 'running';
+    spec.startedWall = Date.now();
+    spec.controller = job.controller;
+    try {
+      const res = await server.transcribe({
+        pcm: spec.pcm,
+        sampleRate,
+        language: requestLanguage,
+        timeoutMs: requestTimeoutMs,
+        signal: job.controller.signal,
+        kind: 'speculate',
+      });
+      spec.finishedWall = Date.now();
+      if (res?.skipped) {
+        spec.status = 'failed';
+        spec.error = new Error(res.reason ?? 'speculative inference skipped');
+        sessionStats.speculationFailed += 1;
+        log(`[asr] 推测 id=${spec.id} 被跳过：${spec.error.message}`);
+        return;
+      }
+      spec.inferMs = res.inferMs ?? null;
+      spec.audioMs = res.audioMs ?? pcmDurationMs(spec.pcm, sampleRate);
+      spec.text = cleanAsrText(res.text);
+      spec.status = 'done';
+      if (spec.canceled) {
+        log(`[asr] 推测 id=${spec.id} 在途作废，丢弃结果（${spec.audioMs}ms 音频，${spec.inferMs}ms 推理）`);
+      } else {
+        log(`[asr] 推测 id=${spec.id} 完成（${spec.audioMs}ms 音频，${spec.inferMs}ms 推理）`);
+      }
+    } catch (err) {
+      spec.finishedWall = Date.now();
+      spec.error = err;
+      if (isAbortError(err) && spec.canceled) {
+        // 语音恢复后主动 abort：不计失败、不产生事件
+        spec.status = 'aborted';
+        log(`[asr] 推测 id=${spec.id} 已 abort（作废后释放队列）`);
+      } else {
+        spec.status = 'failed';
+        sessionStats.speculationFailed += 1;
+        if (!closed && !isAbortError(err)) log(`[asr] 推测 id=${spec.id} 失败：${err?.message ?? err}`);
+      }
+    } finally {
+      spec._resolveDone?.();
+    }
+  }
+
   // ---- 识别任务 ----
 
   async function runFinal(job) {
-    const res = await server.transcribe({
-      pcm: job.pcm,
-      sampleRate,
-      language: requestLanguage,
-      timeoutMs: requestTimeoutMs,
-      signal: job.controller.signal,
-      kind: 'final',
-    });
+    let res = null;
+    let reused = false;
+    if (job.reuseSpec) {
+      const spec = job.reuseSpec;
+      if (spec.status === 'queued' || spec.status === 'running') {
+        try {
+          await spec.donePromise;
+        } catch {
+          /* ignore */
+        }
+      }
+      if (spec.status === 'done' && spec.text) {
+        res = { text: spec.text, inferMs: spec.inferMs, audioMs: spec.audioMs, reused: true };
+        reused = true;
+        sessionStats.speculationHits += 1;
+        const savedMs = estimateSpeculationSavedMs(spec, job.confirmedWall);
+        sessionStats.speculationSavedMs += savedMs;
+        sessionStats.lastSpeculationSavedMs = savedMs;
+        log(`[asr] 推测命中 id=${spec.id}，预计节省 ≈${savedMs}ms（${spec.inferMs}ms 推理已提前启动）`);
+      } else {
+        sessionStats.speculationMisses += 1;
+        log(`[asr] 推测未命中 id=${spec.id}（status=${spec.status}），回退普通推理`);
+      }
+    }
+    if (!res) {
+      res = await server.transcribe({
+        pcm: job.pcm,
+        sampleRate,
+        language: requestLanguage,
+        timeoutMs: requestTimeoutMs,
+        signal: job.controller.signal,
+        kind: 'final',
+      });
+    }
     if (closed) return;
     if (res?.skipped) return;
     const inferMs = res.inferMs ?? 0;
+    updateInferenceMs(inferMs);
     sessionStats.lastFinalInferMs = inferMs;
     sessionStats.totalFinalInferMs += inferMs;
     sessionStats.finalSamples += 1;
@@ -281,7 +526,7 @@ function createWhisperAsrSession({ config = {}, log = () => {}, onEvent = () => 
     sessionStats.finals += 1;
     emit({ type: 'final', text, t0Ms, t1Ms, lang: finalLang });
     log(
-      `[asr] final #${sessionStats.finals} ${t0Ms}-${t1Ms}ms（音频 ${audioMs}ms，推理 ${inferMs}ms）-> "${truncate(text, 90)}"`,
+      `[asr] final #${sessionStats.finals} ${t0Ms}-${t1Ms}ms（音频 ${audioMs}ms，推理 ${inferMs}ms${reused ? '，推测复用' : ''}）-> "${truncate(text, 90)}"`,
     );
   }
 
@@ -324,7 +569,11 @@ function createWhisperAsrSession({ config = {}, log = () => {}, onEvent = () => 
   }
 
   const segmenter = createSegmenter({
-    config: whisper.vad ?? {},
+    config: {
+      ...(whisper.vad ?? {}),
+      speculative: speculativeEnabled,
+      speculativeAfterMs,
+    },
     partial,
     sampleRate,
     log,
@@ -332,6 +581,8 @@ function createWhisperAsrSession({ config = {}, log = () => {}, onEvent = () => 
       if (closed) return;
       if (ev.type === 'final') enqueueFinal(ev);
       else if (ev.type === 'partial') enqueuePartial(ev);
+      else if (ev.type === 'speculate') onSpeculationStart(ev);
+      else if (ev.type === 'speculateCancel') onSpeculationCancel(ev);
     },
   });
 
@@ -366,6 +617,12 @@ function createWhisperAsrSession({ config = {}, log = () => {}, onEvent = () => 
     async close() {
       if (closed) return;
       closed = true;
+      if (activeSpeculation) {
+        activeSpeculation.canceled = true;
+        activeSpeculation._resolveDone?.();
+        activeSpeculation = null;
+      }
+      trailingSilence = false;
       queue.length = 0;
       try {
         currentJob?.controller?.abort();
@@ -389,6 +646,22 @@ function createWhisperAsrSession({ config = {}, log = () => {}, onEvent = () => 
         queued: queue.length,
         busy: Boolean(currentJob),
         lastFinalT1Ms,
+        speculative: {
+          enabled: speculativeEnabled,
+          afterMs: speculativeAfterMs,
+          minInferenceMs: speculationMinInferenceMs,
+          gateOpen: speculationGateOpen(),
+          emaInferMs: inferenceMsEma == null ? null : Math.round(inferenceMsEma),
+          gateBlocked: sessionStats.speculationGateBlocked,
+          aborts: sessionStats.speculationAborts,
+          activeId: activeSpeculation?.id ?? null,
+          trailingSilence,
+          cancelsWithoutStart: speculationCancelsWithoutStart,
+          hitRate:
+            sessionStats.speculations > 0
+              ? Math.round((sessionStats.speculationHits / sessionStats.speculations) * 1000) / 1000
+              : null,
+        },
         ...sessionStats,
         server: server.stats(),
       };

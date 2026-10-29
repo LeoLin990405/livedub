@@ -28,6 +28,7 @@ import {
   normalizeEngineUrl,
 } from './lib/constants.js';
 import { pickLatencyMs } from './lib/pcm.js';
+import { buildSrtFromCaptions, suggestSrtFilename } from './lib/srt.js';
 
 const LOG_PREFIX = '[livedub:bg]';
 const log = (...args) => console.debug(LOG_PREFIX, ...args);
@@ -45,6 +46,8 @@ const BACKGROUND_MESSAGE_TYPES = new Set([
   MSG.CONTENT_TOGGLE,
   MSG.SET_SETTINGS,
   MSG.CONFIG_PATCH,
+  MSG.GET_SRT,
+  MSG.RECONNECT,
   MSG.OFFSCREEN_HELLO,
   MSG.OFFSCREEN_STATE,
   MSG.OFFSCREEN_EVENT,
@@ -60,7 +63,11 @@ function emptyState(engineUrl = DEFAULT_ENGINE_URL) {
     engineUrl,
     tabId: null,
     tabTitle: '',
+    /** 本次会话元信息（popup 展示语言方向 / 标题） */
+    session: null, // {title, url, langFrom, langTo}
     startedAt: null,
+    /** 已累积的字幕条数（导出 SRT 用） */
+    captionCount: 0,
     ready: null, // 引擎 ready 事件摘要 {protocol, providers, voice, limits}
     voice: null, // {mode, voiceId, degraded?, reason?}
     metrics: null, // 最近一条 metrics
@@ -83,6 +90,71 @@ let dubActiveTimer = null;
 let finishedStop = true;
 
 // ---------------------------------------------------------------------------
+// 字幕累积（客户端 segment + translation -> 导出 SRT）
+// ---------------------------------------------------------------------------
+
+/** 单次会话最多累积多少条（防止超长视频内存膨胀；SRT 导出取最近 400 句） */
+const CAPTION_LIMIT = 400;
+/** @type {Array<{id:string, t0Ms:number|null, t1Ms:number|null, src:string, dst:string, final:boolean, updatedAt:number}>} */
+let captionItems = [];
+let captionSessionKey = null;
+let captionPersistTimer = null;
+
+/** 新会话开始时清空字幕累积 */
+function resetCaptions(sessionKey = null) {
+  captionItems = [];
+  captionSessionKey = sessionKey;
+  persistCaptionsNow();
+  if (bgState.captionCount !== 0) updateState({ captionCount: 0 });
+}
+
+function persistCaptionsNow() {
+  if (captionPersistTimer) {
+    clearTimeout(captionPersistTimer);
+    captionPersistTimer = null;
+  }
+  chrome.storage.session
+    .set({ [STORAGE_KEYS.captions]: { sessionKey: captionSessionKey, items: captionItems } })
+    .catch(() => {});
+}
+
+function persistCaptionsSoon(delay = 800) {
+  if (captionPersistTimer) return;
+  captionPersistTimer = setTimeout(() => {
+    captionPersistTimer = null;
+    persistCaptionsNow();
+  }, delay);
+}
+
+/** segment / translation 事件 -> 字幕条目（同一 id 合并） */
+function upsertCaption(patch) {
+  const id = patch && patch.id != null ? String(patch.id) : '';
+  if (!id) return;
+  let item = captionItems.find((caption) => caption.id === id);
+  if (!item) {
+    if (captionItems.length >= CAPTION_LIMIT) captionItems = captionItems.slice(-(CAPTION_LIMIT - 1));
+    item = { id, t0Ms: null, t1Ms: null, src: '', dst: '', final: false, updatedAt: 0 };
+    captionItems.push(item);
+  }
+  if (Number.isFinite(patch.t0Ms) && patch.t0Ms >= 0) item.t0Ms = Math.round(patch.t0Ms);
+  if (Number.isFinite(patch.t1Ms) && patch.t1Ms >= 0) item.t1Ms = Math.round(patch.t1Ms);
+  if (typeof patch.src === 'string') item.src = patch.src.slice(0, 800);
+  if (typeof patch.dst === 'string') item.dst = patch.dst.slice(0, 800);
+  if (patch.final != null) item.final = patch.final === true;
+  item.updatedAt = Date.now();
+  persistCaptionsSoon();
+  if (bgState.captionCount !== captionItems.length) updateState({ captionCount: captionItems.length });
+}
+
+/** 组装导出结果（纯函数渲染在 lib/srt.js） */
+function buildSrtPayload() {
+  const result = buildSrtFromCaptions(captionItems, { bilingual: true, maxCharsPerLine: 24, maxLines: 2 });
+  const title = bgState.tabTitle || (bgState.session && bgState.session.title) || 'livedub';
+  const filename = suggestSrtFilename({ title, startedAt: bgState.startedAt || Date.now() });
+  return { srt: result.srt, count: result.count, filename };
+}
+
+// ---------------------------------------------------------------------------
 // 初始化 / 状态持久化
 // ---------------------------------------------------------------------------
 
@@ -93,6 +165,14 @@ async function init() {
     settings = { ...DEFAULT_SETTINGS, ...(storedSettings && typeof storedSettings === 'object' ? storedSettings : {}) };
     settings.engineUrl = normalizeEngineUrl(settings.engineUrl) || DEFAULT_ENGINE_URL;
     bgState.engineUrl = settings.engineUrl;
+
+    // 恢复本次会话累积的字幕（导出 SRT 在 SW 回收后依然可用）
+    const captionsStored = await chrome.storage.session.get({ [STORAGE_KEYS.captions]: null });
+    const captionsSnapshot = captionsStored[STORAGE_KEYS.captions];
+    if (captionsSnapshot && Array.isArray(captionsSnapshot.items)) {
+      captionItems = captionsSnapshot.items.slice(-CAPTION_LIMIT);
+      captionSessionKey = captionsSnapshot.sessionKey ?? null;
+    }
 
     // 恢复被回收前的运行态；先确认 offscreen 还活着
     const sessionStored = await chrome.storage.session.get({ [STORAGE_KEYS.bgState]: null });
@@ -123,6 +203,7 @@ async function init() {
   } catch (err) {
     log('init failed', err && err.message);
   }
+  if (bgState && typeof bgState === 'object') bgState.captionCount = captionItems.length;
 }
 
 function ensureInit() {
@@ -314,6 +395,13 @@ async function startCapture({ tab = null, tabId = null, streamId = null, engineU
     clearTimeout(dubActiveTimer);
     dubActiveTimer = null;
   }
+  const startedAt = Date.now();
+  const sessionInfo = {
+    title: targetTab.title || '',
+    url: targetTab.url || '',
+    langFrom: settings.langFrom,
+    langTo: settings.langTo,
+  };
   updateState({
     ...emptyState(targetEngineUrl),
     phase: 'starting',
@@ -321,8 +409,10 @@ async function startCapture({ tab = null, tabId = null, streamId = null, engineU
     tabId: targetTab.id,
     tabTitle: targetTab.title || '',
     engineUrl: targetEngineUrl,
-    startedAt: Date.now(),
+    session: sessionInfo,
+    startedAt,
   });
+  resetCaptions(startedAt);
 
   try {
     // 1) 拿 streamId —— 必须在用户手势链内，尽量放在最前面（见文件头注释）
@@ -332,13 +422,7 @@ async function startCapture({ tab = null, tabId = null, streamId = null, engineU
     await ensureContentScript(targetTab.id);
     // 3) 创建/复用 offscreen document，让它消费 streamId 并连引擎
     await ensureOffscreen();
-    const session = {
-      source: 'extension',
-      title: targetTab.title || '',
-      url: targetTab.url || '',
-      langFrom: settings.langFrom,
-      langTo: settings.langTo,
-    };
+    const session = { source: 'extension', ...sessionInfo };
     const response = await sendToOffscreen(
       {
         type: MSG.OFFSCREEN_START,
@@ -415,6 +499,7 @@ async function finalizeStop(reason = 'user') {
   const tabId = bgState.tabId;
   const keepError = reason === 'start-failed' ? bgState.error : null;
   bgState = emptyState(settings.engineUrl);
+  bgState.captionCount = captionItems.length; // 结束后仍可导出本次 SRT
   if (keepError) {
     bgState.phase = 'error';
     bgState.error = keepError;
@@ -482,6 +567,14 @@ function handleEngineEvent(event) {
       break;
     case 'metrics':
       updateState({ metrics: event });
+      break;
+    case 'segment':
+      // ASR 最终句：SRT 的原文与时间轴
+      upsertCaption({ id: event.id, t0Ms: event.t0Ms, t1Ms: event.t1Ms, src: event.text });
+      break;
+    case 'translation':
+      // 同一 id 的译文（增量覆盖 / final）
+      upsertCaption({ id: event.id, dst: event.text, final: event.final !== false });
       break;
     case 'voice':
       updateState({
@@ -663,6 +756,40 @@ async function handleMessage(message, sender) {
         return response || { ok: true };
       } catch (err) {
         return { ok: false, error: { message: String((err && err.message) || err) } };
+      }
+    }
+    case MSG.GET_SRT: {
+      const payload = buildSrtPayload();
+      if (payload.count === 0) {
+        return {
+          ok: false,
+          error: {
+            code: 'NO_CAPTIONS',
+            message: '本次会话还没有可导出的字幕：先开始同传，让视频说几句话后再试。',
+          },
+        };
+      }
+      return { ok: true, ...payload };
+    }
+    case MSG.RECONNECT: {
+      if (!['running', 'starting'].includes(bgState.phase)) {
+        return {
+          ok: false,
+          error: { code: 'NOT_RUNNING', message: '还没有开始抓音：请点击工具栏 livedub 图标，在弹窗里点「开始同传」。' },
+        };
+      }
+      try {
+        const response = await sendToOffscreen({ type: MSG.OFFSCREEN_RECONNECT }, { timeoutMs: 1500 });
+        if (response && response.ok) {
+          updateState({ notice: '已触发立即重连引擎…' });
+          return { ok: true, reconnecting: true };
+        }
+        return response || { ok: true };
+      } catch (err) {
+        return {
+          ok: false,
+          error: { code: 'NO_OFFSCREEN', message: `采集页面未响应（${String((err && err.message) || err)}），请停止后重新开始。` },
+        };
       }
     }
     case MSG.OFFSCREEN_HELLO:

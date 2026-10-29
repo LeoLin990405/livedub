@@ -3,7 +3,19 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="color-scheme" content="dark light" />
   <title>livedub · 离线回放</title>
+  <script>
+    (function () {
+      try {
+        var raw = localStorage.getItem('livedub.studio.v1');
+        var settings = raw ? JSON.parse(raw) : {};
+        document.documentElement.dataset.theme = settings.theme === 'light' ? 'light' : 'dark';
+      } catch (error) {
+        document.documentElement.dataset.theme = 'dark';
+      }
+    })();
+  </script>
   <meta name="description" content="livedub 离线回放：载入会话 JSONL，按时间轴复现双语字幕与配音，用于演示与检查。" />
   <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%230b0d14'/%3E%3Cg stroke='%235eead4' stroke-width='2.4' stroke-linecap='round'%3E%3Cpath d='M8 13v6M13 9v14M18 12v8M23 15v2'/%3E%3C/g%3E%3C/svg%3E" />
   <link rel="stylesheet" href="/studio/styles.css" />
@@ -16,6 +28,10 @@
     <symbol id="i-refresh" viewBox="0 0 24 24"><path d="M20 11a8 8 0 1 0-.6 4"/><path d="M20 5v6h-6"/></symbol>
     <symbol id="i-subtitles" viewBox="0 0 24 24"><rect x="3" y="5" width="18" height="14" rx="3"/><path d="M6.5 14h4M13.5 14h4M6.5 10.5h3M12.5 10.5h5"/></symbol>
     <symbol id="i-film" viewBox="0 0 24 24"><rect x="3.5" y="5" width="17" height="14" rx="2.5"/><path d="M7.5 5v14M16.5 5v14M3.5 9.5h4M3.5 14.5h4M16.5 9.5h4M16.5 14.5h4"/></symbol>
+    <symbol id="i-sun" viewBox="0 0 24 24"><circle cx="12" cy="12" r="4"/><path d="M12 2.5v2M12 19.5v2M2.5 12h2M19.5 12h2M5.3 5.3l1.4 1.4M17.3 17.3l1.4 1.4M18.7 5.3l-1.4 1.4M6.7 17.3l-1.4 1.4"/></symbol>
+    <symbol id="i-moon" viewBox="0 0 24 24"><path d="M20.5 14.2A8.5 8.5 0 0 1 9.8 3.5 8.5 8.5 0 1 0 20.5 14.2Z"/></symbol>
+    <symbol id="i-code" viewBox="0 0 24 24"><path d="M8.5 7.5 4 12l4.5 4.5M15.5 7.5 20 12l-4.5 4.5"/></symbol>
+    <symbol id="i-alert" viewBox="0 0 24 24"><path d="M12 3.5 21 19H3L12 3.5Z"/><path d="M12 9v4.5M12 16.5v.5"/></symbol>
   </svg>
 
   <div class="app replay-page">
@@ -31,6 +47,13 @@
       <span class="spacer"></span>
       <span class="tag" id="replayModeTag">离线</span>
       <span class="badge" id="replayBadge" data-tone="ok"><i class="badge-dot"></i><span id="replayBadgeText">回放就绪</span></span>
+      <button id="btnTheme" class="icon-btn theme-toggle" title="切换暗色 / 亮色主题" aria-label="切换亮色或暗色主题" aria-pressed="false">
+        <svg class="icon theme-icon theme-icon-moon"><use href="#i-moon"/></svg>
+        <svg class="icon theme-icon theme-icon-sun"><use href="#i-sun"/></svg>
+      </button>
+      <button id="btnExportEvents" class="btn btn-ghost btn-sm" disabled title="把会话事件导出为 JSONL，可再次用于回放">
+        <svg class="icon"><use href="#i-code"/></svg><span>事件 JSONL</span>
+      </button>
       <button id="btnExport" class="btn btn-ghost btn-sm" disabled>
         <svg class="icon"><use href="#i-download"/></svg><span>导出 SRT</span>
       </button>
@@ -38,31 +61,37 @@
 
     <main class="workspace replay-workspace">
       <section class="replay-main">
-        <div class="replay-stage no-video" id="replayStage">
-          <video id="video" class="video" playsinline preload="metadata" muted></video>
+        <div class="replay-stage no-video" id="replayStage" role="region" aria-label="回放舞台与双语字幕">
+          <img class="stage-poster" src="/studio/assets/poster.jpg" alt="" aria-hidden="true" />
+          <video id="video" class="video" playsinline preload="metadata" muted poster="/studio/assets/poster.jpg" aria-label="回放视频"></video>
 
           <div class="replay-topline">
             <span class="media-chip" id="mediaChip"><svg class="icon"><use href="#i-film"/></svg><span id="mediaLabel">未加载视频（纯字幕回放）</span></span>
             <span class="stage-clock" id="clock">00:00 / 00:00</span>
           </div>
 
-          <div class="subs" id="subs" hidden>
+          <div class="subs" id="subs" hidden data-position="bottom" role="status" aria-live="polite" aria-label="双语字幕">
             <div class="subs-src" id="subsSrc"></div>
             <div class="subs-dst" id="subsDst"></div>
           </div>
 
-          <div class="replay-loading" id="loading">正在加载会话回放…</div>
+          <div class="replay-loading" id="loading"><span class="spinner" aria-hidden="true"></span>正在加载会话回放…</div>
           <div class="replay-empty" id="empty" hidden>
-            没有可回放的事件。<br />
-            试试 <a href="/replay/?session=/studio/sample/session.jsonl&t=5200">示例会话</a>。
+            <svg class="icon empty-icon"><use href="#i-alert"/></svg>
+            <strong id="emptyTitle">没有可回放的事件</strong>
+            <p id="emptyText">请检查 ?session= 参数指向的会话 JSONL 是否存在。</p>
+            <div class="empty-actions">
+              <button id="btnReload" class="btn btn-primary btn-sm">重新加载</button>
+              <a class="link" href="/replay/?session=/demo/session.jsonl&amp;t=20000">打开示例回放</a>
+            </div>
           </div>
         </div>
 
         <div class="replay-controls">
-          <button id="btnPlay" class="icon-btn icon-btn-lg" title="播放 / 暂停">
+          <button id="btnPlay" class="icon-btn icon-btn-lg" title="播放 / 暂停 (Space)" aria-label="播放或暂停">
             <svg class="icon"><use href="#i-play"/></svg>
           </button>
-          <button id="btnRestart" class="icon-btn" title="回到开头">
+          <button id="btnRestart" class="icon-btn" title="回到开头" aria-label="回到开头">
             <svg class="icon"><use href="#i-refresh"/></svg>
           </button>
           <span class="time" id="timeCurrent">00:00</span>

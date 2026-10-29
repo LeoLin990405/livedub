@@ -1,9 +1,9 @@
 {
   "name": "livedub",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "type": "module",
-  "description": "实时同传看视频：本地优先的流式 ASR -> 增量翻译 -> 克隆音色配音引擎（Chrome 扩展 + 本地工作台）",
+  "description": "本地优先的实时同传引擎：看教学视频时流式 ASR -> 增量翻译 -> 克隆音色配音 + 双语字幕（Chrome 扩展 + 本地工作台，零运行时依赖）",
   "engines": {
     "node": ">=22.0.0"
   },
@@ -16,7 +16,35 @@
     "test": "node --test tests/*.test.mjs",
     "test:core": "node --test tests/core.test.mjs tests/pipeline.test.mjs",
     "demo:video": "node scripts/make-demo.mjs",
-    "demo:batch": "node scripts/batch.mjs"
+    "demo:batch": "node scripts/batch.mjs",
+    "lint": "node scripts/lint.mjs",
+    "check": "node scripts/lint.mjs && node --test tests/*.test.mjs",
+    "start:fast": "LIVEDUB_PROFILE=fast node engine/server.mjs",
+    "batch:fast": "LIVEDUB_PROFILE=fast node scripts/batch.mjs --out demo-fast --no-burn",
+    "demo:fast": "LIVEDUB_PROFILE=fast node scripts/batch.mjs --out demo-fast"
   },
-  "license": "MIT"
+  "license": "MIT",
+  "keywords": [
+    "simultaneous-interpretation",
+    "realtime-translation",
+    "speech-recognition",
+    "whisper",
+    "tts",
+    "subtitles",
+    "live-captioning",
+    "chrome-extension",
+    "lecture",
+    "education",
+    "local-first",
+    "nodejs"
+  ],
+  "author": "livedub contributors",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/LeoLin990405/livedub.git"
+  },
+  "bugs": {
+    "url": "https://github.com/LeoLin990405/livedub/issues"
+  },
+  "homepage": "https://github.com/LeoLin990405/livedub#readme"
 }

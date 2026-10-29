@@ -25,6 +25,14 @@ import { startServer, isAllowedOrigin, buildPresetVoices } from '../engine/serve
 import { encodeAudioFrame } from '../engine/protocol.mjs';
 import { PROJECT_ROOT, deepMerge, loadConfig } from '../engine/config.mjs';
 import { createMockDeps } from '../engine/mock.mjs';
+import { buildEventJsonl, parseSessionJsonl } from '../studio/session-parse.mjs';
+import {
+  buildSparkline,
+  isEditableTarget,
+  normalizeSubsStyle,
+  normalizeTheme,
+  resolveShortcut,
+} from '../studio/ui-kit.mjs';
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -638,4 +646,182 @@ test('真实 engine/pipeline.mjs + mock deps：hello -> ready -> 音频 -> segme
     }
     await srv.close();
   }
+});
+
+// ================================================ v0.2 服务端健壮性 / 纯函数
+
+test('server.maxSessions：超过并发上限时拒绝新会话（error+1013）并报告 activeSessions', async () => {
+  const record = [];
+  const srv = await startServer({
+    port: 0,
+    config: testConfig(),
+    log: () => {},
+    sessionFactory: createFakeSessionFactory(record),
+    maxSessions: 1,
+  });
+  let first = null;
+  let second = null;
+  try {
+    first = await openWs(`${srv.url.replace('http://', 'ws://')}/ws`);
+    first.socket.send(JSON.stringify({ type: 'hello', protocol: 1, session: { source: 'test' } }));
+    await waitForEvent(first.events, (event) => event.type === 'ready', 4000, 'ready');
+
+    const health = await (await fetch(`${srv.url}/health`)).json();
+    assert.equal(health.activeSessions, 1);
+    assert.equal(health.sessions.active, 1);
+    assert.equal(health.sessions.max, 1);
+
+    second = await openWs(`${srv.url.replace('http://', 'ws://')}/ws`);
+    const secondClosed = new Promise((resolve) => second.socket.addEventListener('close', (event) => resolve(event.code), { once: true }));
+    second.socket.send(JSON.stringify({ type: 'hello', protocol: 1, session: { source: 'test' } }));
+    const error = await waitForEvent(second.events, (event) => event.type === 'error', 4000, 'max sessions error');
+    assert.equal(error.code, 'MAX_SESSIONS');
+    assert.equal(error.recoverable, false);
+    assert.match(error.message, /上限/);
+    const closeCode = await secondClosed;
+    assert.equal(closeCode, 1013);
+    assert.equal(record.length, 1, '被拒绝的连接不应创建会话');
+
+    // 第一个连接关闭后，槽位释放
+    const firstClosed = new Promise((resolve) => first.socket.addEventListener('close', resolve, { once: true }));
+    first.socket.close();
+    await firstClosed;
+    await waitFor(() => record[0].closed === true, 4000, 'first session closed');
+  } finally {
+    try {
+      second?.socket?.close();
+    } catch {
+      /* ignore */
+    }
+    try {
+      first?.socket?.close();
+    } catch {
+      /* ignore */
+    }
+    await srv.close();
+  }
+});
+
+test('server.maxSessions：从 config.server.maxSessions 读取并出现在 /health 与 /api/config', async () => {
+  const srv = await startServer({
+    port: 0,
+    config: testConfig({ server: { maxSessions: 2 } }),
+    log: () => {},
+    sessionFactory: createFakeSessionFactory([]),
+  });
+  try {
+    assert.equal(srv.maxSessions, 2);
+    const health = await (await fetch(`${srv.url}/health`)).json();
+    assert.equal(health.sessions.max, 2);
+    const payload = await (await fetch(`${srv.url}/api/config`)).json();
+    assert.equal(payload.config.runtime.maxSessions, 2);
+  } finally {
+    await srv.close();
+  }
+});
+
+test('/health：whisper-server 运行状态（尽力而为）与优雅关闭幂等', async () => {
+  const srv = await startServer({
+    port: 0,
+    config: testConfig(),
+    log: () => {},
+    sessionFactory: createFakeSessionFactory([]),
+    voiceLister: async () => [],
+  });
+  const health = await (await fetch(`${srv.url}/health`)).json();
+  assert.equal(typeof health.whisper.server, 'object');
+  assert.equal(typeof health.whisper.server.running, 'boolean');
+  assert.equal(health.whisper.server.host, '127.0.0.1');
+  assert.equal(health.whisper.server.port, 18765);
+  assert.equal(typeof health.whisper.running, 'boolean');
+  assert.equal(health.sessions.max, 4);
+  await srv.close();
+  await srv.close(); // 幂等：SIGINT/SIGTERM 可能被重复触发
+  await assert.rejects(fetch(`${srv.url}/health`), '关闭后 HTTP 端口应已释放');
+});
+
+test('导出事件 JSONL：meta 首行 + 逐行事件 + 可被回放解析（无内部 atMs 字段）', () => {
+  const events = [
+    { type: 'ready', sessionId: 's_test', protocol: 1 },
+    { type: 'status', state: 'listening', tsMs: 0 },
+    { type: 'segment', id: 1, t0Ms: 0, t1Ms: 1200, text: 'Hello world.', lang: 'en' },
+    { type: 'translation', id: 1, text: '你好，世界。', final: true },
+    { type: 'dub', id: 1, seq: 0, startMs: 1400, sampleRate: 24000, format: 's16le', pcm: 'AAAA', durationMs: 10, voiceId: 'v1', final: true },
+  ];
+  const meta = { title: '单元测试会话', video: '/demo/original.mp4', langFrom: 'en', langTo: 'zh', durationMs: 12000 };
+  const jsonl = buildEventJsonl(events, { meta });
+  const lines = jsonl.trim().split('\n');
+  assert.equal(lines.length, events.length + 1);
+  assert.equal(JSON.parse(lines[0]).type, 'meta');
+  assert.equal(JSON.parse(lines[0]).title, '单元测试会话');
+  assert.ok(jsonl.endsWith('\n'), 'JSONL 应以换行结尾');
+
+  const parsed = parseSessionJsonl(jsonl);
+  assert.equal(parsed.meta.title, '单元测试会话');
+  assert.equal(parsed.meta.video, '/demo/original.mp4');
+  assert.equal(parsed.events.length, events.length);
+  assert.equal(parsed.segments.size, 1);
+  assert.equal(parsed.segments.get('1').translation, '你好，世界。');
+  assert.equal(parsed.dubs.length, 1);
+  assert.ok(!jsonl.includes('"atMs"'), '导出不应包含内部字段 atMs');
+  assert.ok(!jsonl.includes('"inferred"'));
+
+  // 带标注时间的事件也应剔除内部字段
+  const annotated = buildEventJsonl([{ type: 'status', state: 'listening', atMs: 100, inferred: true }]);
+  assert.ok(!annotated.includes('atMs'));
+  assert.ok(!annotated.includes('inferred'));
+
+  // 空输入
+  assert.equal(buildEventJsonl([], { meta: null }), '');
+  assert.equal(buildEventJsonl(null), '');
+});
+
+test('UI 纯函数：主题/字幕样式/快捷键/sparkline', () => {
+  // 主题
+  assert.equal(normalizeTheme('light'), 'light');
+  assert.equal(normalizeTheme('LIGHT'), 'light');
+  assert.equal(normalizeTheme('dark'), 'dark');
+  assert.equal(normalizeTheme('neon'), 'dark');
+  assert.equal(normalizeTheme(null), 'dark');
+  assert.equal(normalizeTheme('neon', 'light'), 'light');
+
+  // 字幕样式预设
+  assert.deepEqual(normalizeSubsStyle({ size: 'xl', opacity: 5, position: 'top' }), { size: 'xl', opacity: 1, position: 'top' });
+  const fallbackStyle = normalizeSubsStyle({ size: 'huge', opacity: -1, position: 'left' });
+  assert.deepEqual(fallbackStyle, { size: 'm', opacity: 0.15, position: 'bottom' });
+  assert.deepEqual(normalizeSubsStyle(null), { size: 'm', opacity: 0.72, position: 'bottom' });
+
+  // 快捷键
+  const base = { preventDefault: false, ctrlKey: false, metaKey: false, altKey: false, repeat: false, code: 'Space', key: ' ' };
+  assert.equal(resolveShortcut(base), 'toggle-play');
+  assert.equal(resolveShortcut({ ...base, code: 'KeyS', key: 's' }), 'toggle-subs');
+  assert.equal(resolveShortcut({ ...base, code: 'KeyD', key: 'd' }), 'toggle-dub');
+  assert.equal(resolveShortcut({ ...base, code: 'Escape', key: 'Escape' }), 'escape');
+  assert.equal(resolveShortcut({ ...base, code: 'KeyX', key: 'x' }), null);
+  assert.equal(resolveShortcut(base, { editable: true }), null);
+  assert.equal(resolveShortcut({ ...base, ctrlKey: true }), null);
+  assert.equal(resolveShortcut({ ...base, metaKey: true }), null);
+  assert.equal(resolveShortcut({ ...base, repeat: true }), null);
+  assert.equal(resolveShortcut({ ...base, defaultPrevented: true }), null);
+  assert.equal(resolveShortcut(null), null);
+
+  // 是否可编辑元素
+  assert.equal(isEditableTarget({ tagName: 'INPUT' }), true);
+  assert.equal(isEditableTarget({ tagName: 'textarea' }), true);
+  assert.equal(isEditableTarget({ tagName: 'SELECT' }), true);
+  assert.equal(isEditableTarget({ tagName: 'DIV', isContentEditable: true }), true);
+  assert.equal(isEditableTarget({ tagName: 'DIV' }), false);
+  assert.equal(isEditableTarget(null), false);
+
+  // sparkline
+  const spark = buildSparkline([100, 200, 300], { width: 100, height: 50, pad: 5 });
+  assert.equal(spark.count, 3);
+  assert.equal(spark.min, 100);
+  assert.equal(spark.max, 300);
+  assert.equal(spark.last, 300);
+  assert.equal(spark.points.split(' ').length, 3);
+  const empty = buildSparkline([]);
+  assert.deepEqual(empty, { points: '', min: 0, max: 0, last: null, count: 0 });
+  assert.equal(buildSparkline([100, Number.NaN, -5, 'x', 200]).count, 2);
+  assert.equal(buildSparkline([42]).count, 1);
 });

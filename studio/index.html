@@ -3,7 +3,20 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="color-scheme" content="dark light" />
   <title>livedub · 本地实时同传工作台</title>
+  <script>
+    // 首屏应用主题，避免亮暗切换闪动（与 studio/ui-kit.mjs#normalizeTheme 的规则保持一致）
+    (function () {
+      try {
+        var raw = localStorage.getItem('livedub.studio.v1');
+        var settings = raw ? JSON.parse(raw) : {};
+        document.documentElement.dataset.theme = settings.theme === 'light' ? 'light' : 'dark';
+      } catch (error) {
+        document.documentElement.dataset.theme = 'dark';
+      }
+    })();
+  </script>
   <meta name="description" content="livedub 本地工作台：打开视频，实时英文语音 -> 本地 whisper 识别 -> 增量翻译 -> 配音 + 双语字幕。" />
   <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%230b0d14'/%3E%3Cg stroke='%235eead4' stroke-width='2.4' stroke-linecap='round'%3E%3Cpath d='M8 13v6M13 9v14M18 12v8M23 15v2'/%3E%3C/g%3E%3C/svg%3E" />
   <link rel="stylesheet" href="./styles.css" />
@@ -28,12 +41,18 @@
     <symbol id="i-settings" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M12 3.5v2.2M12 18.3v2.2M3.5 12h2.2M18.3 12h2.2M6 6l1.6 1.6M16.4 16.4 18 18M18 6l-1.6 1.6M7.6 16.4 6 18"/></symbol>
     <symbol id="i-wand" viewBox="0 0 24 24"><path d="M4 20 16 8"/><path d="M14 4.5 15 6M19.5 10l1.5 1M17 2l.7 1.6M22 6.5l-1.6.7"/></symbol>
     <symbol id="i-dot" viewBox="0 0 24 24"><circle cx="12" cy="12" r="4" fill="currentColor" stroke="none"/></symbol>
+    <symbol id="i-sun" viewBox="0 0 24 24"><circle cx="12" cy="12" r="4"/><path d="M12 2.5v2M12 19.5v2M2.5 12h2M19.5 12h2M5.3 5.3l1.4 1.4M17.3 17.3l1.4 1.4M18.7 5.3l-1.4 1.4M6.7 17.3l-1.4 1.4"/></symbol>
+    <symbol id="i-moon" viewBox="0 0 24 24"><path d="M20.5 14.2A8.5 8.5 0 0 1 9.8 3.5 8.5 8.5 0 1 0 20.5 14.2Z"/></symbol>
+    <symbol id="i-code" viewBox="0 0 24 24"><path d="M8.5 7.5 4 12l4.5 4.5M15.5 7.5 20 12l-4.5 4.5"/></symbol>
+    <symbol id="i-alert" viewBox="0 0 24 24"><path d="M12 3.5 21 19H3L12 3.5Z"/><path d="M12 9v4.5M12 16.5v.5"/></symbol>
+    <symbol id="i-expand" viewBox="0 0 24 24"><path d="M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5"/></symbol>
+    <symbol id="i-keyboard" viewBox="0 0 24 24"><rect x="2.5" y="6" width="19" height="12" rx="2.5"/><path d="M6.5 10h.5M10 10h.5M13.5 10h.5M17 10h.5M6.5 13.5h.5M10 13.5h.5M13.5 13.5h.5M17 13.5h.5M8 16.5h8"/></symbol>
   </svg>
 
   <div class="app">
     <header class="topbar">
       <div class="brand">
-        <span class="brand-mark" aria-hidden="true">
+        <span class="brand-mark" aria-hidden="true" role="img" aria-label="livedub 标志">
           <svg viewBox="0 0 40 40"><g stroke="url(#brandGrad)" stroke-width="3" stroke-linecap="round"><path d="M9 17v6"/><path d="M15 11v18"/><path d="M21 14v12"/><path d="M27 9v22"/><path d="M33 17v6"/></g><defs><linearGradient id="brandGrad" x1="0" y1="0" x2="40" y2="40"><stop stop-color="#5eead4"/><stop offset="1" stop-color="#818cf8"/></linearGradient></defs></svg>
         </span>
         <span class="brand-text">
@@ -53,6 +72,10 @@
       </div>
 
       <div class="topbar-actions">
+        <button id="btnTheme" class="icon-btn theme-toggle" title="切换暗色 / 亮色主题" aria-label="切换亮色或暗色主题" aria-pressed="false">
+          <svg class="icon theme-icon theme-icon-moon"><use href="#i-moon"/></svg>
+          <svg class="icon theme-icon theme-icon-sun"><use href="#i-sun"/></svg>
+        </button>
         <button id="btnReconnect" class="btn btn-ghost" title="重新连接本地引擎并重建会话">
           <svg class="icon"><use href="#i-refresh"/></svg><span>重连</span>
         </button>
@@ -67,8 +90,8 @@
 
     <main class="workspace">
       <section class="stage-col">
-        <div class="stage card" id="stage">
-          <video id="video" class="video" playsinline preload="metadata"></video>
+        <div class="stage card" id="stage" role="region" aria-label="视频舞台与双语字幕">
+          <video id="video" class="video" playsinline preload="metadata" aria-label="正在播放的视频"></video>
 
           <div class="stage-empty" id="stageEmpty">
             <div class="stage-glow" aria-hidden="true"></div>
@@ -89,9 +112,15 @@
               </div>
               <div class="empty-foot">
                 <span>示例：</span>
-                <a class="link" href="/replay/?session=/studio/sample/session.jsonl&t=5200">打开离线回放演示 →</a>
+                <a class="link" href="/replay/?session=/demo/session.jsonl&t=20000">打开真实回放 →</a>
                 <span class="dot-sep">·</span>
                 <span>支持 mp4 / webm / mkv / mp3</span>
+              </div>
+              <div class="empty-shortcuts" aria-label="键盘快捷键">
+                <span><kbd>Space</kbd> 播放/暂停</span>
+                <span><kbd>S</kbd> 字幕</span>
+                <span><kbd>D</kbd> 配音</span>
+                <span><kbd>Esc</kbd> 面板</span>
               </div>
             </div>
           </div>
@@ -102,7 +131,7 @@
             <span class="stage-clock" id="stageClock">00:00 / --:--</span>
           </div>
 
-          <div class="subs" id="subs" hidden>
+          <div class="subs" id="subs" hidden data-position="bottom" role="status" aria-live="polite" aria-label="双语字幕">
             <div class="subs-toolbar">
               <button class="mini-btn" id="subsSmaller" title="缩小字幕"><svg class="icon"><use href="#i-minus"/></svg></button>
               <button class="mini-btn" id="subsBigger" title="放大字幕"><svg class="icon"><use href="#i-plus"/></svg></button>
@@ -117,10 +146,10 @@
 
         <div class="controls card">
           <div class="transport">
-            <button id="btnPlay" class="icon-btn icon-btn-lg" title="播放 / 暂停" disabled>
+            <button id="btnPlay" class="icon-btn icon-btn-lg" title="播放 / 暂停 (Space)" aria-label="播放或暂停" disabled>
               <svg class="icon"><use href="#i-play"/></svg>
             </button>
-            <button id="btnStopVideo" class="icon-btn" title="停止播放" disabled>
+            <button id="btnStopVideo" class="icon-btn" title="停止播放" aria-label="停止播放并回到开头" disabled>
               <svg class="icon"><use href="#i-stop"/></svg>
             </button>
             <span class="time" id="timeCurrent">00:00</span>
@@ -142,6 +171,10 @@
               <input id="urlInput" type="url" placeholder="视频 / 音频 URL" spellcheck="false" />
               <button id="btnLoadUrl" class="btn btn-ghost btn-sm">载入</button>
             </div>
+            <span class="capture-hint" id="captureHint" hidden>
+              <svg class="icon"><use href="#i-alert"/></svg>
+              <span>检测不到音频：请确认视频没有静音、系统音量正常，或换一个带音轨的视频</span>
+            </span>
             <span class="spacer"></span>
             <label class="toggle" title="显示 / 隐藏双语字幕">
               <input id="toggleSubs" type="checkbox" checked /><span>字幕</span>
@@ -160,6 +193,9 @@
             <h2><svg class="icon"><use href="#i-subtitles"/></svg>实时字幕</h2>
             <span class="muted" id="transcriptCount">0 句</span>
             <span class="spacer"></span>
+            <button id="btnExportEvents" class="btn btn-ghost btn-sm" disabled title="把收到的引擎事件导出为 JSONL，可直接给回放页使用">
+              <svg class="icon"><use href="#i-code"/></svg><span>事件 JSONL</span>
+            </button>
             <button id="btnExportSrt" class="btn btn-ghost btn-sm" disabled>
               <svg class="icon"><use href="#i-download"/></svg><span>导出 SRT</span>
             </button>
@@ -170,7 +206,16 @@
         </div>
       </section>
 
-      <aside class="side-col">
+      <aside class="side-col" aria-label="会话与引擎面板">
+        <section class="card panel conn-help" id="connHelp" hidden>
+          <div class="card-head"><h2>引擎未连接</h2><span class="tag warn">离线</span></div>
+          <p class="panel-hint">工作台需要本地引擎。请在项目根目录运行：</p>
+          <code class="cmd">npm start</code>
+          <div class="panel-actions">
+            <button id="btnConnRetry" class="btn btn-primary btn-sm">重试连接</button>
+            <span class="muted">默认 http://127.0.0.1:8787</span>
+          </div>
+        </section>
         <section class="card panel">
           <div class="card-head"><h2>会话</h2><span class="tag" id="sessionModeTag">未开始</span></div>
           <div class="kv"><span>状态</span><b id="sessionState">未开始</b></div>
@@ -210,6 +255,62 @@
           <p class="panel-hint">端到端 = 这句话结束时，到配音第一段可播的延迟。</p>
         </section>
 
+        <section class="card panel">
+          <div class="card-head"><h2>延迟趋势</h2><span class="tag" id="sparkCount">最近 0 句</span></div>
+          <div class="spark-wrap">
+            <svg id="sparkSvg" class="spark-svg" viewBox="0 0 260 96" preserveAspectRatio="none" role="img" aria-label="最近若干句的 ASR、翻译、TTS、端到端延迟趋势">
+              <g class="spark-grid">
+                <line x1="3" y1="24" x2="257" y2="24" />
+                <line x1="3" y1="48" x2="257" y2="48" />
+                <line x1="3" y1="72" x2="257" y2="72" />
+              </g>
+              <polyline id="sparkAsr" class="spark-line asr" points="" />
+              <polyline id="sparkMt" class="spark-line mt" points="" />
+              <polyline id="sparkTts" class="spark-line tts" points="" />
+              <polyline id="sparkE2e" class="spark-line e2e" points="" />
+            </svg>
+            <div class="spark-legend">
+              <span class="spark-leg asr"><i></i>ASR</span>
+              <span class="spark-leg mt"><i></i>翻译</span>
+              <span class="spark-leg tts"><i></i>TTS</span>
+              <span class="spark-leg e2e"><i></i>端到端</span>
+            </div>
+          </div>
+        </section>
+
+        <section class="card panel panel-subs-style">
+          <div class="card-head"><h2>字幕样式</h2><span class="muted" id="subsStyleHint">可拖拽字幕</span></div>
+          <div class="style-row">
+            <span>字号</span>
+            <div class="segmented segmented-sm" id="subsSize" role="group" aria-label="字幕字号">
+              <button type="button" data-size="s" aria-pressed="false">S</button>
+              <button type="button" data-size="m" aria-pressed="false">M</button>
+              <button type="button" data-size="l" aria-pressed="false">L</button>
+              <button type="button" data-size="xl" aria-pressed="false">XL</button>
+            </div>
+          </div>
+          <div class="style-row">
+            <span>位置</span>
+            <div class="segmented segmented-sm" id="subsPosition" role="group" aria-label="字幕位置">
+              <button type="button" data-position="bottom" aria-pressed="false">下</button>
+              <button type="button" data-position="mid" aria-pressed="false">中下</button>
+              <button type="button" data-position="top" aria-pressed="false">上</button>
+            </div>
+          </div>
+          <div class="style-row">
+            <span>背景</span>
+            <input id="subsOpacity" class="opacity-range" type="range" min="15" max="100" step="5" value="72" aria-label="字幕背景不透明度" />
+            <b class="mono" id="subsOpacityValue">72%</b>
+          </div>
+          <div class="panel-actions">
+            <button id="btnSubsOnly" class="btn btn-primary btn-sm">
+              <svg class="icon"><use href="#i-expand"/></svg><span>仅字幕模式</span>
+            </button>
+            <button id="btnSubsReset" class="link">重置位置</button>
+          </div>
+          <p class="panel-hint"><svg class="icon hint-icon"><use href="#i-keyboard"/></svg>Space 播放 · S 字幕 · D 配音 · Esc 面板</p>
+        </section>
+
         <section class="card panel panel-glossary">
           <div class="card-head">
             <h2>术语表</h2>
@@ -217,7 +318,7 @@
             <span class="spacer"></span>
             <button id="btnGlossaryReset" class="link" title="恢复为配置文件里的默认术语表">重置</button>
           </div>
-          <textarea id="glossaryInput" spellcheck="false" placeholder="每行一条：english=中文&#10;例：gradient descent=梯度下降"></textarea>
+          <textarea id="glossaryInput" spellcheck="false" aria-label="术语表，每行一条 english=中文" placeholder="每行一条：english=中文&#10;例：gradient descent=梯度下降"></textarea>
           <div class="panel-actions">
             <button id="btnGlossary" class="btn btn-primary btn-sm">应用术语表</button>
             <span class="muted" id="glossaryHint">会话中随时可更新</span>
@@ -249,6 +350,8 @@
     </footer>
   </div>
 
+  <button id="btnSubsOnlyExit" class="float-btn" type="button" hidden>退出仅字幕 <kbd>Esc</kbd></button>
+  <button id="btnPanelsShow" class="float-btn" type="button" hidden>显示面板 <kbd>Esc</kbd></button>
   <div class="toasts" id="toasts" aria-live="polite"></div>
   <script type="module" src="./app.mjs"></script>
 </body>

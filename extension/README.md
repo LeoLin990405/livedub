@@ -7,6 +7,15 @@
 3. 引擎做流式 whisper 识别 → 增量翻译 → 中文 TTS 配音（优先克隆讲师音色）；
 4. 扩展在页面上显示**双语字幕浮层**，并播放中文配音；说话时自动压低原声。
 
+v0.2 迭代（日常可用性）：
+- **原生全屏兼容**：容器型全屏（YouTube/B 站播放器）时浮层自动迁入 `document.fullscreenElement`，退出恢复；
+  `<video>` 直接全屏受浏览器限制无法叠加 DOM，会给出提示；
+- **字幕停靠/避让**：底部/顶部停靠、Y 偏移（避让平台原生字幕）、横向拖动、深/浅/无背景、背景不透明度、字号，全部持久化；
+- **导出本次 SRT**：客户端累积 segment+translation，按会话时间轴生成双语 SRT 并下载；
+- **引擎未连接引导**：`npm start` 步骤、`/health` 检测、一键重试连接；
+- **状态信息**：provider / 音色 / 语言方向、ASR/翻译/配音/端到端延迟细分；
+- 设置面板可拖拽、可收起；结束会话恢复所有压音元素并清理 offscreen。
+
 > 协议、时间轴、事件定义见 `docs/CONTRACTS.md` §3；引擎入口 `engine/server.mjs`。
 > 本目录零 npm 依赖、无远程代码 / CDN / 内联脚本，所有资源随扩展本地打包。
 
@@ -21,7 +30,9 @@ extension/
 ├── popup.html/js          # 工具栏弹窗：引擎地址、开始/停止、音色模式、延迟、错误
 ├── lib/
 │   ├── constants.js       # 共享常量：默认地址 / storage key / 消息类型 / 设置默认值 / URL 规范化
-│   └── pcm.js             # 纯函数：PCM 编解码、重采样、base64、hello、文本清洗、duck 状态机
+│   ├── pcm.js             # 纯函数：PCM 编解码、重采样、base64、hello、文本清洗、duck 状态机、dub 排期
+│   ├── ui.js              # v0.2 纯函数：全屏宿主选择/迁移、字幕停靠/避让布局、展示设置规范化
+│   └── srt.js             # v0.2 纯函数：caption -> SRT（时间戳/双语/文件名）
 ├── worklet/pcm-worklet.js # AudioWorklet：100ms 分片 + 兜底重采样到 16kHz + float32→s16
 └── README.md
 tests/extension.test.mjs   # manifest / 静态检查 / 纯函数单测（node --test）
@@ -72,6 +83,9 @@ offscreen: getUserMedia(tab) ─▶ 16k AudioContext + AudioWorklet（100ms）
 - 断线重连：指数退避 0.5s→1s→2s→4s→8s→10s（上限 10s），重连成功后重新发 `hello`、时间轴归零；断线期间的音频直接丢弃（实时同传不做长缓存）。
 - 停止：offscreen 先发 `{type:'control', action:'stop'}` 再关闭 WS / 音轨 / AudioContext，background 随后关闭 offscreen document。
 - 压音：content script 记录页面 `video/audio` 原始 `volume`，引擎状态 `speaking` 或收到 `dub` 时把音量设为 `原音量 × duckRatio`（默认 0.18），空闲 800ms 后恢复；停止/异常时全部恢复。
+- 全屏：监听 `fullscreenchange`，容器型全屏元素（`<div>` 播放器壳）可承载浮层，直接把同一个 Shadow DOM host 迁进去（`position:fixed` 仍相对视口），退出后迁回 `document.documentElement`；`<video>`/`<canvas>` 等替换元素自身全屏时浏览器不允许子节点渲染，浮层保持挂载但不显示，并弹提示。
+- SRT：background 累积 `segment`（t0Ms/t1Ms/src）+ `translation`（dst）到 `chrome.storage.session`（最多 400 句），
+  导出时用 `lib/srt.js` 生成双语 SRT；content 浮层与 popup 都可触发下载。
 
 ## 排障（按顺序排查）
 
@@ -116,10 +130,23 @@ offscreen: getUserMedia(tab) ─▶ 16k AudioContext + AudioWorklet（100ms）
 | 12 | SPA 站点内跳转（如 YouTube 视频切换） | 浮层保持、继续更新字幕 |
 | 13 | 在 `chrome://extensions` 页面点开始 | 显示「当前页面不支持抓音」可读错误，无未捕获异常 |
 | 14 | 多标签页同时只允许一个会话 | 第二个标签页点开始会提示已在运行（先停止） |
+| 15 | 在 YouTube/B 站播放器上进入**全屏**（容器型） | 字幕浮层与状态胶囊跟随进入全屏、位置正常；退出全屏后回到页面右下/底部，不丢设置 |
+| 16 | 点胶囊打开设置 → 位置切「顶部」、拖动「避让」滑块 | 字幕移动到顶部/按偏移避让；刷新页面后仍保持 |
+| 17 | 设置 → 背景切换深/浅/无，拖「不透明度」 | 字幕背景立即变化，文字仍清晰可读；持久化 |
+| 18 | 拖动设置面板标题栏、点右上角 ▾ 收起 | 面板可移动、可收起/展开，位置保存 |
+| 19 | 播放视频说几句后点「导出 SRT」（浮层或 popup） | 下载 `livedub-<标题>-<时间>.srt`，时间轴/双语行正确，可被播放器加载 |
+| 20 | 拖动字幕框左右/上下 | 位置跟随手指，刷新后保持（横向偏移 + 避让） |
+| 21 | 引擎未启动时打开 popup | 显示「未连接本地引擎」引导（npm start / /health 步骤）；点「检测引擎」显示离线；启动引擎后点「重新检测」变在线 |
+| 22 | 运行中 kill 引擎，再重启 | 胶囊/popup 显示重连中；点「重试连接」立即重连；字幕恢复 |
+| 23 | 停止会话 | 页面音量全部恢复；offscreen document 关闭；字幕仍在（可继续导出本次 SRT） |
+| 24 | 在 `<video>` 元素被直接全屏的站点（如部分原生播放器）进入全屏 | 弹出「浏览器限制」提示；退出全屏后浮层恢复（诚实限制，见下） |
 
 ## 已知限制 / TODO
 
-- **无法自动化验证真实 tabCapture**：本机/CI 无法在无头环境点击扩展图标并播放真实视频，自动测试只做 manifest、静态检查、纯函数单测；音画同步、真实抓音必须按上面的手动清单验证。
+- **无法自动化验证真实 tabCapture**：本机/CI 无法在无头环境点击扩展图标并播放真实视频，自动测试只做 manifest、静态检查、纯函数单测、线协议冒烟；音画同步、真实抓音、全屏/导出/SRT 下载必须按上面的手动清单验证。
+- **原生全屏的浏览器限制**：如果站点直接把 `<video>` 元素请求全屏（而不是播放器容器），浏览器只渲染该替换元素，任何扩展/脚本都无法在其上叠加 DOM；浮层此时不可见，会给出中文提示。YouTube/B 站等容器型全屏正常工作。
+- **SRT 时间轴**：SRT 使用客户端会话时间轴（第一段音频为 0），不是视频文件自身的 `currentTime`；若需要与视频文件精确对齐，后续可用 `tMsBase`/视频时间戳扩展协议（当前契约未要求）。
+- SRT 只累积最近 400 句（约几十分钟），超长课程可分多次导出；刷新页面/重启扩展后 background 会从 `chrome.storage.session` 恢复上次累积。
 - 压音只作用于页面里可见的 `<video>/<audio>` 元素，且只在顶层 frame（manifest `all_frames: false`）：iframe 播放器（部分网课平台）与 Web Audio API 直出音频的站点不会被压音。
 - 克隆音色依赖引擎侧能力：当前 Token Plan 不支持 `voice_clone` 时会自动降级为预设音色（浮层/弹窗会提示降级原因）。
 - 同一时间只支持一个标签页抓音（`tabCapture` 会话为全局单例逻辑）；引擎地址修改对运行中的会话不生效，需停止后重新开始。
@@ -139,7 +166,9 @@ node --test tests/extension.test.mjs
 - `manifest.json`：MV3、权限集合、`content_scripts` `<all_urls>` + `all_frames:false`、action popup、module service worker、无远程代码；
 - 所有扩展 JS 的 `node --check` 语法检查；
 - `lib/pcm.js` 纯函数：float32↔s16、s16le、48k→16k 重采样、二进制音频帧与 `engine/protocol.mjs` **字节级一致**、base64、hello 与 `normalizeHello` 兼容、文本清洗/截断、duck 状态机；
-- `lib/constants.js`：默认引擎地址、URL 规范化、工作台地址推导、消息类型/设置默认值；
+- `lib/constants.js`：默认引擎地址、URL 规范化、工作台地址推导（/studio/）、健康检查地址、消息类型/设置默认值；
+- `lib/ui.js`：全屏宿主选择/迁移决策、字幕停靠/避让布局、背景/透明度/字号/压音规范化（含 v0.1 subsPos 迁移）；
+- `lib/srt.js`：SRT 时间戳、caption 排序/防重叠/兜底时长、双语行折叠、文件名清洗与时间戳；
 - **线协议冒烟**：用 Node 起一个 `engine/ws.mjs` 回环服务，验证扩展的 `hello` + 二进制音频帧 + `control stop` 能被引擎解析；
 - `computeDubPlayhead`：dub 按 `startMs` 排期、落后立即播；
 - content/background/offscreen/popup 的关键实现静态断言（user gesture、offscreen reasons、Shadow DOM、压音 800ms 等）。

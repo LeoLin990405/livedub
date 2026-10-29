@@ -81,6 +81,63 @@ function sessionProviderInfo(config) {
   };
 }
 
+/** 兼容两代翻译层：有 createClauseExtractor 就用真实实现，否则退到内置的简化版。 */
+let clauseExtractorModulePromise = null;
+async function loadClauseExtractorFactory() {
+  if (!clauseExtractorModulePromise) {
+    clauseExtractorModulePromise = import('./translate/index.mjs')
+      .then((m) => (typeof m.createClauseExtractor === 'function' ? m.createClauseExtractor : null))
+      .catch(() => null);
+  }
+  return clauseExtractorModulePromise;
+}
+
+/** 简化版子句提取器（翻译层 helper 不可用时的兜底；不追求稳定性判定） */
+function createNaiveClauseExtractor({ minClauseChars = 8, maxChunkChars = 80, stabilityMs = 250 } = {}) {
+  let emittedLength = 0;
+  let lastText = '';
+  let lastChangeAt = 0;
+  return {
+    push(cumulativeText) {
+      const text = String(cumulativeText ?? '');
+      const nowMs = Date.now();
+      if (text !== lastText) {
+        lastText = text;
+        lastChangeAt = nowMs;
+      }
+      if (text.length < emittedLength) emittedLength = 0;
+      if (nowMs - lastChangeAt < stabilityMs) return [];
+      const rest = text.slice(emittedLength);
+      const match = rest.match(/^[\s\S]*?[。！？；;.!?…]/);
+      if (!match) return [];
+      const raw = match[0];
+      const clause = raw.trim();
+      if (clause.length < minClauseChars) return [];
+      emittedLength += raw.length;
+      return [clause];
+    },
+    flush(finalText) {
+      const text = String(finalText ?? '');
+      const rest = text.slice(Math.min(emittedLength, text.length)).trim();
+      emittedLength = text.length;
+      if (!rest) return [];
+      const parts = rest.match(/[^。！？；;.!?…]+[。！？；;.!?…]?/g) ?? [rest];
+      const out = [];
+      for (const part of parts) {
+        const clause = String(part).trim();
+        if (!clause) continue;
+        for (let i = 0; i < clause.length; i += maxChunkChars) out.push(clause.slice(i, i + maxChunkChars));
+      }
+      return out;
+    },
+    reset() {
+      emittedLength = 0;
+      lastText = '';
+      lastChangeAt = 0;
+    },
+  };
+}
+
 let sessionSeq = 0;
 
 export class Session {
@@ -114,6 +171,7 @@ export class Session {
     this._glossary = [];
     this._voiceInfo = null;
     this._splitForTts = null;
+    this._clauseExtractorFactory = null;
     this._ttsFallbacks = [];
   }
 
@@ -135,6 +193,12 @@ export class Session {
 
     // 各层初始化：TTS/翻译先建，ASR 最慢（可能拉起 whisper-server）
     this.tts = await this.deps.createTts({ config: this.config, log });
+    // 预热 TTS（后台进行，失败不致命）：让首个配音请求少一次冷连接
+    if (typeof this.tts?.warmup === 'function') {
+      Promise.resolve()
+        .then(() => this.tts.warmup())
+        .catch((err) => this.log(`tts warmup failed: ${err.message}`));
+    }
     this.translator = await this.deps.createTranslator({ config: this.config, log });
     this.scheduler = this.deps.createScheduler ? await this.deps.createScheduler({ config: this.config, log }) : null;
     this.voice = this.deps.createVoiceManager ? await this.deps.createVoiceManager({ config: this.config, tts: this.tts, log }) : null;
@@ -147,7 +211,18 @@ export class Session {
         /* T3 尚未实现时退到 registry 兜底 */
       }
     }
-    this.asr = await this.deps.createAsr({ config: this.config, log, onEvent: (ev) => this._onAsrEvent(ev) });
+    if (typeof this.deps.createClauseExtractor === 'function') {
+      this._clauseExtractorFactory = this.deps.createClauseExtractor;
+    } else {
+      const factory = await loadClauseExtractorFactory();
+      if (factory) this._clauseExtractorFactory = factory;
+    }
+    this.asr = await this.deps.createAsr({
+      config: this.config,
+      log,
+      onEvent: (ev) => this._onAsrEvent(ev),
+      onError: (info) => this._onAsrError(info),
+    });
 
     // 初始音色（preset；克隆在拿到足够语音样本后再尝试）
     try {
@@ -384,8 +459,13 @@ export class Session {
       }
     }
 
-    // ---- 翻译 ----
-    let translated = '';
+    const dubEnabled = this.config?.dub?.enabled !== false;
+    // 默认开启「翻译流式 x TTS 重叠」：已稳定的子句先合成，缩短第一个配音可播时间
+    const overlap = dubEnabled && this.config?.dub?.overlapStreaming !== false;
+    const dubStream = dubEnabled ? this._createDubStreamer(id, segment) : null;
+    const extractor = overlap ? this._createClauseExtractor() : null;
+    let translateFailed = false;
+
     try {
       this._send(statusEvent('translating', '', t1Ms));
       let firstWall = null;
@@ -402,33 +482,52 @@ export class Session {
             this.metrics.mark(id, 'mtFirstAt', firstWall);
           }
           this._send({ type: MSG.TRANSLATION, id, text: p, final: false });
+          if (overlap && dubStream && extractor) {
+            let clauses = [];
+            try {
+              clauses = extractor.push(p) ?? [];
+            } catch (err) {
+              this.log(`clause extractor failed: ${err.message}`);
+            }
+            for (const clause of clauses) dubStream.enqueue(clause);
+          }
         },
       });
       this.metrics.mark(id, 'mtDoneAt');
-      translated = String(result?.text ?? '').trim();
+      const translated = String(result?.text ?? '').trim();
       if (!translated) throw new Error('翻译结果为空');
       this._send({ type: MSG.TRANSLATION, id, text: translated, final: true });
       this._context.push({ src: text, dst: translated });
       if (this._context.length > 8) this._context.shift();
+
+      if (dubStream) {
+        let rest = [];
+        if (overlap && extractor) {
+          try {
+            rest = extractor.flush(translated) ?? [];
+          } catch (err) {
+            this.log(`clause extractor flush failed: ${err.message}`);
+            rest = this._splitClauses(translated);
+          }
+        } else {
+          rest = this._splitClauses(translated);
+        }
+        for (const clause of rest) dubStream.enqueue(clause);
+      }
     } catch (err) {
+      translateFailed = true;
       this.log(`translate failed: ${err.message}`);
       this._send(errorEvent('translate', `翻译失败：${err.message}`, { segmentId: id, tsMs: t1Ms }));
-      this._sendMetrics(id, { t0Ms, t1Ms, failed: 'translate' });
-      return;
     }
 
-    // ---- 配音（TTS）----
-    if (this.config?.dub?.enabled === false) {
-      this._sendMetrics(id, { t0Ms, t1Ms });
-      return;
+    if (dubStream) {
+      try {
+        await dubStream.finish();
+      } catch (err) {
+        this.log(`dub stream failed: ${err.message}`);
+      }
     }
-    this._ttsQueue = this._ttsQueue
-      .then(() => this._synthesizeDubs(id, translated, segment))
-      .catch((err) => {
-        this.log(`dub pipeline error: ${err.message}`);
-        this._send(errorEvent('tts', `配音失败：${err.message}`, { segmentId: id }));
-      })
-      .finally(() => this._sendMetrics(id, { t0Ms, t1Ms }));
+    this._sendMetrics(id, { t0Ms, t1Ms, ...(translateFailed ? { failed: 'translate' } : {}) });
   }
 
   _splitClauses(text) {
@@ -445,94 +544,140 @@ export class Session {
     return clauses;
   }
 
-  async _synthesizeDubs(id, text, segment) {
-    if (this._closed) return;
-    const clauses = this._splitClauses(text);
-    let seq = 0;
-    let scheduledEndMs = 0;
-    let firstChunk = true;
-    const voiceId = this._voiceInfo?.voiceId || this.config?.tts?.presetVoices?.default || '';
-    const speed = Number(this.config?.tts?.speed) || 1;
-    for (const clause of clauses) {
-      if (this._closed) break;
+  _createClauseExtractor() {
+    const opts = {
+      minClauseChars: this.config?.tts?.chunk?.minClauseChars ?? 8,
+      maxChunkChars: this.config?.tts?.chunk?.maxChunkChars ?? 80,
+      stabilityMs: this.config?.translate?.clauseStabilityMs ?? 250,
+    };
+    if (typeof this._clauseExtractorFactory === 'function') {
       try {
-        let emitted = false;
-        const emitChunk = (pcm, sampleRate) => {
-          const buf = Buffer.isBuffer(pcm) ? pcm : Buffer.from(pcm ?? []);
-          if (buf.length === 0) return;
-          const rate = Number(sampleRate) || Number(this.config?.tts?.sampleRate) || 24000;
-          const durationMs = pcmDurationMs(buf, rate);
-          const readyAtMs = this._currentSessionMs();
-          let plan = { action: 'play', startMs: readyAtMs, rate: 1 };
-          try {
-            if (this.scheduler) {
-              plan = this.scheduler.plan({
-                readyAtMs,
-                durationMs,
-                playheadMs: readyAtMs,
-                lagMs: Math.max(0, readyAtMs - segment.t1Ms),
-              });
-            }
-          } catch (err) {
-            this.log(`scheduler plan failed: ${err.message}`);
-          }
-          if (plan.action === 'skip') {
-            this.log(`drop stale dub chunk id=${id} (lag=${Math.round(readyAtMs - segment.t1Ms)}ms)`);
-            return;
-          }
-          const startMs = Math.max(Math.round(plan.startMs ?? readyAtMs), scheduledEndMs);
-          scheduledEndMs = startMs + durationMs;
-          if (firstChunk) {
-            firstChunk = false;
-            this.metrics.mark(id, 'ttsFirstAt');
-            this.metrics.mark(id, 'dubFirstAt');
-          }
+        return this._clauseExtractorFactory(opts);
+      } catch (err) {
+        this.log(`createClauseExtractor failed: ${err.message}`);
+      }
+    }
+    return createNaiveClauseExtractor(opts);
+  }
+
+  _onAsrError(info) {
+    const message = typeof info === 'string' ? info : info?.message ?? info?.error ?? '未知识别错误';
+    this.log(`asr error: ${message}`);
+    this._send(errorEvent('asr', `识别失败：${String(message).slice(0, 300)}`, { recoverable: true }));
+  }
+
+  /** 一个句子的配音流：可被翻译的 partial 提前 enqueue 子句，最后 finish 收尾（顺序/时间轴由内部状态维护） */
+  _createDubStreamer(id, segment) {
+    const state = {
+      seq: 0,
+      scheduledEndMs: 0,
+      firstChunk: true,
+      voiceId: this._voiceInfo?.voiceId || this.config?.tts?.presetVoices?.default || '',
+      speed: Number(this.config?.tts?.speed) || 1,
+      sampleRate: Number(this.config?.tts?.sampleRate) || 24000,
+    };
+    let chain = Promise.resolve();
+    let finished = false;
+    return {
+      enqueue: (clause) => {
+        const text = String(clause ?? '').trim();
+        if (!text || finished || this._closed) return;
+        chain = chain
+          .then(() => this._synthesizeClause(id, text, segment, state))
+          .catch((err) => {
+            if (this._closed || err?.name === 'AbortError') return;
+            this.log(`tts clause chain error id=${id}: ${err.message}`);
+            this._send(errorEvent('tts', `配音失败：${err.message}`, { segmentId: id, recoverable: true }));
+          });
+      },
+      finish: async () => {
+        if (finished) return;
+        finished = true;
+        await chain;
+        if (state.seq > 0) {
+          this.metrics.mark(id, 'ttsDoneAt');
+          // 结束标记：空音频 + final=true（客户端收到空 pcm 忽略播放，仅用于收尾）
           this._send({
             type: MSG.DUB,
             id,
-            seq: seq++,
-            startMs,
-            sampleRate: rate,
+            seq: state.seq,
+            startMs: state.scheduledEndMs,
+            sampleRate: state.sampleRate,
             format: 's16le',
-            pcm: base64Pcm(buf),
-            durationMs,
-            voiceId,
-            final: false,
+            pcm: '',
+            durationMs: 0,
+            voiceId: state.voiceId,
+            final: true,
           });
-          emitted = true;
-          this._markSpeaking(durationMs);
-        };
-
-        if (typeof this.tts.synthesizeStream === 'function') {
-          for await (const chunk of this.tts.synthesizeStream({ text: clause, voiceId, speed, signal: this._abort.signal })) {
-            if (this._closed) break;
-            emitChunk(chunk?.pcm, chunk?.sampleRate);
-          }
-        } else {
-          const res = await this.tts.synthesize({ text: clause, voiceId, speed, signal: this._abort.signal });
-          emitChunk(res?.pcm, res?.sampleRate);
         }
-        if (!emitted) this.log(`tts returned no audio for clause: ${clause.slice(0, 20)}`);
+      },
+    };
+  }
+
+  async _synthesizeClause(id, clause, segment, state) {
+    if (this._closed) return;
+    let emitted = false;
+    const emitChunk = (pcm, sampleRate) => {
+      const buf = Buffer.isBuffer(pcm) ? pcm : Buffer.from(pcm ?? []);
+      if (buf.length === 0) return;
+      const rate = Number(sampleRate) || state.sampleRate;
+      const durationMs = pcmDurationMs(buf, rate);
+      const readyAtMs = this._currentSessionMs();
+      let plan = { action: 'play', startMs: readyAtMs, rate: 1 };
+      try {
+        if (this.scheduler) {
+          plan = this.scheduler.plan({
+            readyAtMs,
+            durationMs,
+            playheadMs: readyAtMs,
+            lagMs: Math.max(0, readyAtMs - segment.t1Ms),
+          });
+        }
       } catch (err) {
-        this.log(`tts clause failed: ${err.message}`);
-        this._send(errorEvent('tts', `配音失败：${err.message}`, { segmentId: id, recoverable: true }));
+        this.log(`scheduler plan failed: ${err.message}`);
       }
-    }
-    if (seq > 0) {
-      this.metrics.mark(id, 'ttsDoneAt');
-      // 结束标记：空音频 + final=true（客户端收到空 pcm 应忽略播放，仅用于收尾）
+      if (plan.action === 'skip') {
+        this.log(`drop stale dub chunk id=${id} (lag=${Math.round(readyAtMs - segment.t1Ms)}ms)`);
+        return;
+      }
+      const startMs = Math.max(Math.round(plan.startMs ?? readyAtMs), state.scheduledEndMs);
+      state.scheduledEndMs = startMs + durationMs;
+      if (state.firstChunk) {
+        state.firstChunk = false;
+        this.metrics.mark(id, 'ttsFirstAt');
+        this.metrics.mark(id, 'dubFirstAt');
+      }
       this._send({
         type: MSG.DUB,
         id,
-        seq,
-        startMs: scheduledEndMs,
-        sampleRate: Number(this.config?.tts?.sampleRate) || 24000,
+        seq: state.seq++,
+        startMs,
+        sampleRate: rate,
         format: 's16le',
-        pcm: '',
-        durationMs: 0,
-        voiceId,
-        final: true,
+        pcm: base64Pcm(buf),
+        durationMs,
+        voiceId: state.voiceId,
+        final: false,
       });
+      emitted = true;
+      this._markSpeaking(durationMs);
+    };
+
+    try {
+      if (typeof this.tts.synthesizeStream === 'function') {
+        for await (const chunk of this.tts.synthesizeStream({ text: clause, voiceId: state.voiceId, speed: state.speed, signal: this._abort.signal })) {
+          if (this._closed) break;
+          emitChunk(chunk?.pcm, chunk?.sampleRate);
+        }
+      } else {
+        const res = await this.tts.synthesize({ text: clause, voiceId: state.voiceId, speed: state.speed, signal: this._abort.signal });
+        emitChunk(res?.pcm, res?.sampleRate);
+      }
+      if (!emitted) this.log(`tts returned no audio for clause: ${clause.slice(0, 20)}`);
+    } catch (err) {
+      if (this._closed || err?.name === 'AbortError') return;
+      this.log(`tts clause failed: ${err.message}`);
+      this._send(errorEvent('tts', `配音失败：${err.message}`, { segmentId: id, recoverable: true }));
     }
   }
 

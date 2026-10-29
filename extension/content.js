@@ -1,17 +1,20 @@
 /**
  * livedub Chrome MV3 扩展 —— content script（每个页面一个实例，classic script）。
  *
- * 只做「显示 + 压音」，不直接连引擎：
- * - Shadow DOM 浮层（不污染页面样式）：底部双语字幕（原文灰色小字 + 译文白色大字，可拖拽）、
- *   右上角状态胶囊 + 延迟、点击胶囊展开设置面板；
- * - 压音：记录页面所有 video/audio 原 volume，引擎 state=speaking / 收到 dub 时把音量
- *   压到 duckRatio（默认 0.18），空闲 800ms 后恢复；停止/异常时全部恢复；
- * - SPA 导航 / 页面重建 body / 新视频出现时保持浮层（MutationObserver + 轻量 interval）；
- * - 从 background 的 runtime 消息增量更新（chrome.runtime.onMessage）。
+ * v0.2：
+ * - 原生全屏兼容：`fullscreenchange` 时把浮层迁进 `document.fullscreenElement`（容器型），
+ *   退出后迁回 document；`<video>` 直接全屏时浏览器不允许叠加自定义 DOM，会展示提示（诚实限制）；
+ * - 字幕停靠 bottom/top + Y 偏移避让平台原生字幕、背景/不透明度、字号，全部持久化；
+ * - 设置面板可拖拽、可收起；
+ * - 导出本次 SRT（background 累积 segment+translation，基于 lib/srt.js 生成）；
+ * - 引擎未连接/断线时给出可操作指引（npm start / /health / 重试连接）；
+ * - 延迟细分展示（ASR / 翻译 / 配音 / 端到端）；
+ * - 结束时恢复所有被压音元素、清理定时器与拖拽状态。
  *
- * 为什么是 classic script：MV3 content_scripts 不能直接 import ESM。因此这里内联了
- * 与 extension/lib/constants.js、lib/pcm.js 等价的少量常量/逻辑（有注释标注），
- * tests/extension.test.mjs 会做一致性校验。
+ * 只做「显示 + 压音」，不直接连引擎：从 background 的 runtime 消息增量更新。
+ * 为什么是 classic script：MV3 content_scripts 不能 import ESM。因此这里内联了与
+ * extension/lib/{pcm,ui,constants,srt}.js 等价的少量纯逻辑（有注释标注），
+ * tests/extension.test.mjs 会对 lib 版本做单测、并对本文件做关键实现静态校验。
  */
 
 (() => {
@@ -22,7 +25,7 @@
   globalThis.__livedubContentLoaded = true;
 
   // -------------------------------------------------------------------------
-  // 常量 / 默认设置（与 extension/lib/constants.js 保持一致）
+  // 常量 / 默认设置（与 extension/lib/constants.js + lib/ui.js 保持一致）
   // -------------------------------------------------------------------------
 
   const M = {
@@ -32,6 +35,8 @@
     PING: 'livedub:ping',
     CONTENT_READY: 'livedub:content-ready',
     CONTENT_TOGGLE: 'livedub:toggle-capture',
+    GET_SRT: 'livedub:get-srt',
+    RECONNECT: 'livedub:reconnect',
   };
   const STORAGE_SETTINGS_KEY = 'livedub:settings';
   const DEFAULT_SETTINGS = {
@@ -41,18 +46,29 @@
     duckRatio: 0.18,
     showOriginal: true,
     fontSize: 22,
+    dock: 'bottom',
+    offsetY: 0,
+    dx: 0,
+    subsOpacity: 0.82,
+    subsBg: 'dark',
     langFrom: 'en',
     langTo: 'zh',
     hidden: false,
-    subsPos: null,
+    panelCollapsed: false,
+    panelPos: null,
   };
+  /** 与 lib/ui.js 对齐：这些全屏元素无法承载子节点（替换元素） */
+  const NON_HOSTABLE_TAGS = ['VIDEO', 'AUDIO', 'IMG', 'CANVAS', 'IFRAME', 'OBJECT', 'EMBED', 'PICTURE', 'SVG'];
+  const OFFSET_Y_MIN = -200;
+  const OFFSET_Y_MAX = 320;
+  const OFFSET_X_LIMIT = 480;
   /** 配音结束/说话结束后多久恢复原音量 */
   const IDLE_RESTORE_MS = 800;
   /** 字幕保留块数 */
   const MAX_BLOCKS = 3;
   /** 字幕块最长保留时间 */
   const BLOCK_TTL_MS = 25000;
-  /** 浮层轮询间隔（压音 tick / 字幕过期 / SPA 检查） */
+  /** 浮层轮询间隔（压音 tick / 字幕过期 / SPA / 全屏兜底检查） */
   const TICK_MS = 500;
 
   const runtime = {
@@ -60,38 +76,62 @@
     bgState: null,
     sessionKey: null,
     metrics: null,
-    notice: '',
     error: null,
     errorTimer: null,
     items: new Map(), // key -> {key, src, dst, draft, ts}
     host: null,
     shadow: null,
+    hostKind: null, // 'document' | 'fullscreen'
+    hostParent: null,
     els: {},
     drag: null,
+    panelDrag: null,
     trackedMedia: new Map(), // HTMLMediaElement -> originalVolume
     duck: { ducking: false, idleSince: null, lastActivity: 0 },
     panelOpen: false,
     mounted: false,
+    fullscreenBareVideo: false,
+    fullscreenHintShown: false,
   };
 
   const now = () => (typeof performance !== 'undefined' && performance.now ? performance.now() : Date.now());
 
   // -------------------------------------------------------------------------
   // 设置（chrome.storage.local，popup 与浮层共享）
+  // 仅展示类字段做 clamp；引擎/语音字段透传
   // -------------------------------------------------------------------------
+
+  function clampNumber(value, min, max, fallback) {
+    const num = Number(value);
+    if (!Number.isFinite(num)) return fallback;
+    return Math.min(max, Math.max(min, num));
+  }
 
   function normalizeSettings(raw) {
     const merged = { ...DEFAULT_SETTINGS, ...(raw && typeof raw === 'object' ? raw : {}) };
-    merged.fontSize = Math.min(32, Math.max(14, Number(merged.fontSize) || DEFAULT_SETTINGS.fontSize));
-    merged.duckRatio = Math.min(1, Math.max(0.02, Number(merged.duckRatio) || DEFAULT_SETTINGS.duckRatio));
+    // v0.1 的 subsPos = {dx, dy} 迁移到 v0.2 的 dx + offsetY
+    let dx = merged.dx;
+    let offsetY = merged.offsetY;
+    if (merged.subsPos && typeof merged.subsPos === 'object' && dx == null && offsetY == null) {
+      dx = Number(merged.subsPos.dx) || 0;
+      offsetY = -(Number(merged.subsPos.dy) || 0);
+    }
+    merged.fontSize = Math.round(clampNumber(merged.fontSize, 14, 32, 22));
+    merged.duckRatio = clampNumber(merged.duckRatio, 0.02, 1, 0.18);
+    merged.subsOpacity = clampNumber(merged.subsOpacity, 0.2, 1, 0.82);
+    merged.offsetY = Math.round(clampNumber(offsetY, OFFSET_Y_MIN, OFFSET_Y_MAX, 0));
+    merged.dx = Math.round(clampNumber(dx, -OFFSET_X_LIMIT, OFFSET_X_LIMIT, 0));
+    merged.dock = merged.dock === 'top' ? 'top' : 'bottom';
+    merged.subsBg = ['dark', 'light', 'none'].includes(merged.subsBg) ? merged.subsBg : 'dark';
+    merged.panelCollapsed = merged.panelCollapsed === true;
     merged.dubEnabled = merged.dubEnabled !== false;
     merged.showOriginal = merged.showOriginal !== false;
     merged.hidden = merged.hidden === true;
-    if (merged.subsPos && typeof merged.subsPos === 'object') {
-      merged.subsPos = { dx: Number(merged.subsPos.dx) || 0, dy: Number(merged.subsPos.dy) || 0 };
-    } else {
-      merged.subsPos = null;
-    }
+    merged.panelPos =
+      merged.panelPos && typeof merged.panelPos === 'object'
+        ? { dx: Math.round(Number(merged.panelPos.dx) || 0), dy: Math.round(Number(merged.panelPos.dy) || 0) }
+        : null;
+    delete merged.subsPos;
     return merged;
   }
 
@@ -106,31 +146,50 @@
 
   async function saveSettings(patch) {
     runtime.settings = normalizeSettings({ ...runtime.settings, ...patch });
-    applySettings(runtime.settings, { skipPanelSync: false });
+    applySettings(runtime.settings);
     try {
       await chrome.storage.local.set({ [STORAGE_SETTINGS_KEY]: runtime.settings });
     } catch {
-      /* 隐私模式等场景下 storage 写失败不影响展示 */
+      /* 隐私模式等场景 storage 写失败不影响展示 */
     }
   }
 
-  function applySettings(settings, { skipPanelSync = false } = {}) {
+  function applySettings(settings) {
     runtime.settings = normalizeSettings(settings);
-    if (!skipPanelSync) syncPanelControls();
+    syncPanelControls();
     applyOverlayVisibility();
-    applySubtitleStyle();
+    applySubsLayout();
+    applyPanelPosition();
     renderSubtitles();
+    renderMeta();
+  }
+
+  function formatSettingValue(key, value) {
+    if (key === 'fontSize') return `${value}px`;
+    if (key === 'offsetY') return `${value}px`;
+    if (key === 'subsOpacity') return `${Math.round(value * 100)}%`;
+    if (key === 'duckRatio') return String(value);
+    return String(value);
   }
 
   function syncPanelControls() {
     const panel = runtime.els.panel;
     if (!panel) return;
-    for (const input of panel.querySelectorAll('input[data-set]')) {
+    for (const input of panel.querySelectorAll('input[data-set], select[data-set]')) {
       const key = input.getAttribute('data-set');
       if (input.type === 'checkbox') input.checked = !!runtime.settings[key];
       else input.value = runtime.settings[key];
       const valueEl = panel.querySelector(`[data-val="${key}"]`);
-      if (valueEl) valueEl.textContent = String(runtime.settings[key]);
+      if (valueEl) valueEl.textContent = formatSettingValue(key, runtime.settings[key]);
+    }
+    for (const button of panel.querySelectorAll('[data-act^="dock-"]')) {
+      const active = button.getAttribute('data-act') === `dock-${runtime.settings.dock}`;
+      button.classList.toggle('active', active);
+    }
+    if (runtime.els.panelBody) runtime.els.panelBody.hidden = runtime.settings.panelCollapsed;
+    if (runtime.els.collapseButton) {
+      runtime.els.collapseButton.textContent = runtime.settings.panelCollapsed ? '▸' : '▾';
+      runtime.els.collapseButton.title = runtime.settings.panelCollapsed ? '展开设置' : '收起设置';
     }
   }
 
@@ -166,29 +225,74 @@
     .livedub-capsule .lat { color: #b8bdd0; font-variant-numeric: tabular-nums; }
     .livedub-capsule .gear { color: #b8bdd0; font-size: 12px; }
     .livedub-panel {
-      position: fixed; top: 52px; right: 14px; width: 264px;
-      padding: 12px 14px; border-radius: 14px;
-      background: rgba(14, 16, 24, 0.92);
+      position: fixed; top: 52px; right: 14px; width: 292px;
+      max-height: calc(100vh - 78px); overflow-y: auto; overflow-x: hidden;
+      padding: 11px 13px; border-radius: 14px;
+      background: rgba(14, 16, 24, 0.94);
       border: 1px solid rgba(255, 255, 255, 0.14);
       box-shadow: 0 12px 32px rgba(0, 0, 0, 0.45);
       backdrop-filter: blur(10px);
       pointer-events: auto; font-size: 13px; color: #e9ebf3;
+      scrollbar-width: thin;
     }
     .livedub-panel[hidden] { display: none; }
-    .livedub-panel .row { display: flex; align-items: center; gap: 8px; margin: 8px 0; }
-    .livedub-panel .row label { display: flex; align-items: center; gap: 6px; flex: 1; }
-    .livedub-panel .row input[type="range"] { flex: 1; accent-color: #7c9cff; }
-    .livedub-panel .row .val { min-width: 34px; text-align: right; color: #b8bdd0; font-variant-numeric: tabular-nums; }
-    .livedub-panel .actions { gap: 8px; margin-top: 10px; }
-    .livedub-panel button {
-      flex: 1; padding: 7px 8px; border-radius: 9px; border: 1px solid rgba(255, 255, 255, 0.18);
-      background: rgba(255, 255, 255, 0.10); color: #f2f3f7; font-size: 13px; cursor: pointer;
-      font-family: inherit;
+    .livedub-panel-head {
+      display: flex; align-items: center; justify-content: space-between; gap: 8px;
+      padding-bottom: 7px; margin-bottom: 6px;
+      border-bottom: 1px solid rgba(255, 255, 255, 0.10);
+      cursor: grab; user-select: none;
     }
-    .livedub-panel button:hover { background: rgba(255, 255, 255, 0.18); }
+    .livedub-panel-head:active { cursor: grabbing; }
+    .livedub-panel-title { font-size: 12.5px; font-weight: 600; letter-spacing: 0.2px; }
+    .livedub-panel-title .brand { color: #7c9cff; }
+    .livedub-panel-head button {
+      flex: none; width: 24px; height: 21px; padding: 0;
+      background: rgba(255, 255, 255, 0.08); border: 1px solid rgba(255, 255, 255, 0.16);
+      border-radius: 6px; color: #b8bdd0; font-size: 12px; line-height: 1; cursor: pointer;
+    }
+    .livedub-panel-body[hidden] { display: none; }
+    .livedub-panel .row { display: flex; align-items: center; gap: 8px; margin: 7px 0; }
+    .livedub-panel .row label { display: flex; align-items: center; gap: 6px; flex: 1; min-width: 0; }
+    .livedub-panel .row .row-label { color: #b8bdd0; flex: none; }
+    .livedub-panel .row input[type="range"] { flex: 1; min-width: 0; accent-color: #7c9cff; }
+    .livedub-panel .row select {
+      flex: 1; min-width: 0; padding: 4px 6px; border-radius: 7px;
+      background: rgba(255, 255, 255, 0.08); border: 1px solid rgba(255, 255, 255, 0.16);
+      color: #e9ebf3; font-size: 12px; font-family: inherit;
+    }
+    .livedub-panel .row select option { background: #1a1d28; color: #e9ebf3; }
+    .livedub-panel .row .val { min-width: 40px; text-align: right; color: #b8bdd0; font-variant-numeric: tabular-nums; font-size: 11.5px; }
+    .livedub-panel .seg { display: inline-flex; gap: 4px; flex: 1; justify-content: flex-end; }
+    .livedub-panel .seg button { flex: none; padding: 4px 10px; font-size: 12px; }
+    .livedub-panel .seg button.active { background: #3f5bd9; border-color: #5a74e8; color: #fff; }
+    .livedub-panel .actions { gap: 6px; margin-top: 10px; flex-wrap: wrap; }
+    .livedub-panel button {
+      padding: 6px 9px; border-radius: 9px; border: 1px solid rgba(255, 255, 255, 0.18);
+      background: rgba(255, 255, 255, 0.10); color: #f2f3f7; font-size: 12px; cursor: pointer;
+      font-family: inherit; transition: background 0.15s ease, opacity 0.15s ease;
+    }
+    .livedub-panel button:hover:not(:disabled) { background: rgba(255, 255, 255, 0.18); }
+    .livedub-panel button:disabled { opacity: 0.45; cursor: default; }
+    .livedub-panel .actions button { flex: 1; min-width: 78px; }
     .livedub-panel button[data-act="toggle"] { background: #3f5bd9; border-color: #5a74e8; }
-    .livedub-panel button[data-act="toggle"]:hover { background: #4a67ec; }
-    .livedub-panel .hint { color: #8f94a8; font-size: 11px; line-height: 1.5; }
+    .livedub-panel button[data-act="toggle"]:hover:not(:disabled) { background: #4a67ec; }
+    .livedub-panel .hint { color: #8f94a8; font-size: 11px; line-height: 1.5; margin: 6px 0 0; }
+    .livedub-guide {
+      margin: 8px 0; padding: 9px 10px; border-radius: 10px;
+      background: rgba(90, 169, 255, 0.13); border: 1px solid rgba(90, 169, 255, 0.32);
+      font-size: 11.5px; line-height: 1.55; color: #d6e6ff;
+    }
+    .livedub-guide[hidden] { display: none; }
+    .livedub-guide .guide-title { font-weight: 600; margin-bottom: 3px; }
+    .livedub-guide .guide-body { white-space: pre-line; color: #b9cbe4; }
+    .livedub-guide .guide-actions { display: flex; gap: 6px; margin-top: 7px; }
+    .livedub-guide .guide-actions button { flex: 1; font-size: 11.5px; padding: 5px 8px; }
+    .livedub-meta {
+      margin: 7px 0 0; padding-top: 7px;
+      border-top: 1px dashed rgba(255, 255, 255, 0.12);
+      font-size: 11px; color: #9aa0b4; line-height: 1.6; white-space: pre-line;
+    }
+    .livedub-meta[hidden] { display: none; }
     .livedub-error {
       margin-top: 8px; padding: 7px 9px; border-radius: 9px;
       background: rgba(255, 92, 108, 0.18); border: 1px solid rgba(255, 92, 108, 0.4);
@@ -204,16 +308,29 @@
       max-width: min(78vw, 980px);
       display: flex; flex-direction: column; gap: 6px;
       pointer-events: auto; cursor: grab; user-select: none;
+      --livedub-subs-alpha: 0.72;
     }
     .livedub-subs[hidden] { display: none; }
     .livedub-subs:active { cursor: grabbing; }
     .livedub-block {
       padding: 9px 16px; border-radius: 13px;
-      background: rgba(10, 12, 20, 0.72);
+      background: rgba(10, 12, 20, var(--livedub-subs-alpha, 0.72));
       border: 1px solid rgba(255, 255, 255, 0.08);
       box-shadow: 0 6px 22px rgba(0, 0, 0, 0.38);
       backdrop-filter: blur(6px);
       text-align: center;
+    }
+    .livedub-root[data-bg="light"] .livedub-block {
+      background: rgba(248, 249, 252, var(--livedub-subs-alpha, 0.86));
+      border-color: rgba(0, 0, 0, 0.08);
+      box-shadow: 0 6px 22px rgba(0, 0, 0, 0.22);
+    }
+    .livedub-root[data-bg="light"] .livedub-block .dst { color: #10131c; text-shadow: none; }
+    .livedub-root[data-bg="light"] .livedub-block .src { color: #4a4f60; }
+    .livedub-root[data-bg="none"] .livedub-block {
+      background: transparent; border-color: transparent;
+      box-shadow: none; backdrop-filter: none;
+      padding: 2px 6px;
     }
     .livedub-block .src {
       color: #b4b9c9; line-height: 1.35; margin-bottom: 3px;
@@ -224,6 +341,7 @@
       text-shadow: 0 1px 3px rgba(0, 0, 0, 0.6); white-space: pre-line;
     }
     .livedub-block .dst.draft { color: #e3e6f0; opacity: 0.82; font-weight: 500; }
+    .livedub-root[data-bg="light"] .livedub-block .dst.draft { color: #3a3f52; }
     .livedub-block .src[hidden] { display: none; }
   `;
 
@@ -234,7 +352,7 @@
       shadow.adoptedStyleSheets = [sheet];
       return;
     } catch {
-      /* 老浏览器 / 受限环境回退到 <style> */
+      /* 受限环境回退到 <style> */
     }
     const style = document.createElement('style');
     style.textContent = OVERLAY_CSS;
@@ -246,13 +364,12 @@
     const host = document.createElement('div');
     host.id = 'livedub-overlay-host';
     host.setAttribute('data-livedub', 'overlay');
-    // 注意：style 属性通过 CSSOM/字符串只影响宿主元素，不污染页面其它节点
     host.style.cssText =
       'all: initial !important; position: fixed !important; inset: 0 !important; z-index: 2147483647 !important; pointer-events: none !important; display: block !important;';
     const shadow = host.attachShadow({ mode: 'open' });
     attachShadowStyles(shadow);
     shadow.innerHTML = `
-      <div class="livedub-root" data-part="root">
+      <div class="livedub-root" data-part="root" data-bg="dark">
         <div class="livedub-capsule" data-part="capsule" role="button" tabindex="0" title="livedub：点击打开设置">
           <span class="dot"></span>
           <span class="state" data-part="state">未连接</span>
@@ -260,13 +377,36 @@
           <span class="gear">⚙</span>
         </div>
         <div class="livedub-panel" data-part="panel" hidden>
-          <div class="row"><label><input type="checkbox" data-set="dubEnabled" /> 中文配音</label></div>
-          <div class="row"><label>压音 <input type="range" data-set="duckRatio" min="0.02" max="0.6" step="0.01" /></label><span class="val" data-val="duckRatio"></span></div>
-          <div class="row"><label><input type="checkbox" data-set="showOriginal" /> 显示原文</label></div>
-          <div class="row"><label>字号 <input type="range" data-set="fontSize" min="14" max="32" step="1" /></label><span class="val" data-val="fontSize"></span></div>
-          <div class="row actions"><button type="button" data-act="toggle">开始同传</button><button type="button" data-act="hide">隐藏浮层</button></div>
-          <div class="row hint">开始/停止需要用户手势；如果失败，请点击工具栏上的 livedub 图标在弹窗里操作。</div>
-          <div class="livedub-error" data-part="error" hidden></div>
+          <div class="livedub-panel-head" data-part="panel-head" title="拖动移动设置面板">
+            <span class="livedub-panel-title"><span class="brand">livedub</span> 设置</span>
+            <button type="button" data-act="collapse" data-part="collapse" title="收起设置">▾</button>
+          </div>
+          <div class="livedub-panel-body" data-part="panel-body">
+            <div class="row"><label><input type="checkbox" data-set="dubEnabled" /> 中文配音</label></div>
+            <div class="row"><label>压音 <input type="range" data-set="duckRatio" min="0.02" max="0.6" step="0.01" /></label><span class="val" data-val="duckRatio"></span></div>
+            <div class="row"><label><input type="checkbox" data-set="showOriginal" /> 显示原文</label></div>
+            <div class="row"><label>字号 <input type="range" data-set="fontSize" min="14" max="32" step="1" /></label><span class="val" data-val="fontSize"></span></div>
+            <div class="row"><span class="row-label">位置</span><span class="seg"><button type="button" data-act="dock-bottom">底部</button><button type="button" data-act="dock-top">顶部</button></span></div>
+            <div class="row"><label>避让 <input type="range" data-set="offsetY" min="-200" max="320" step="10" /></label><span class="val" data-val="offsetY"></span></div>
+            <div class="row"><label>背景 <select data-set="subsBg"><option value="dark">深色</option><option value="light">浅色</option><option value="none">无背景</option></select></label></div>
+            <div class="row"><label>不透明度 <input type="range" data-set="subsOpacity" min="0.2" max="1" step="0.02" /></label><span class="val" data-val="subsOpacity"></span></div>
+            <div class="livedub-guide" data-part="guide" hidden>
+              <div class="guide-title" data-part="guide-title"></div>
+              <div class="guide-body" data-part="guide-body"></div>
+              <div class="guide-actions">
+                <button type="button" data-act="reconnect">重试连接</button>
+                <button type="button" data-act="start">开始同传</button>
+              </div>
+            </div>
+            <div class="livedub-meta" data-part="meta" hidden></div>
+            <div class="row actions">
+              <button type="button" data-act="toggle">开始同传</button>
+              <button type="button" data-act="export">导出 SRT</button>
+              <button type="button" data-act="hide">隐藏浮层</button>
+            </div>
+            <div class="hint">开始/停止需要用户手势；点工具栏 livedub 图标在弹窗操作更稳。字幕可拖动，位置/样式自动保存。</div>
+            <div class="livedub-error" data-part="error" hidden></div>
+          </div>
         </div>
         <div class="livedub-subs" data-part="subs" hidden><div class="livedub-sub-list" data-part="sublist"></div></div>
       </div>`;
@@ -279,29 +419,133 @@
       state: shadow.querySelector('[data-part="state"]'),
       lat: shadow.querySelector('[data-part="lat"]'),
       panel: shadow.querySelector('[data-part="panel"]'),
+      panelHead: shadow.querySelector('[data-part="panel-head"]'),
+      panelBody: shadow.querySelector('[data-part="panel-body"]'),
+      collapseButton: shadow.querySelector('[data-part="collapse"]'),
+      guide: shadow.querySelector('[data-part="guide"]'),
+      guideTitle: shadow.querySelector('[data-part="guide-title"]'),
+      guideBody: shadow.querySelector('[data-part="guide-body"]'),
+      meta: shadow.querySelector('[data-part="meta"]'),
       error: shadow.querySelector('[data-part="error"]'),
       subs: shadow.querySelector('[data-part="subs"]'),
       sublist: shadow.querySelector('[data-part="sublist"]'),
     };
     bindOverlayEvents();
     applyOverlayVisibility();
-    applySubtitleStyle();
+    applySubsLayout();
+    applyPanelPosition();
     syncPanelControls();
     return host;
   }
 
+  // -------------------------------------------------------------------------
+  // 全屏兼容：宿主选择 / 迁移（与 lib/ui.js 等价）
+  // -------------------------------------------------------------------------
+
+  function isHostableFullscreenElement(el) {
+    if (!el || typeof el !== 'object' || el.nodeType !== 1) return false;
+    const tag = String(el.tagName || '').toUpperCase();
+    if (!tag) return false;
+    return !NON_HOSTABLE_TAGS.includes(tag);
+  }
+
+  function resolveHostTarget() {
+    const fullscreenElement = document.fullscreenElement || document.webkitFullscreenElement || null;
+    if (isHostableFullscreenElement(fullscreenElement)) {
+      return { kind: 'fullscreen', element: fullscreenElement, bare: false };
+    }
+    return { kind: 'document', element: document.documentElement, bare: !!fullscreenElement };
+  }
+
+  /**
+   * 保证浮层挂载在正确宿主：
+   * - 原生全屏（容器型）-> 迁入 fullscreenElement（浮层随全屏一起显示）；
+   * - 退出全屏 / <video> 直接全屏（无法承载子节点）-> 留在 documentElement。
+   * 同一 host 元素迁移，不重建 Shadow DOM，状态/拖拽/面板位置都不丢。
+   */
   function ensureMounted() {
     if (!document.documentElement) return false;
     if (!runtime.host) buildOverlay();
-    if (!runtime.host.isConnected) {
-      document.documentElement.appendChild(runtime.host);
+    const target = resolveHostTarget();
+    const targetElement = target.element || document.documentElement;
+    const needsMove =
+      runtime.hostKind == null ||
+      runtime.hostKind !== target.kind ||
+      runtime.hostParent !== targetElement ||
+      runtime.host.parentNode !== targetElement;
+    if (needsMove) {
+      try {
+        targetElement.appendChild(runtime.host);
+      } catch {
+        if (document.documentElement) document.documentElement.appendChild(runtime.host);
+      }
+      runtime.hostKind = target.kind;
+      runtime.hostParent = runtime.host.parentNode;
+      runtime.fullscreenBareVideo = target.bare;
+      applySubsLayout();
+      applyPanelPosition();
     }
     if (!runtime.mounted) {
       runtime.mounted = true;
       renderStatus();
       renderSubtitles();
+      renderMeta();
     }
     return true;
+  }
+
+  function onFullscreenChange() {
+    const wasBare = runtime.fullscreenBareVideo;
+    ensureMounted();
+    applySubsLayout();
+    applyPanelPosition();
+    renderStatus();
+    const stillFullscreen = !!(document.fullscreenElement || document.webkitFullscreenElement);
+    if (runtime.fullscreenBareVideo) {
+      // <video> 直接全屏时浮层无法渲染，提示留到退出全屏后再展示（否则用户看不到）
+      runtime.fullscreenHintShown = true;
+    } else if (!stillFullscreen && wasBare && runtime.fullscreenHintShown) {
+      runtime.fullscreenHintShown = false;
+      showError(
+        '刚才的站点以 <video> 元素直接进入原生全屏：浏览器不允许在视频元素上叠加自定义字幕浮层，所以全屏内看不到字幕。可改用站点「剧场 / 网页全屏」模式。',
+        'info',
+      );
+    }
+    if (!stillFullscreen) {
+      runtime.fullscreenBareVideo = false;
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // 布局：字幕停靠/避让/背景 + 设置面板位置
+  // -------------------------------------------------------------------------
+
+  function computeSubsLayoutInline({ dock = 'bottom', offsetY = 0, dx = 0, viewportHeight = 800, baseVh = 0.08 } = {}) {
+    const height = Number.isFinite(viewportHeight) && viewportHeight > 0 ? viewportHeight : 800;
+    const basePx = Math.round(height * baseVh);
+    const offset = Math.round(clampNumber(offsetY, OFFSET_Y_MIN, OFFSET_Y_MAX, 0));
+    const offsetX = Math.round(clampNumber(dx, -OFFSET_X_LIMIT, OFFSET_X_LIMIT, 0));
+    const transform = `translateX(-50%) translateX(${offsetX}px)`;
+    if (dock === 'top') return { topPx: Math.max(8, basePx + offset), bottomPx: null, transform };
+    return { topPx: null, bottomPx: Math.max(8, basePx + offset), transform };
+  }
+
+  function applySubsLayout() {
+    const subs = runtime.els.subs;
+    const root = runtime.els.root;
+    if (!subs) return;
+    const layout = computeSubsLayoutInline({
+      dock: runtime.settings.dock,
+      offsetY: runtime.settings.offsetY,
+      dx: runtime.settings.dx,
+      viewportHeight: window.innerHeight,
+    });
+    subs.style.top = layout.topPx == null ? '' : `${layout.topPx}px`;
+    subs.style.bottom = layout.bottomPx == null ? '' : `${layout.bottomPx}px`;
+    subs.style.transform = layout.transform;
+    subs.style.setProperty('--livedub-subs-alpha', String(runtime.settings.subsOpacity));
+    if (root) root.setAttribute('data-bg', runtime.settings.subsBg);
+    if (runtime.els.sublist) runtime.els.sublist.style.fontSize = `${runtime.settings.fontSize}px`;
   }
 
   function applyOverlayVisibility() {
@@ -310,15 +554,24 @@
     if (runtime.els.capsule) runtime.els.capsule.style.display = runtime.settings.hidden ? 'none' : 'flex';
   }
 
-  function applySubtitleStyle() {
-    if (!runtime.els.sublist) return;
-    runtime.els.sublist.style.fontSize = `${runtime.settings.fontSize}px`;
-    const pos = runtime.settings.subsPos || { dx: 0, dy: 0 };
-    runtime.els.subs.style.transform = `translateX(-50%) translate(${pos.dx}px, ${pos.dy}px)`;
+  function clampPanelPosition(pos) {
+    const maxX = Math.max(0, window.innerWidth - 120);
+    const maxY = Math.max(0, window.innerHeight - 100);
+    return {
+      dx: Math.round(clampNumber(pos.dx, -maxX, maxX, 0)),
+      dy: Math.round(clampNumber(pos.dy, -maxY, maxY, 0)),
+    };
+  }
+
+  function applyPanelPosition() {
+    const panel = runtime.els.panel;
+    if (!panel) return;
+    const pos = runtime.settings.panelPos || { dx: 0, dy: 0 };
+    panel.style.transform = `translate(${pos.dx}px, ${pos.dy}px)`;
   }
 
   // -------------------------------------------------------------------------
-  // 浮层事件 / 拖拽
+  // 浮层事件 / 拖拽 / 面板
   // -------------------------------------------------------------------------
 
   function bindOverlayEvents() {
@@ -336,16 +589,12 @@
       });
     }
     if (panel) {
-      panel.addEventListener('click', (event) => event.stopPropagation());
+      panel.addEventListener('click', onPanelClick);
       panel.addEventListener('change', onPanelChange);
       panel.addEventListener('input', onPanelChange);
-      panel.addEventListener('click', (event) => {
-        const button = event.target && event.target.closest ? event.target.closest('button[data-act]') : null;
-        if (!button) return;
-        const action = button.getAttribute('data-act');
-        if (action === 'toggle') void toggleCapture();
-        if (action === 'hide') void saveSettings({ hidden: true });
-      });
+    }
+    if (runtime.els.panelHead) {
+      runtime.els.panelHead.addEventListener('pointerdown', onPanelPointerDown);
     }
     if (subs) {
       subs.addEventListener('pointerdown', onSubtitlePointerDown);
@@ -360,15 +609,55 @@
       },
       true,
     );
+    window.addEventListener('resize', () => {
+      applySubsLayout();
+      applyPanelPosition();
+    });
     window.addEventListener('beforeunload', () => {
       restoreVolumes();
     });
+    document.addEventListener('fullscreenchange', onFullscreenChange, true);
+    document.addEventListener('webkitfullscreenchange', onFullscreenChange, true);
   }
 
   function togglePanel(force) {
     const next = typeof force === 'boolean' ? force : !runtime.panelOpen;
     runtime.panelOpen = next;
     if (runtime.els.panel) runtime.els.panel.hidden = !next;
+    if (next && runtime.settings.panelCollapsed) void saveSettings({ panelCollapsed: false });
+  }
+
+  function onPanelClick(event) {
+    const target = event.target;
+    const button = target && target.closest ? target.closest('button[data-act]') : null;
+    if (!button) return;
+    const action = button.getAttribute('data-act');
+    switch (action) {
+      case 'toggle':
+      case 'start':
+        void toggleCapture();
+        break;
+      case 'hide':
+        void saveSettings({ hidden: true });
+        break;
+      case 'export':
+        void exportSrt();
+        break;
+      case 'reconnect':
+        void retryConnection();
+        break;
+      case 'collapse':
+        void saveSettings({ panelCollapsed: !runtime.settings.panelCollapsed });
+        break;
+      case 'dock-bottom':
+        void saveSettings({ dock: 'bottom' });
+        break;
+      case 'dock-top':
+        void saveSettings({ dock: 'top' });
+        break;
+      default:
+        break;
+    }
   }
 
   function onPanelChange(event) {
@@ -378,13 +667,77 @@
     if (!key) return;
     let value;
     if (target.type === 'checkbox') value = target.checked;
+    else if (target.tagName === 'SELECT') value = target.value;
     else value = Number(target.value);
-    if (key === 'duckRatio') value = Math.min(1, Math.max(0.02, value));
-    if (key === 'fontSize') value = Math.min(32, Math.max(14, Math.round(value)));
+    if (key === 'duckRatio') value = clampNumber(value, 0.02, 1, 0.18);
+    if (key === 'fontSize') value = Math.round(clampNumber(value, 14, 32, 22));
+    if (key === 'offsetY') value = Math.round(clampNumber(value, OFFSET_Y_MIN, OFFSET_Y_MAX, 0));
+    if (key === 'subsOpacity') value = clampNumber(value, 0.2, 1, 0.82);
     const valueEl = runtime.els.panel && runtime.els.panel.querySelector(`[data-val="${key}"]`);
-    if (valueEl) valueEl.textContent = String(value);
+    if (valueEl) valueEl.textContent = formatSettingValue(key, value);
     void saveSettings({ [key]: value });
   }
+
+  // ---- 设置面板拖拽 ----
+
+  function onPanelPointerDown(event) {
+    if (event.button != null && event.button !== 0) return;
+    const target = event.target;
+    if (target && target.closest && target.closest('button')) return; // 头部按钮不触发拖拽
+    event.preventDefault();
+    event.stopPropagation();
+    const base = runtime.settings.panelPos || { dx: 0, dy: 0 };
+    runtime.panelDrag = {
+      pointerId: event.pointerId,
+      startX: event.clientX,
+      startY: event.clientY,
+      dx: base.dx,
+      dy: base.dy,
+      next: base,
+    };
+    try {
+      runtime.els.panelHead.setPointerCapture(event.pointerId);
+    } catch {
+      /* ignore */
+    }
+    runtime.els.panelHead.addEventListener('pointermove', onPanelPointerMove);
+    runtime.els.panelHead.addEventListener('pointerup', onPanelPointerUp);
+    runtime.els.panelHead.addEventListener('pointercancel', onPanelPointerUp);
+  }
+
+  function onPanelPointerMove(event) {
+    const drag = runtime.panelDrag;
+    if (!drag || event.pointerId !== drag.pointerId) return;
+    const next = { dx: drag.dx + (event.clientX - drag.startX), dy: drag.dy + (event.clientY - drag.startY) };
+    drag.next = next;
+    if (runtime.els.panel) runtime.els.panel.style.transform = `translate(${next.dx}px, ${next.dy}px)`;
+  }
+
+  function onPanelPointerUp(event) {
+    const drag = runtime.panelDrag;
+    if (!drag || event.pointerId !== drag.pointerId) return;
+    runtime.panelDrag = null;
+    const head = runtime.els.panelHead;
+    if (head) {
+      head.removeEventListener('pointermove', onPanelPointerMove);
+      head.removeEventListener('pointerup', onPanelPointerUp);
+      head.removeEventListener('pointercancel', onPanelPointerUp);
+      try {
+        head.releasePointerCapture(drag.pointerId);
+      } catch {
+        /* ignore */
+      }
+    }
+    const moved = Math.abs(drag.next.dx - drag.dx) + Math.abs(drag.next.dy - drag.dy);
+    // 位置变化很小 = 点击而非拖拽：恢复到已保存位置，不写 storage
+    if (moved < 3) {
+      applyPanelPosition();
+      return;
+    }
+    void saveSettings({ panelPos: clampPanelPosition({ dx: drag.next.dx, dy: drag.next.dy }) });
+  }
+
+  // ---- 字幕拖拽（横向 + 停靠侧避让） ----
 
   function onSubtitlePointerDown(event) {
     if (event.button != null && event.button !== 0) return;
@@ -392,13 +745,13 @@
     if (!subs) return;
     event.preventDefault();
     event.stopPropagation();
-    const startPos = runtime.settings.subsPos || { dx: 0, dy: 0 };
     runtime.drag = {
       pointerId: event.pointerId,
       startX: event.clientX,
       startY: event.clientY,
-      baseX: startPos.dx,
-      baseY: startPos.dy,
+      dx: runtime.settings.dx,
+      offsetY: runtime.settings.offsetY,
+      next: { dx: runtime.settings.dx, offsetY: runtime.settings.offsetY },
     };
     try {
       subs.setPointerCapture(event.pointerId);
@@ -413,15 +766,29 @@
   function onSubtitlePointerMove(event) {
     const drag = runtime.drag;
     if (!drag || event.pointerId !== drag.pointerId) return;
-    const dx = drag.baseX + (event.clientX - drag.startX);
-    const dy = drag.baseY + (event.clientY - drag.startY);
-    if (runtime.els.subs) runtime.els.subs.style.transform = `translateX(-50%) translate(${dx}px, ${dy}px)`;
-    runtime.drag.next = { dx, dy };
+    const deltaX = event.clientX - drag.startX;
+    const deltaY = event.clientY - drag.startY;
+    // bottom 停靠：向上拖 = 避让增大；top 停靠：向下拖 = 避让增大
+    const sign = runtime.settings.dock === 'top' ? 1 : -1;
+    const next = { dx: drag.dx + deltaX, offsetY: drag.offsetY + sign * deltaY };
+    drag.next = next;
+    const layout = computeSubsLayoutInline({
+      dock: runtime.settings.dock,
+      offsetY: next.offsetY,
+      dx: next.dx,
+      viewportHeight: window.innerHeight,
+    });
+    const subs = runtime.els.subs;
+    if (!subs) return;
+    subs.style.top = layout.topPx == null ? '' : `${layout.topPx}px`;
+    subs.style.bottom = layout.bottomPx == null ? '' : `${layout.bottomPx}px`;
+    subs.style.transform = layout.transform;
   }
 
   function onSubtitlePointerUp(event) {
     const drag = runtime.drag;
     if (!drag || event.pointerId !== drag.pointerId) return;
+    runtime.drag = null;
     const subs = runtime.els.subs;
     if (subs) {
       subs.removeEventListener('pointermove', onSubtitlePointerMove);
@@ -433,19 +800,13 @@
         /* ignore */
       }
     }
-    runtime.drag = null;
-    const next = drag.next || { dx: drag.baseX, dy: drag.baseY };
-    void saveSettings({ subsPos: clampSubsPosition(next) });
-  }
-
-  function clampSubsPosition(pos) {
-    const maxDx = Math.max(0, window.innerWidth / 2 - 80);
-    const maxDyDown = Math.max(0, window.innerHeight * 0.45);
-    const maxDyUp = Math.max(0, window.innerHeight * 0.8);
-    return {
-      dx: Math.min(maxDx, Math.max(-maxDx, Number(pos.dx) || 0)),
-      dy: Math.min(maxDyDown, Math.max(-maxDyUp, Number(pos.dy) || 0)),
-    };
+    const moved = Math.abs(drag.next.dx - drag.dx) + Math.abs(drag.next.offsetY - drag.offsetY);
+    if (moved < 3) {
+      // 只是点了一下字幕（没有拖动）：恢复布局，不写 storage
+      applySubsLayout();
+      return;
+    }
+    void saveSettings({ dx: drag.next.dx, offsetY: drag.next.offsetY });
   }
 
   // -------------------------------------------------------------------------
@@ -538,8 +899,7 @@
       return;
     }
     if (runtime.duck.idleSince == null && t - runtime.duck.lastActivity >= IDLE_RESTORE_MS) {
-      // 引擎仍报 speaking 时放宽兜底窗口：避免两句配音之间（> 800ms）音量来回抖动；
-      // 正常结束会先收到非 speaking 的 status，由 idleSince 分支在 800ms 后精确恢复。
+      // 引擎仍报 speaking 时放宽兜底窗口：避免两句配音之间音量来回抖动
       const speaking = runtime.bgState && runtime.bgState.engineState === 'speaking';
       if (!speaking || t - runtime.duck.lastActivity >= 3000) restoreVolumes();
     }
@@ -548,6 +908,11 @@
   // -------------------------------------------------------------------------
   // 状态 / 字幕渲染
   // -------------------------------------------------------------------------
+
+  function isActive() {
+    const state = runtime.bgState;
+    return !!state && (state.phase === 'running' || state.phase === 'starting');
+  }
 
   function statusSummary() {
     const state = runtime.bgState;
@@ -587,27 +952,134 @@
     return parts.length > 0 ? parts.reduce((sum, v) => sum + v, 0) : null;
   }
 
-  function renderStatus() {
-    if (!runtime.els.capsule) return;
-    const summary = statusSummary();
-    runtime.els.capsule.setAttribute('data-tone', summary.tone);
-    if (runtime.els.state) runtime.els.state.textContent = summary.label;
+  function currentLatency() {
+    if (runtime.metrics) {
+      const value = latencyFromMetrics(runtime.metrics);
+      if (value != null) return value;
+    }
+    return runtime.bgState && typeof runtime.bgState.latencyMs === 'number' ? runtime.bgState.latencyMs : null;
+  }
+
+  function providerSummary() {
+    const ready = runtime.bgState && runtime.bgState.ready;
+    if (!ready || !ready.providers) return '';
+    const providers = ready.providers;
+    const names = [providers.asr, providers.translate, providers.tts].filter(Boolean);
+    return names.length > 0 ? names.join(' · ') : '';
+  }
+
+  function voiceSummary() {
     const state = runtime.bgState;
-    const latency = runtime.metrics
-      ? latencyFromMetrics(runtime.metrics)
-      : state && typeof state.latencyMs === 'number'
-        ? state.latencyMs
-        : null;
-    if (runtime.els.lat) runtime.els.lat.textContent = formatLatency(latency);
-    const toggleButton = runtime.els.panel && runtime.els.panel.querySelector('button[data-act="toggle"]');
-    if (toggleButton) {
-      const active = state && (state.phase === 'running' || state.phase === 'starting');
-      toggleButton.textContent = active ? '停止同传' : '开始同传';
+    const voice = (state && state.voice) || (state && state.ready && state.ready.voice) || null;
+    if (!voice) return '';
+    const mode = voice.mode === 'clone' ? '克隆' : '预设';
+    const degraded = voice.degraded ? '（已降级）' : '';
+    return `${mode}${voice.voiceId ? ` · ${voice.voiceId}` : ''}${degraded}`;
+  }
+
+  function languageSummary() {
+    const state = runtime.bgState;
+    const session = state && state.session;
+    if (!session) return '';
+    return `${session.langFrom || 'en'} → ${session.langTo || 'zh'}`;
+  }
+
+  function latencyBreakdownLines() {
+    const metrics = runtime.metrics || (runtime.bgState && runtime.bgState.metrics);
+    if (!metrics) return [];
+    const lines = [];
+    if (Number.isFinite(metrics.asrFinalMs)) lines.push(`ASR ${formatLatency(metrics.asrFinalMs)}`);
+    if (Number.isFinite(metrics.mtFirstMs)) lines.push(`翻译首字 ${formatLatency(metrics.mtFirstMs)}`);
+    else if (Number.isFinite(metrics.mtDoneMs)) lines.push(`翻译 ${formatLatency(metrics.mtDoneMs)}`);
+    if (Number.isFinite(metrics.ttsFirstMs)) lines.push(`配音 ${formatLatency(metrics.ttsFirstMs)}`);
+    const e2e = latencyFromMetrics(metrics);
+    if (e2e != null) lines.push(`端到端 ${formatLatency(e2e)}`);
+    return lines;
+  }
+
+  function renderStatus() {
+    const capsule = runtime.els.capsule;
+    if (!capsule) return;
+    const summary = statusSummary();
+    capsule.setAttribute('data-tone', summary.tone);
+    if (runtime.els.state) runtime.els.state.textContent = summary.label;
+    if (runtime.els.lat) runtime.els.lat.textContent = formatLatency(currentLatency());
+    const state = runtime.bgState;
+    const active = isActive();
+    for (const button of runtime.els.panel ? runtime.els.panel.querySelectorAll('button[data-act="toggle"]') : []) {
+      button.textContent = active ? '停止同传' : '开始同传';
     }
-    if (runtime.els.capsule) {
-      const title = state && state.engineState ? `livedub：${summary.label}（引擎 ${state.engineState}）` : `livedub：${summary.label}`;
-      runtime.els.capsule.title = title;
+    capsule.title = `livedub：${summary.label}${state && state.engineState ? `（引擎 ${state.engineState}）` : ''}，点击打开设置`;
+    renderGuidance();
+    renderMeta();
+    renderExportState();
+  }
+
+  function renderExportState() {
+    const count = (runtime.bgState && runtime.bgState.captionCount) || 0;
+    const button = runtime.els.panel ? runtime.els.panel.querySelector('button[data-act="export"]') : null;
+    if (button) {
+      button.disabled = count === 0;
+      button.title =
+        count === 0 ? '先开始同传并让视频说几句话，才有字幕可导出' : `导出本次 ${count} 条字幕（SRT）`;
     }
+  }
+
+  function renderGuidance() {
+    const guide = runtime.els.guide;
+    if (!guide) return;
+    const state = runtime.bgState;
+    const active = isActive();
+    let info = null;
+    if (!state || (!active && !state.error)) {
+      info = {
+        title: '未连接本地引擎',
+        body:
+          '① 在 livedub 目录执行 npm start（或 node engine/server.mjs）\n② 确认 http://127.0.0.1:8787/health 可访问\n③ 点击工具栏 livedub 图标 → 开始同传',
+        showRetry: false,
+        showStart: true,
+      };
+    } else if (active && state.connection === 'closed') {
+      info = {
+        title: '引擎连接断开，正在自动重连…',
+        body: '请确认引擎进程仍在运行（npm start）。也可以点「重试连接」立即重连，无需重新开始抓音。',
+        showRetry: true,
+        showStart: false,
+      };
+    } else if (state.phase === 'error') {
+      info = {
+        title: '抓音失败',
+        body: `${(state.error && state.error.message) || '请检查页面与引擎状态后重试。'}\n可先确认引擎已启动（npm start），再点「开始同传」。`,
+        showRetry: false,
+        showStart: true,
+      };
+    }
+    guide.hidden = !info;
+    if (!info) return;
+    if (runtime.els.guideTitle) runtime.els.guideTitle.textContent = info.title;
+    if (runtime.els.guideBody) runtime.els.guideBody.textContent = info.body;
+    const retryButton = guide.querySelector('button[data-act="reconnect"]');
+    const startButton = guide.querySelector('button[data-act="start"]');
+    if (retryButton) retryButton.style.display = info.showRetry ? '' : 'none';
+    if (startButton) startButton.style.display = info.showStart ? '' : 'none';
+  }
+
+  function renderMeta() {
+    const meta = runtime.els.meta;
+    if (!meta) return;
+    const lines = [];
+    const providers = providerSummary();
+    const voice = voiceSummary();
+    const language = languageSummary();
+    if (providers) lines.push(`引擎 ${providers}`);
+    if (voice) lines.push(`音色 ${voice}`);
+    if (language) lines.push(`语言 ${language}`);
+    const latency = latencyBreakdownLines();
+    if (latency.length > 0) lines.push(`延迟 ${latency.join(' · ')}`);
+    const count = (runtime.bgState && runtime.bgState.captionCount) || 0;
+    if (count > 0) lines.push(`本次字幕 ${count} 条（可导出 SRT）`);
+    meta.hidden = lines.length === 0;
+    meta.textContent = lines.join('\n');
   }
 
   function showError(message, kind = 'error') {
@@ -706,7 +1178,6 @@
       case 'segment': {
         const key = `u:${event.id ?? 'segment'}`;
         if (!runtime.items.has(key)) {
-          // 部分引擎实现 partial/segment 用不同 id：合并掉最后一条 draft，避免重复块
           const last = [...runtime.items.values()].pop();
           if (last && last.draft) runtime.items.delete(last.key);
         }
@@ -735,6 +1206,7 @@
       }
       case 'voice':
         if (event.degraded && event.reason) showError(`音色已降级为预设（${event.reason}）`, 'info');
+        renderMeta();
         break;
       case 'error':
         if (event.message) showError(`引擎错误（${event.scope || 'session'}）：${event.message}`, 'error');
@@ -753,7 +1225,6 @@
     const previous = runtime.bgState;
     runtime.bgState = { ...(previous || {}), ...state };
     if (state.startedAt && state.startedAt !== runtime.sessionKey) {
-      // 新会话：清空上一场字幕
       runtime.sessionKey = state.startedAt;
       runtime.items.clear();
       runtime.metrics = null;
@@ -763,15 +1234,18 @@
     }
     const wasActive = previous && (previous.phase === 'running' || previous.phase === 'starting');
     if (wasActive && state.phase !== 'running' && state.phase !== 'starting') {
-      // 停止 / 出错：恢复所有页面音量
+      // 结束会话：恢复所有被压音元素 + 停掉压音状态机
       restoreVolumes();
-      if (state.phase === 'idle' || state.phase === 'stopping') duckIdle();
     }
-    if (typeof state.latencyMs === 'number') runtime.metrics = state.metrics || runtime.metrics;
+    if (state.metrics) runtime.metrics = state.metrics;
     if (state.error && state.error.message) showError(state.error.message, 'error');
     if (state.notice) showError(state.notice, 'info');
     renderStatus();
   }
+
+  // -------------------------------------------------------------------------
+  // 动作：开始/停止、重试连接、导出 SRT
+  // -------------------------------------------------------------------------
 
   async function toggleCapture() {
     try {
@@ -786,6 +1260,53 @@
         `无法开始/停止：${String((err && err.message) || err)}。Chrome 要求用户手势，请点击工具栏的 livedub 图标，在弹窗里操作。`,
         'error',
       );
+    }
+  }
+
+  async function retryConnection() {
+    try {
+      const response = await chrome.runtime.sendMessage({ type: M.RECONNECT });
+      if (response && response.ok) showError('正在重新连接引擎…', 'info');
+      else showError((response && response.error && response.error.message) || '重试连接失败，请停止后重新开始。', 'error');
+    } catch (err) {
+      showError(`重试连接失败：${String((err && err.message) || err)}`, 'error');
+    }
+  }
+
+  function downloadTextFile(text, filename) {
+    // 带 BOM，Windows 播放器对 UTF-8 SRT 的识别更稳
+    const blob = new Blob([`\ufeff${text}`], { type: 'text/plain;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const anchor = document.createElement('a');
+    anchor.href = url;
+    anchor.download = filename || 'livedub.srt';
+    anchor.style.display = 'none';
+    (document.body || document.documentElement).appendChild(anchor);
+    try {
+      anchor.click();
+    } finally {
+      setTimeout(() => {
+        try {
+          anchor.remove();
+        } catch {
+          /* ignore */
+        }
+        URL.revokeObjectURL(url);
+      }, 1500);
+    }
+  }
+
+  async function exportSrt() {
+    try {
+      const response = await chrome.runtime.sendMessage({ type: M.GET_SRT });
+      if (!response || response.ok !== true) {
+        showError((response && response.error && response.error.message) || '导出失败：暂时没有字幕数据', 'error');
+        return;
+      }
+      downloadTextFile(response.srt, response.filename);
+      showError(`已导出 ${response.count} 条字幕：${response.filename}`, 'info');
+    } catch (err) {
+      showError(`导出失败：${String((err && err.message) || err)}`, 'error');
     }
   }
 
@@ -822,7 +1343,7 @@
   });
 
   // -------------------------------------------------------------------------
-  // 启动 / SPA 保持
+  // 启动 / SPA / 全屏保持
   // -------------------------------------------------------------------------
 
   let mutationTimer = null;
@@ -847,19 +1368,21 @@
       ensureMounted();
       duckTick();
       if (tickCount % 4 === 0) pruneItems();
-      // 页面滚动/视频出现后压音目标可能变化：运行中每 2s 收集一次新媒体元素
+      // 运行中每 2s 收集一次新媒体元素（SPA 换播放器 / 新视频）
       if (runtime.duck.ducking && tickCount % 2 === 0) duckActivity();
     }, TICK_MS);
   }
 
   function announceReady() {
     try {
-      chrome.runtime.sendMessage({ type: M.CONTENT_READY, href: location.href, title: document.title }).then(
-        (response) => {
-          if (response && response.state) handleBgState(response.state, response.settings);
-        },
-        () => {},
-      );
+      chrome.runtime
+        .sendMessage({ type: M.CONTENT_READY, href: location.href, title: document.title })
+        .then(
+          (response) => {
+            if (response && response.state) handleBgState(response.state, response.settings);
+          },
+          () => {},
+        );
     } catch {
       /* ignore */
     }

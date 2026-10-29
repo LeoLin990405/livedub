@@ -1,0 +1,22 @@
+{
+  "_comment": "LIVEDUB_PROFILE=fast 时叠加：用 whisper small 换更低延迟（术语准确率略降）。需要 models/ggml-small.bin 或 ~/.sayless/ggml-small.bin。",
+  "asr": {
+    "whisper": {
+      "models": [
+        "models/ggml-small.bin",
+        "~/.sayless/ggml-small.bin",
+        "models/ggml-large-v3-turbo-q5_0.bin"
+      ],
+      "threads": 8,
+      "partial": {
+        "intervalMs": 1200
+      }
+    }
+  },
+  "translate": {
+    "partialThrottleMs": 40
+  },
+  "dub": {
+    "overlapStreaming": true
+  }
+}

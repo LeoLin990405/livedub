@@ -9,7 +9,7 @@ import {
   createMockVoiceManager,
 } from '../engine/mock.mjs';
 import { createSession } from '../engine/pipeline.mjs';
-import { silencePcm, makeTonePcm } from './helpers.mjs';
+import { silencePcm, makeTonePcm, sleep } from './helpers.mjs';
 
 const SAMPLE_RATE = 16000;
 const CHUNK_MS = 100;
@@ -156,6 +156,8 @@ test('pipeline: mock end-to-end produces segment -> translation -> dub -> metric
   assert.ok(Number.isFinite(metrics.e2eLagMs));
   assert.ok(metrics.e2eLagMs >= 0);
 
+  await recorder.waitFor((e) => e.type === 'segment' && e.id === 3, { label: '3 segments' });
+  await recorder.waitFor((e) => e.type === 'translation' && e.id === 3 && e.final, { label: '3 translations' });
   assert.ok(recorder.count('segment') >= 3);
   assert.ok(recorder.count('translation') >= 3);
   const statuses = recorder.of('status').map((e) => e.state);
@@ -278,3 +280,119 @@ test('pipeline: no audio -> close is clean', async () => {
   await recorder.waitFor((e) => e.type === 'bye', { label: 'bye' });
   assert.equal(recorder.count('segment'), 0);
 });
+
+// ------------------------------------------------- v0.2 streaming TTS overlap
+
+function testClauseExtractor() {
+  let emitted = 0;
+  return {
+    push(text) {
+      const rest = String(text ?? '').slice(emitted);
+      const m = rest.match(/^(.+?[。！？；;.!?…])/);
+      if (!m) return [];
+      emitted += m[1].length;
+      return [m[1].trim()];
+    },
+    flush(text) {
+      const finalText = String(text ?? '');
+      const rest = finalText.slice(Math.min(emitted, finalText.length)).trim();
+      emitted = finalText.length;
+      return rest ? [rest] : [];
+    },
+    reset() {
+      emitted = 0;
+    },
+  };
+}
+
+function makeSlowTranslator({ first = '今天我们来学习梯度下降。', second = '它是优化算法。', finalDelayMs = 140 } = {}) {
+  return {
+    name: 'slow-translator',
+    async translate({ onPartial }) {
+      onPartial?.(first);
+      await sleep(30);
+      onPartial?.(first + second);
+      await sleep(finalDelayMs);
+      return { text: first + second };
+    },
+  };
+}
+
+async function openCustomSession(configOverrides, depsOverride) {
+  const config = makeConfig(configOverrides);
+  const recorder = makeRecorder();
+  const session = await createSession({
+    id: 'test-custom',
+    options: { source: 'test' },
+    emit: (e) => recorder.emit(e),
+    log: () => {},
+    deps: depsOverride(config),
+  });
+  return { session, recorder, config };
+}
+
+test('pipeline v0.2: dub starts before translation final when streaming overlap enabled', async () => {
+  const { session, recorder } = await openCustomSession({}, (config) => ({
+    ...makeDeps(config),
+    createTranslator: () => makeSlowTranslator(),
+    createClauseExtractor: () => testClauseExtractor(),
+  }));
+  await recorder.waitFor((e) => e.type === 'ready', { label: 'ready' });
+  await feedAudio(session, 2600);
+  await recorder.waitFor((e) => e.type === 'translation' && e.final, { label: 'translation final' });
+  await recorder.waitFor((e) => e.type === 'dub' && e.pcm, { label: 'dub audio' });
+  const dubIdx = recorder.events.findIndex((e) => e.type === 'dub' && e.pcm);
+  const finalIdx = recorder.events.findIndex((e) => e.type === 'translation' && e.final);
+  assert.ok(dubIdx >= 0 && finalIdx >= 0, 'both events present');
+  assert.ok(dubIdx < finalIdx, `expected dub (${dubIdx}) before translation final (${finalIdx})`);
+  await session.close('done');
+});
+
+test('pipeline v0.2: overlap can be disabled (dub only after translation final)', async () => {
+  const { session, recorder } = await openCustomSession({ dub: { overlapStreaming: false } }, (config) => ({
+    ...makeDeps(config),
+    createTranslator: () => makeSlowTranslator(),
+    createClauseExtractor: () => testClauseExtractor(),
+  }));
+  await recorder.waitFor((e) => e.type === 'ready', { label: 'ready' });
+  await feedAudio(session, 2600);
+  await recorder.waitFor((e) => e.type === 'dub' && e.pcm, { label: 'dub audio' });
+  const dubIdx = recorder.events.findIndex((e) => e.type === 'dub' && e.pcm);
+  const finalIdx = recorder.events.findIndex((e) => e.type === 'translation' && e.final);
+  assert.ok(finalIdx >= 0 && dubIdx >= 0);
+  assert.ok(finalIdx < dubIdx, `expected translation final (${finalIdx}) before dub (${dubIdx})`);
+  await session.close('done');
+});
+
+test('pipeline v0.2: tts.warmup is called after session starts', async () => {
+  let warmupCalled = false;
+  const { session, recorder } = await openCustomSession({}, (config) => ({
+    ...makeDeps(config),
+    createTts: (opts) => {
+      const tts = createMockTts({ ...opts, config });
+      tts.warmup = async () => {
+        warmupCalled = true;
+      };
+      return tts;
+    },
+  }));
+  await recorder.waitFor((e) => e.type === 'ready', { label: 'ready' });
+  for (let i = 0; i < 20 && !warmupCalled; i++) await sleep(10);
+  assert.equal(warmupCalled, true);
+  await session.close('done');
+});
+
+test('pipeline v0.2: asr onError is forwarded as error(asr) event', async () => {
+  const { session, recorder } = await openCustomSession({}, (config) => ({
+    ...makeDeps(config),
+    createAsr: (opts) => {
+      setTimeout(() => opts.onError?.({ message: 'microphone lost' }), 0);
+      return createMockAsr({ ...opts, config });
+    },
+  }));
+  await recorder.waitFor((e) => e.type === 'ready', { label: 'ready' });
+  const err = await recorder.waitFor((e) => e.type === 'error' && e.scope === 'asr', { label: 'asr error' });
+  assert.match(err.message, /microphone lost/);
+  await session.close('done');
+});
+

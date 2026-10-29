@@ -16,6 +16,8 @@ export const STORAGE_KEYS = Object.freeze({
   settings: 'livedub:settings',
   /** chrome.storage.session：service worker 的运行态快照（SW 被回收后可恢复） */
   bgState: 'livedub:bg-state',
+  /** chrome.storage.session：本次会话的 segment+translation 累积（用于导出 SRT 跨 SW 回收） */
+  captions: 'livedub:captions',
 });
 
 /** 跨上下文消息类型（popup/content <-> background <-> offscreen） */
@@ -26,6 +28,10 @@ export const MSG = Object.freeze({
   STOP: 'livedub:stop',
   CONTENT_READY: 'livedub:content-ready',
   CONTENT_TOGGLE: 'livedub:toggle-capture',
+  /** popup / 浮层 -> background：导出本次会话 SRT（返回 srt 文本与文件名） */
+  GET_SRT: 'livedub:get-srt',
+  /** popup / 浮层 -> background：立即重试连接引擎（运行中时驱动 offscreen 重连） */
+  RECONNECT: 'livedub:reconnect',
   SET_SETTINGS: 'livedub:set-settings',
   CONFIG_PATCH: 'livedub:config-patch',
 
@@ -47,6 +53,8 @@ export const MSG = Object.freeze({
   OFFSCREEN_STOPPED: 'livedub:offscreen-stopped',
   /** background -> offscreen 健康检查（用于 SW 恢复后确认采集是否还在） */
   OFFSCREEN_PING: 'livedub:offscreen-ping',
+  /** background -> offscreen：跳过退避立即重连引擎 */
+  OFFSCREEN_RECONNECT: 'livedub:offscreen-reconnect',
 });
 
 /** offscreen document 的路径与创建原因（manifest 不声明，由 background 动态创建） */
@@ -67,12 +75,24 @@ export const DEFAULT_SETTINGS = Object.freeze({
   showOriginal: true,
   /** 字幕译文字号（px） */
   fontSize: 22,
+  /** 字幕停靠：bottom | top */
+  dock: 'bottom',
+  /** 字幕 Y 偏移（px，正值 = 远离停靠边：bottom 上移 / top 下移，用于避开平台原生字幕） */
+  offsetY: 0,
+  /** 字幕横向偏移（px，可拖拽） */
+  dx: 0,
+  /** 字幕背景不透明度（0.2 ~ 1，只影响背景不影响文字） */
+  subsOpacity: 0.82,
+  /** 字幕背景：dark | light | none */
+  subsBg: 'dark',
   langFrom: 'en',
   langTo: 'zh',
   /** 是否隐藏浮层（从 popup 可重新打开） */
   hidden: false,
-  /** 字幕框拖拽偏移 {dx, dy}，null = 默认底部居中 */
-  subsPos: null,
+  /** 设置面板是否收起（保留标题栏可展开） */
+  panelCollapsed: false,
+  /** 设置面板拖拽偏移 {dx, dy}，null = 默认右上角 */
+  panelPos: null,
 });
 
 /**
@@ -106,21 +126,43 @@ export function normalizeEngineUrl(value) {
 }
 
 /**
- * 从引擎 WS 地址推导本地工作台（HTTP）地址，用于 popup 的「打开工作台」。
- * ws://127.0.0.1:8787/ws -> http://127.0.0.1:8787/
+ * 从引擎 WS 地址推导引擎 HTTP 根地址。
+ * ws://127.0.0.1:8787/ws -> http://127.0.0.1:8787
  * @param {string} engineUrl
  * @returns {string|null}
  */
-export function deriveStudioUrl(engineUrl) {
+export function deriveEngineHttpBase(engineUrl) {
   const normalized = normalizeEngineUrl(engineUrl);
   if (!normalized) return null;
   try {
     const url = new URL(normalized);
     const proto = url.protocol === 'wss:' ? 'https:' : 'http:';
-    return `${proto}//${url.host}/`;
+    return `${proto}//${url.host}`;
   } catch {
     return null;
   }
+}
+
+/**
+ * 从引擎 WS 地址推导本地工作台地址，用于 popup 的「打开工作台」。
+ * engine/server.mjs 静态托管在 /studio/（根路径 302 过去）。
+ * ws://127.0.0.1:8787/ws -> http://127.0.0.1:8787/studio/
+ * @param {string} engineUrl
+ * @returns {string|null}
+ */
+export function deriveStudioUrl(engineUrl) {
+  const base = deriveEngineHttpBase(engineUrl);
+  return base ? `${base}/studio/` : null;
+}
+
+/**
+ * 引擎健康检查地址（GET /health，返回 providers / whisper / ok 等）。
+ * @param {string} engineUrl
+ * @returns {string|null}
+ */
+export function deriveHealthUrl(engineUrl) {
+  const base = deriveEngineHttpBase(engineUrl);
+  return base ? `${base}/health` : null;
 }
 
 /**

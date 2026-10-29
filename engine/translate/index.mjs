@@ -19,6 +19,8 @@
  * - 超时用 AbortController 触发；超时属于可降级错误，用户中断（signal.aborted）不可降级。
  * - 降级链按 config.translate.chain 顺序尝试，全部失败抛「可读 + 带下一步建议」的错误。
  * - 最终文本清洗：去「译文：」前缀、包裹引号、Markdown 粗体/代码围栏、尾部解释性括号。
+ * - v0.2 增量子句提取器 createClauseExtractor：翻译还在流式输出时，把已稳定子句提前交给 TTS
+ *   （见下方「增量子句提取器」大段契约注释；Lead 在 pipeline 里动态 import 集成）。
  * - 不在库代码里 console.*；日志一律走传入的 log()，且绝不打印 apiKey。
  */
 import { sanitizeGlossary } from '../protocol.mjs';
@@ -146,11 +148,12 @@ export function buildTranslationMessages({ text, context = [], glossary = [], co
     serviceLine,
     '请严格遵守以下要求：',
     '1. 忠实：只翻译说话人实际说出的内容，不增删、不总结、不解释、不扩写，不添加任何评论、旁白或提示。',
-    '2. 口语化：译文要像老师现场讲中文一样自然，句子短、可直接被 TTS 朗读；避免书面腔、文言和翻译腔。',
-    '3. 保留原文：数学公式、变量名、函数名、代码标识符、命令行、URL、产品名与专有名词保持原样，不翻译、不改写、不加音译。',
-    '4. 术语表是强约束：原文出现术语表中的 src 时，必须使用对应的 dst 译法，不得改写、另译或省略。',
-    '5. 只输出译文本身：不要输出原文、拼音、注释或解释性括号；不要以「译文：」等前缀开头，不要用引号包裹整句。',
-    `6. 输出简体中文（如果目标语言是${langName(to, '目标语言')}）；中文与英文术语混排时保持自然。`,
+    '2. 口语化、短句：像老师现场讲中文一样自然，用短句，一句话说清一个意思，句子短到可以直接被 TTS 逐句朗读；多用逗号或句号形成自然停顿，避免书面腔、文言和翻译腔。',
+    '3. 不要使用「首先、其次、然后、最后、综上所述、值得注意的是、总而言之」这类书面连接词；除非原文明确在列举步骤，否则直接用短句顺承。',
+    '4. 保留原文：数学公式、变量名、函数名、代码标识符、命令行、URL、产品名与专有名词必须原样保留——不翻译、不改写、不加音译、不加空格、不改大小写、不拆开。',
+    '5. 术语表是强约束：原文出现术语表中的 src 时，必须逐字使用对应的 dst 译法，不得改写、另译、加字或省略。',
+    '6. 只输出译文本身：不要输出原文、拼音、注释或解释性括号；不要以「译文：」等前缀开头，不要用引号包裹整句，不要重复原文。',
+    `7. 输出简体中文（如果目标语言是${langName(to, '目标语言')}）；中文与英文术语混排时保持自然。`,
   ].join('\n');
 
   const userSections = [];
@@ -243,6 +246,449 @@ export function cleanTranslation(raw) {
   s = joinModelLines(s);
   s = s.replace(/[ \t]{2,}/g, ' ').replace(/\s+$/g, '').trim();
   return s;
+}
+
+/* ------------------------------------------------------------------ *
+ * 增量子句提取器（v0.2）：翻译还在流式输出时，把已稳定的子句提前交给 TTS。
+ *
+ * 契约（Lead 动态 import 使用，签名固定）：
+ *   createClauseExtractor({ minClauseChars = 8, maxChunkChars = 80, stabilityMs = 250 } = {})
+ *     -> { push(cumulativeText) -> string[], flush(finalText?) -> string[], reset() -> void }
+ *
+ * 语义：
+ * - push 每次收到「当前累计译文」（partial 覆盖式传入），返回本次新确认的稳定子句（0~N 个）。
+ * - 确认条件：子句以中英句末标点（。！？；;.!?…）结尾、长度 >= minClauseChars，
+ *   且「从游标到该标点」的前缀内容连续 stabilityMs 没有被改写（后续追加不影响稳定性判定）。
+ * - 已确认发出的内容不会重复发、不会回退；累计文本变短（清理）或前缀被改写时，
+ *   内部游标安全回退到公共前缀，已发内容保留，只提取改写后的新尾巴。
+ * - 数字（1,000 / 3.14 / 50%）、代码标识符（msToSamples / node.js）、URL 内的标点不算句末，
+ *   不会在中间切断。
+ * - 子句超过 maxChunkChars 时按标点/空格兜底切块（超长单词/URL 才硬拆）。
+ * - flush 输出剩余未发内容，保证「push 发出的 + flush 的」覆盖最终译文（允许空白/标点级差异）。
+ * - options.now 是测试注入钩子（默认 Date.now），生产调用方不需要传。
+ * ------------------------------------------------------------------ */
+
+/** 句末标点：只有这些字符出现才可能确认子句（逗号/顿号/冒号不算） */
+const CLAUSE_SENTENCE_END = new Set(['。', '！', '？', '；', ';', '!', '?', '…']);
+/** 软标点：切块时优先在这里断，不单独成块 */
+const CLAUSE_SOFT_PUNCT = new Set(['，', '、', '：', ':', ',', '—', '–', '·']);
+/** 括号内的句号不当作子句边界 */
+const CLAUSE_OPEN_BRACKETS = new Set(['（', '(', '【', '[', '《', '「', '『', '〈', '{']);
+const CLAUSE_CLOSE_BRACKETS = new Set(['）', ')', '】', ']', '》', '」', '』', '〉', '}']);
+/** URL 末尾附带的 ASCII 标点要还给句子，不能算进 URL token */
+const CLAUSE_URL_TAIL = '.,;:!?)]}\'"';
+/** 出现在 URL 后直接结束 URL 的中文标点 */
+const CLAUSE_CJK_TERMINATORS = new Set(['，', '。', '！', '？', '；', '：', '、', '）', '】', '》', '」', '』', '…']);
+
+function cpLength(text) {
+  return Array.from(String(text ?? '')).length;
+}
+
+function isDigitChar(ch) {
+  return ch !== undefined && ch >= '0' && ch <= '9';
+}
+
+function isAlnumUnderscore(ch) {
+  return ch !== undefined && /[A-Za-z0-9_$]/.test(ch);
+}
+
+function isLatinLetter(ch) {
+  return ch !== undefined && /[A-Za-z]/.test(ch);
+}
+
+/** 位置 i 是否是一个 URL 的开头（http://、https://、www.） */
+function isUrlStart(chars, index) {
+  const rest = chars.slice(index, index + 8).join('').toLowerCase();
+  return rest.startsWith('http://') || rest.startsWith('https://') || rest.startsWith('www.');
+}
+
+/** '.' 之后的下一个「有效字符」（跳过空白与收尾引号/括号） */
+function nextSignificantChar(chars, index) {
+  for (let i = index; i < chars.length; i += 1) {
+    const ch = chars[i];
+    if (/\s/.test(ch)) continue;
+    if ('”’」』）)】》'.includes(ch)) continue;
+    return ch;
+  }
+  return null;
+}
+
+/**
+ * 子句 tokenizer：把文本切成不可再分的 token（word/数字/URL 整体、CJK 逐字、标点、空白）。
+ * 结果带 code point 下标，便于做「游标到哪里」与「哪个标点是句末」的判断。
+ */
+function tokenizeClauseText(text) {
+  const chars = Array.from(String(text ?? ''));
+  const tokens = [];
+  let i = 0;
+  let bracketDepth = 0;
+
+  const add = (type, start, end, extra = {}) => {
+    tokens.push({ type, text: chars.slice(start, end).join(''), start, end, sentenceEnd: false, ...extra });
+  };
+
+  while (i < chars.length) {
+    const ch = chars[i];
+
+    if (/\s/.test(ch)) {
+      let j = i + 1;
+      while (j < chars.length && /\s/.test(chars[j])) j += 1;
+      add('space', i, j);
+      i = j;
+      continue;
+    }
+
+    // URL 整体保护（内部的 . / : ? & = 等都不算标点）
+    if (isUrlStart(chars, i)) {
+      let j = i;
+      while (
+        j < chars.length &&
+        !/\s/.test(chars[j]) &&
+        !CJK_CHAR_RE.test(chars[j]) &&
+        !CLAUSE_CJK_TERMINATORS.has(chars[j])
+      ) {
+        j += 1;
+      }
+      while (j > i && CLAUSE_URL_TAIL.includes(chars[j - 1])) j -= 1; // 句末标点还给句子
+      if (j <= i) j = i + 1;
+      add('word', i, j);
+      i = j;
+      continue;
+    }
+
+    // 数字整体保护（1,000 / 3.14 / 50% / 1.2.3）
+    if (isDigitChar(ch)) {
+      let j = i + 1;
+      for (;;) {
+        if (isDigitChar(chars[j])) {
+          j += 1;
+          continue;
+        }
+        if ((chars[j] === ',' || chars[j] === '.') && isDigitChar(chars[j + 1])) {
+          j += 2;
+          continue;
+        }
+        break;
+      }
+      if (chars[j] === '%') j += 1;
+      add('word', i, j);
+      i = j;
+      continue;
+    }
+
+    // 拉丁词/代码标识符整体保护（msToSamples / node.js / api.deepseek.com/v1 / fine-tuning）
+    if (isLatinLetter(ch) || ch === '_' || ch === '$') {
+      let j = i + 1;
+      for (;;) {
+        const c = chars[j];
+        if (isAlnumUnderscore(c)) {
+          j += 1;
+          continue;
+        }
+        if (c !== undefined && '._/:@-+'.includes(c) && isAlnumUnderscore(chars[j + 1])) {
+          j += 2;
+          continue;
+        }
+        break;
+      }
+      add('word', i, j);
+      i = j;
+      continue;
+    }
+
+    if (CLAUSE_OPEN_BRACKETS.has(ch)) {
+      add('punct', i, i + 1);
+      bracketDepth += 1;
+      i += 1;
+      continue;
+    }
+    if (CLAUSE_CLOSE_BRACKETS.has(ch)) {
+      add('punct', i, i + 1);
+      bracketDepth = Math.max(0, bracketDepth - 1);
+      i += 1;
+      continue;
+    }
+
+    // 中文句末标点（连续标点如「？！」「……」合并为一个 token）
+    if (CLAUSE_SENTENCE_END.has(ch)) {
+      let j = i + 1;
+      while (j < chars.length && CLAUSE_SENTENCE_END.has(chars[j])) j += 1;
+      add('punct', i, j, { sentenceEnd: bracketDepth === 0 });
+      i = j;
+      continue;
+    }
+
+    // 英文句点：数字/标识符/URL 内部已在上面消费；剩下的按「后面是否像新句子开头」判断
+    if (ch === '.') {
+      const prev = chars[i - 1];
+      const nextSignificant = nextSignificantChar(chars, i + 1);
+      const nextIsWordChar = chars[i + 1] !== undefined && /[A-Za-z0-9_]/.test(chars[i + 1]);
+      const prevIsDigit = isDigitChar(prev);
+      const sentenceEnd =
+        bracketDepth === 0 &&
+        !prevIsDigit &&
+        !nextIsWordChar &&
+        (nextSignificant === null || CJK_CHAR_RE.test(nextSignificant) || /[A-Z0-9]/.test(nextSignificant));
+      add('punct', i, i + 1, { sentenceEnd });
+      i += 1;
+      continue;
+    }
+
+    if (CLAUSE_SOFT_PUNCT.has(ch)) {
+      add('punct', i, i + 1);
+      i += 1;
+      continue;
+    }
+
+    add('other', i, i + 1);
+    i += 1;
+  }
+  return tokens;
+}
+
+/** 从游标 from 开始，收集所有「长度 >= minClauseChars 的句末标点」作为候选子句边界 */
+function collectClauseBoundaries(tokens, chars, from, minClauseChars) {
+  const out = [];
+  for (const token of tokens) {
+    if (!token.sentenceEnd || token.end <= from) continue;
+    const raw = chars.slice(from, token.end).join('');
+    const text = raw.trim();
+    if (cpLength(text) < minClauseChars) continue;
+    out.push({ end: token.end, text, raw });
+  }
+  return out;
+}
+
+/**
+ * 子句超长时兜底切块：优先在标点/空格处断，数字/代码/URL token 不拆；
+ * 只有单个 token 自身超过 maxChunkChars（如超长 URL）才硬拆。
+ */
+function chunkClauseText(text, maxChunkChars) {
+  const source = String(text ?? '').trim();
+  if (!source) return [];
+  const max = Math.max(4, Math.floor(Number(maxChunkChars) || 80));
+  const chars = Array.from(source);
+  if (chars.length <= max) return [source];
+
+  const tokens = tokenizeClauseText(source);
+  const chunks = [];
+  let buffer = '';
+  let bufferLen = 0;
+  /** buffer 内最近一次标点/空格之后的切点（用于优先在标点处断块） */
+  let punctBreak = -1;
+  let spaceBreak = -1;
+
+  const resetBreaks = () => {
+    punctBreak = -1;
+    spaceBreak = -1;
+  };
+  const pushBuffer = () => {
+    const trimmed = buffer.trim();
+    if (trimmed) chunks.push(trimmed);
+    buffer = '';
+    bufferLen = 0;
+    resetBreaks();
+  };
+  const append = (piece, pieceLen) => {
+    buffer += piece;
+    bufferLen += pieceLen;
+  };
+  const splitBufferAt = (at) => {
+    const head = Array.from(buffer).slice(0, at).join('');
+    const tail = Array.from(buffer).slice(at).join('').trimStart();
+    const trimmed = head.trim();
+    if (trimmed) chunks.push(trimmed);
+    buffer = tail;
+    bufferLen = Array.from(tail).length;
+    resetBreaks();
+  };
+
+  for (const token of tokens) {
+    const piece = token.text;
+    const pieceLen = Array.from(piece).length;
+    if (token.type === 'space' && bufferLen === 0) continue;
+
+    if (bufferLen > 0 && bufferLen + pieceLen > max) {
+      // 标点悬挂：句末/软标点不单独落到下一块（允许超 1-2 字符）
+      const hanging = token.type === 'punct' && bufferLen + pieceLen <= max + 2;
+      if (hanging) {
+        append(piece, pieceLen);
+        punctBreak = bufferLen;
+        continue;
+      }
+      // 兜底切块优先断在标点，其次空格；太靠前（< 40% max）就按长度断
+      const minChunk = Math.max(4, Math.floor(max * 0.4));
+      const at = punctBreak >= minChunk ? punctBreak : spaceBreak >= minChunk ? spaceBreak : -1;
+      if (at > 0 && at < bufferLen) splitBufferAt(at);
+      else pushBuffer();
+    }
+    // 切分后仍放不下（剩余尾巴+新 token 超限）：先把尾巴收掉
+    if (bufferLen > 0 && bufferLen + pieceLen > max) pushBuffer();
+
+    if (pieceLen > max) {
+      // 超长单词/URL：只能硬拆兜底
+      if (bufferLen > 0) pushBuffer();
+      const atom = Array.from(piece);
+      for (let i = 0; i < atom.length; i += max) {
+        const part = atom.slice(i, i + max).join('');
+        if (i + max < atom.length) chunks.push(part);
+        else append(part, Array.from(part).length);
+      }
+      continue;
+    }
+
+    append(piece, pieceLen);
+    if (token.type === 'punct') punctBreak = bufferLen;
+    else if (token.type === 'space') spaceBreak = bufferLen;
+  }
+  pushBuffer();
+  return chunks;
+}
+
+/**
+ * 创建增量子句提取器（契约见上方大段注释）。
+ * @param {object} [options]
+ * @param {number} [options.minClauseChars=8] 子句最短字符数（含标点，trim 后计）
+ * @param {number} [options.maxChunkChars=80] 单块最大字符数（超长兜底切块）
+ * @param {number} [options.stabilityMs=250] 子句前缀需要连续稳定多久才确认
+ * @param {() => number} [options.now] 测试注入时钟（默认 Date.now），生产不传
+ */
+export function createClauseExtractor(options = {}) {
+  const opts = options && typeof options === 'object' ? options : {};
+  const rawMin = Number(opts.minClauseChars);
+  const rawMax = Number(opts.maxChunkChars);
+  const rawStability = Number(opts.stabilityMs);
+  const minClauseChars = Number.isFinite(rawMin) && rawMin >= 1 ? Math.floor(rawMin) : 8;
+  const maxChunkChars = Number.isFinite(rawMax) && rawMax >= 4 ? Math.floor(rawMax) : 80;
+  const stabilityMs = Number.isFinite(rawStability) && rawStability >= 0 ? Math.floor(rawStability) : 250;
+  const nowFn = typeof opts.now === 'function' ? opts.now : Date.now;
+
+  /** 已发出的累计原文前缀（游标 = 其 code point 长度） */
+  let emittedRaw = '';
+  let cursorLen = 0;
+  /** 最近一次 push/flush 看到的累计译文 */
+  let lastText = '';
+  /** 候选边界观察时间：`end|子句文本` -> 首次被看到的时间 */
+  let seen = new Map();
+
+  const now = () => {
+    const value = Number(nowFn());
+    return Number.isFinite(value) ? value : Date.now();
+  };
+
+  function reset() {
+    emittedRaw = '';
+    cursorLen = 0;
+    lastText = '';
+    seen = new Map();
+  }
+
+  /**
+   * 把内部游标与新的累计文本对齐：
+   * - 正常增长：游标不动；
+   * - 纯截断（新文本是已发内容的旧前缀，通常是清洗剥掉了尾部注释）：游标不回退；
+   * - 前缀被改写：游标回退到公共前缀，已发出的内容不重发，观察记录清空。
+   */
+  function syncCursor(chars) {
+    const emittedChars = Array.from(emittedRaw);
+    const emittedLen = emittedChars.length;
+    if (emittedLen === 0) {
+      cursorLen = 0;
+      return 0;
+    }
+    const compareLen = Math.min(emittedLen, chars.length);
+    let same = true;
+    for (let i = 0; i < compareLen; i += 1) {
+      if (chars[i] !== emittedChars[i]) {
+        same = false;
+        break;
+      }
+    }
+    if (same) {
+      cursorLen = emittedLen;
+      return emittedLen; // 正常增长，或纯截断：都保持游标
+    }
+    let common = 0;
+    while (common < compareLen && chars[common] === emittedChars[common]) common += 1;
+    emittedRaw = emittedChars.slice(0, common).join('');
+    cursorLen = common;
+    seen = new Map();
+    return common;
+  }
+
+  function pruneSeen(validKeys) {
+    for (const key of [...seen.keys()]) {
+      if (!validKeys.has(key)) seen.delete(key);
+    }
+  }
+
+  /**
+   * 输入当前累计译文，返回本次新确认的稳定子句（可能 0~N 个）。
+   * @param {string} cumulativeText
+   * @returns {string[]}
+   */
+  function push(cumulativeText) {
+    const text = String(cumulativeText ?? '');
+    const t = now();
+    lastText = text;
+    const chars = Array.from(text);
+    cursorLen = syncCursor(chars);
+    if (cursorLen > chars.length) {
+      // 纯截断：还没有新内容可提取
+      seen = new Map();
+      return [];
+    }
+
+    const tokens = tokenizeClauseText(text);
+    const out = [];
+    for (;;) {
+      const boundaries = collectClauseBoundaries(tokens, chars, cursorLen, minClauseChars);
+      const validKeys = new Set();
+      let emitIndex = -1;
+      for (let index = 0; index < boundaries.length; index += 1) {
+        const boundary = boundaries[index];
+        const key = `${boundary.end}\u0000${boundary.text}`;
+        validKeys.add(key);
+        if (!seen.has(key)) seen.set(key, t);
+        if (emitIndex < 0 && t - seen.get(key) >= stabilityMs) emitIndex = index;
+      }
+      pruneSeen(validKeys);
+      if (emitIndex < 0) break;
+
+      const target = boundaries[emitIndex];
+      emittedRaw += target.raw;
+      cursorLen = cpLength(emittedRaw);
+      out.push(...chunkClauseText(target.text, maxChunkChars));
+      // 已消费边界之前的观察记录可以丢掉
+      for (const key of [...seen.keys()]) {
+        const end = Number(key.split('\u0000')[0]);
+        if (end <= cursorLen) seen.delete(key);
+      }
+    }
+    return out;
+  }
+
+  /**
+   * 翻译结束：输出剩余未发内容（按标点/长度兜底切块）。
+   * @param {string} [finalText] 最终译文；不传则用最近一次 push 的累计文本
+   * @returns {string[]}
+   */
+  function flush(finalText) {
+    const text = finalText === undefined || finalText === null ? lastText : String(finalText);
+    lastText = text;
+    const chars = Array.from(text);
+    cursorLen = syncCursor(chars);
+    const start = Math.min(cursorLen, chars.length);
+    const remaining = chars.slice(start).join('').trim();
+    // 用最终文本覆盖游标：重复 flush 返回空数组
+    emittedRaw = chars.join('');
+    cursorLen = chars.length;
+    seen = new Map();
+    if (!remaining) return [];
+    return chunkClauseText(remaining, maxChunkChars);
+  }
+
+  return { push, flush, reset };
 }
 
 /* ------------------------------------------------------------------ *

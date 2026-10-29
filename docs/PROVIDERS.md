@@ -88,7 +88,24 @@ livedub 的 TTS 适配器层已按「克隆 provider 可插拔」设计，接入
 - `voiceMode: "preset"`：完全不尝试克隆（最省额度、最快）；
 - 克隆失败只尝试一次并记住原因，不会每句重试。
 
-## 5. 常见问题
+## 5. 延迟档位（ASR 模型）
+
+| 档位 | 开启方式 | 模型 | 实测 e2e（本机） | 适用 |
+|---|---|---|---|---|
+| 质量档（默认） | `npm start` / `npm run batch` | `ggml-large-v3-turbo-q5_0` | ~3.0s | 术语多、口音重、要求准确 |
+| 快速档 | `npm run start:fast` / `npm run batch:fast` | `ggml-small` | ~2.4s | 追求更低延迟，可接受少量术语误差 |
+
+快速档需要 `models/ggml-small.bin` 或 `~/.sayless/ggml-small.bin`（见 `config/livedub.fast.json` 的候选路径）：
+
+```bash
+curl -L -o models/ggml-small.bin \
+  https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-small.bin
+```
+
+> ASR partial（边听边出字幕）默认关闭：每次 partial 也要跑一次 whisper 推理，会占用串行队列，
+> 实测让 final 延后 ~0.8s。想要实时字幕感可在 config 里开 `asr.whisper.partial.enabled`。
+
+## 6. 常见问题
 
 | 现象 | 原因 / 处理 |
 |---|---|
@@ -98,7 +115,7 @@ livedub 的 TTS 适配器层已按「克隆 provider 可插拔」设计，接入
 | 字幕出来了但没配音 | 看 `error(tts)` 事件与 `npm run doctor --probe`；确认 TTS key 与音色 ID |
 | 页面抓不到声音（扩展） | DRM/受保护页面、或未在点击手势内调用 tabCapture；换普通视频页面试试 |
 
-## 6. 用量与成本参考（请以各家实时价格为准）
+## 7. 用量与成本参考（请以各家实时价格为准）
 
 - 翻译：每句一次短请求（输入 <200 tokens，输出 <120 tokens），60 分钟课程约 300–500 句；
 - TTS：按输出字符计费，中文译文约为原文的 0.6–1.0 倍字符量；

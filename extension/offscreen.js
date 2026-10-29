@@ -82,6 +82,8 @@ async function handleOffscreenMessage(message) {
       return handleStop(message);
     case MSG.OFFSCREEN_CONFIG:
       return handleConfigPatch(message.patch);
+    case MSG.OFFSCREEN_RECONNECT:
+      return reconnectNow();
     case MSG.OFFSCREEN_PING:
       return {
         ok: true,
@@ -524,6 +526,22 @@ function buildOverrides() {
     dub: { enabled: runtime.settings.dubEnabled !== false },
     tts: { voiceMode: runtime.settings.voiceMode || 'clone-first' },
   };
+}
+
+/**
+ * 手动/立即重连：清掉退避定时器、重置计数、马上重建 WS（popup/浮层的「重试」按钮）。
+ * 采集与音频 pipeline 不动，只重连 WS；新会话时间轴从 0 重新开始。
+ */
+function reconnectNow() {
+  if (!runtime.running) return { ok: false, error: '抓音未在运行，请先开始同传' };
+  if (runtime.reconnectTimer) {
+    clearTimeout(runtime.reconnectTimer);
+    runtime.reconnectTimer = null;
+  }
+  runtime.reconnectAttempts = 0;
+  postState({ connection: 'connecting', notice: '手动重试：正在重新连接引擎…' });
+  connectEngine();
+  return { ok: true, reconnecting: true };
 }
 
 function scheduleReconnect(info = {}) {

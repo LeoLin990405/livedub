@@ -8,3 +8,10 @@ data/*
 demo/tmp/
 demo/*.wav
 demo/*.aiff
+
+# chrome extension build artifacts (never commit the pem!)
+*.crx
+*.pem
+demo-fast/
+.env
+.env.*

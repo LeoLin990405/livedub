@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: 使用问题 / 讨论
+    url: https://github.com/LeoLin990405/livedub/discussions
+    about: 安装、配置、使用技巧请走 Discussions；Bug 与 Feature 请用模板
+  - name: 安全问题
+    url: https://github.com/LeoLin990405/livedub/security/advisories/new
+    about: 请勿公开 Issue，按 SECURITY.md 私下报告

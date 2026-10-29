@@ -134,7 +134,18 @@ export function resolveWhisperModel(config) {
 
 /** 加载完整配置 */
 export function loadConfig({ env = process.env, overrides = {} } = {}) {
-  const base = readJsonIfExists(CONFIG_FILE) ?? {};
+  let base = readJsonIfExists(CONFIG_FILE) ?? {};
+  const profile = String(env.LIVEDUB_PROFILE ?? '').trim();
+  if (profile) {
+    const profileFile = path.join(PROJECT_ROOT, 'config', `livedub.${profile}.json`);
+    const profileOverlay = readJsonIfExists(profileFile);
+    if (profileOverlay) {
+      base = deepMerge(base, profileOverlay);
+      delete base._comment;
+    } else {
+      process.emitWarning(`LIVEDUB_PROFILE=${profile} 但找不到 ${path.basename(profileFile)}，使用默认配置`);
+    }
+  }
   const sayless = loadSaylessProviders(env);
   const withSayless = deepMerge(base, {
     // 只有显式提供的 sayless.* 才注入，避免把用户的全部 provider 深拷贝进配置（运行时 resolveProvider 会再查）

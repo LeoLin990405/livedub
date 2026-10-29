@@ -6,6 +6,10 @@
  *   - { type: 'speechStart', t0Ms, t1Ms }                 一段语音开始（含 pre-roll）
  *   - { type: 'partial', t0Ms, t1Ms, pcm }                滚动 partial 窗口请求（每 partial.intervalMs 一次）
  *   - { type: 'final', t0Ms, t1Ms, pcm }                  一句最终音频（含 pre-roll / tailPad）
+ *   - { type: 'speculate', id, t0Ms, t1Ms, pcm }         尾部静音刚开始（~120ms）时的推测收句请求（opt-in）：
+ *                                                        提前把当前句送去识别，若静音确认则直接复用
+ *   - { type: 'speculateCancel', id, reason }            推测作废（语音恢复 / 强制切分）：ASR 层丢弃结果
+ *   注意：speculative 默认关闭；v0.2 实测大模型（推理 ~1.4s）下净收益不稳定，只有显式开启才生效。
  *
  * 时间轴：完全由「音频时长」推导（不是墙钟）。首个 push 的 tMs 作为锚点，
  * 之后每帧 t0Ms = 锚点 + 累计帧数 * frameMs；客户端 tMs 只用于检测跳变（seek/断流）。
@@ -37,6 +41,10 @@ export const SEGMENTER_DEFAULTS = Object.freeze({
   maxUtteranceMs: 7000,
   preRollMs: 200,
   tailPadMs: 150,
+  /** speculative final：尾部静音开始就提前送 ASR 推理（默认关闭，opt-in；ASR 层按 config 显式传入） */
+  speculative: false,
+  /** 尾部静音达到该时长即触发推测（要明显小于 minSilenceMs 才有收益） */
+  speculativeAfterMs: 120,
   /** 相邻 push 的 client tMs 与音频时间轴偏差超过该值 -> 视为 seek/断流，重置时间轴 */
   discontinuityMs: 500,
 });
@@ -67,6 +75,8 @@ export function normalizeVadConfig(config = {}) {
     maxUtteranceMs: finiteNum(src.maxUtteranceMs, SEGMENTER_DEFAULTS.maxUtteranceMs, { min: 200, max: 120000 }),
     preRollMs: finiteNum(src.preRollMs, SEGMENTER_DEFAULTS.preRollMs, { min: 0, max: 2000 }),
     tailPadMs: finiteNum(src.tailPadMs, SEGMENTER_DEFAULTS.tailPadMs, { min: 0, max: 2000 }),
+    speculative: src.speculative === true,
+    speculativeAfterMs: finiteNum(src.speculativeAfterMs, SEGMENTER_DEFAULTS.speculativeAfterMs, { min: 20, max: 5000 }),
     discontinuityMs: finiteNum(src.discontinuityMs, SEGMENTER_DEFAULTS.discontinuityMs, { min: 100, max: 60000 }),
   };
 }
@@ -106,6 +116,10 @@ export function createSegmenter({
   const minSilenceFrames = Math.max(1, Math.ceil(cfg.minSilenceMs / frameMs));
   const tailFrames = Math.max(0, Math.round(cfg.tailPadMs / frameMs));
   const preRollFrames = Math.max(0, Math.round(cfg.preRollMs / frameMs));
+  // 推测触发点必须早于静音确认点，否则没有收益（minSilenceMs 太小则自动关闭推测）
+  const speculateFrames = cfg.speculative
+    ? Math.max(0, Math.min(Math.ceil(cfg.speculativeAfterMs / frameMs), minSilenceFrames - 1))
+    : 0;
   // 历史环形缓冲要能覆盖 pre-roll + 检测窗口 + partial 窗口 + 最长句
   const keepMs =
     Math.max(
@@ -132,6 +146,10 @@ export function createSegmenter({
   let noiseFloor = 0;
   let lastPartialAtMs = 0;
   let liveThreshold = cfg.energyThreshold;
+  let speculating = false; // 当前句是否处于「尾部静音、推测已发出」状态
+  let speculationSeq = 0;
+  /** @type {null | {id:number, t0Ms:number, t1Ms:number}} */
+  let speculation = null;
 
   const stats = {
     frames: 0,
@@ -140,6 +158,8 @@ export function createSegmenter({
     partials: 0,
     forceSplits: 0,
     discontinuityResets: 0,
+    speculations: 0,
+    speculationCancels: 0,
     bytesIn: 0,
   };
 
@@ -162,6 +182,8 @@ export function createSegmenter({
     voicedRun = 0;
     silenceRun = 0;
     lastVoicedEndMs = null;
+    speculating = false;
+    speculation = null;
   }
 
   function trimHistory() {
@@ -213,7 +235,11 @@ export function createSegmenter({
     if (utt.hasSpeech && t1 > utt.t0Ms) {
       const picked = selectRange(utt.frames, utt.t0Ms, t1);
       const pcm = picked.length ? Buffer.concat(picked.map((p) => p.pcm)) : Buffer.alloc(0);
-      if (pcm.length > 0) emitFinal(utt.t0Ms, t1, pcm);
+      if (pcm.length > 0) {
+        // 尾部静音期已发出推测 -> final 带上关联 id，ASR 层可直接复用那次推理
+        const extra = speculating && speculation ? { speculated: true, speculationId: speculation.id } : {};
+        emitFinal(utt.t0Ms, t1, pcm, extra);
+      }
     }
     resetSpeaking();
   }
@@ -221,6 +247,8 @@ export function createSegmenter({
   /** 连续语音到 maxUtteranceMs：在 cutMs 硬切，立刻以 cutMs 起下一句（无 pre-roll、不重叠） */
   function forceSplit(cutMs) {
     if (!speaking || !utt) return;
+    // 硬切分需要完整音频，作废尾部推测（极少数：静音期间句长达到 maxUtteranceMs）
+    if (speculating) cancelSpeculation('force-split');
     if (utt.hasSpeech && cutMs > utt.t0Ms) {
       const picked = selectRange(utt.frames, utt.t0Ms, cutMs);
       const pcm = picked.length ? Buffer.concat(picked.map((p) => p.pcm)) : Buffer.alloc(0);
@@ -271,6 +299,33 @@ export function createSegmenter({
     emit({ type: 'partial', t0Ms: t0, t1Ms: t0 + pcmDurationMs(pcm, rate), pcm });
   }
 
+  /** 尾部静音达到 speculativeAfterMs：把当前句（含已积累的少量尾静音）提前送去识别 */
+  function emitSpeculate(nowMs) {
+    if (!speaking || !utt || !utt.hasSpeech) return;
+    const t0 = utt.t0Ms;
+    const t1 = Math.min(nowMs, lastFrameEndMs ?? nowMs);
+    if (t1 <= t0) return;
+    const picked = selectRange(utt.frames, t0, t1);
+    if (picked.length === 0) return;
+    const pcm = Buffer.concat(picked.map((p) => p.pcm));
+    if (pcm.length === 0) return;
+    speculationSeq += 1;
+    speculation = { id: speculationSeq, t0Ms: t0, t1Ms: t0 + pcmDurationMs(pcm, rate) };
+    speculating = true;
+    stats.speculations += 1;
+    emit({ type: 'speculate', id: speculation.id, t0Ms: speculation.t0Ms, t1Ms: speculation.t1Ms, pcm });
+  }
+
+  /** 推测作废：语音恢复 / 强制切分（ASR 层丢弃在途结果，不产生任何事件） */
+  function cancelSpeculation(reason) {
+    if (!speculating || !speculation) return;
+    const id = speculation.id;
+    speculating = false;
+    speculation = null;
+    stats.speculationCancels += 1;
+    emit({ type: 'speculateCancel', id, reason });
+  }
+
   function updateNoiseFloor(energy) {
     const capped = Math.min(energy, cfg.energyThreshold);
     noiseFloor += cfg.adaptiveAlpha * (capped - noiseFloor);
@@ -311,9 +366,13 @@ export function createSegmenter({
       silenceRun = 0;
       utt.lastVoicedEndMs = endMs;
       utt.hasSpeech = true;
+      // 语音恢复（用户只是句中停顿）-> 作废尾部静音期的推测，继续累积
+      if (speculating) cancelSpeculation('speech-resumed');
     } else {
       silenceRun += 1;
       if (cfg.adaptive) updateNoiseFloor(energy);
+      // 尾部静音刚开始 -> 提前送 whisper 推理，静音确认后直接复用
+      if (speculateFrames > 0 && !speculating && silenceRun >= speculateFrames) emitSpeculate(endMs);
     }
 
     // 1) 静音够长 -> 自然收句
@@ -437,6 +496,13 @@ export function createSegmenter({
         bufferedBytes: buffer.length,
         frameMs,
         sampleRate: rate,
+        speculative: {
+          enabled: speculateFrames > 0,
+          afterMs: cfg.speculativeAfterMs,
+          frames: speculateFrames,
+          speculating,
+          speculationId: speculation?.id ?? null,
+        },
         stats: { ...stats },
       };
     },

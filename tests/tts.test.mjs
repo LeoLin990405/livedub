@@ -67,6 +67,20 @@ function makeFetchMock(handler) {
   return fn;
 }
 
+/** 构造 MiniMax t2a_v2 成功响应（hex PCM） */
+function t2aResponse(pcm, sampleRate = 24000) {
+  return jsonResponse({
+    data: { audio: pcm.toString('hex'), status: 2 },
+    extra_info: { audio_length: pcmDurationMs(pcm, sampleRate), audio_sample_rate: sampleRate, audio_format: 'pcm' },
+    base_resp: { status_code: 0, status_msg: 'success' },
+  });
+}
+
+/** 构造 get_voice 响应 */
+function voicesResponse(list = [{ voice_id: 'male-qn-qingse', voice_name: '青涩青年音色' }]) {
+  return jsonResponse({ system_voice: list, voice_cloning: [], voice_generation: [], base_resp: { status_code: 0, status_msg: 'success' } });
+}
+
 function sseText(events) {
   return `${events.map((e) => (typeof e === 'string' ? `data: ${e}` : `data: ${JSON.stringify(e)}`)).join('\n\n')}\n\n`;
 }
@@ -834,6 +848,370 @@ test('voiceManager: MiniMax 2061 克隆失败 -> 会话层拿到 degraded 状态
 });
 
 // ---------------------------------------------------------------------------
+// v0.2：LRU 缓存
+// ---------------------------------------------------------------------------
+
+test('v0.2 cache: 相同 text+voiceId+speed 第二次命中缓存，不再发请求', async () => {
+  const pcm = makePcm(300, 24000);
+  const fetchMock = makeFetchMock(async () => t2aResponse(pcm));
+  const tts = await createTts({ config: minimaxConfig(), log: () => {}, fetchImpl: fetchMock });
+  const miss = await tts.synthesize({ text: '梯度下降', voiceId: 'male-qn-qingse', speed: 1 });
+  const hit = await tts.synthesize({ text: '梯度下降', voiceId: 'male-qn-qingse', speed: 1 });
+  assert.equal(fetchMock.calls.length, 1, '第二次应命中缓存，不再请求 MiniMax');
+  assert.equal(hit.pcm.equals(miss.pcm), true);
+  assert.equal(hit.durationMs, miss.durationMs);
+  assert.equal(hit.sampleRate, 24000);
+  const st = tts.stats().cache;
+  assert.equal(st.hits, 1);
+  assert.equal(st.misses, 1);
+  assert.equal(st.lookups, 2);
+  assert.equal(st.entries, 1);
+  assert.equal(st.hitRate, 0.5);
+  assert.ok(st.bytes >= pcm.length);
+  assert.equal(st.enabled, true);
+});
+
+test('v0.2 cache: key 含 voiceId 与 speed（不同 voice/speed 不串缓存）', async () => {
+  const fetchMock = makeFetchMock(async () => t2aResponse(makePcm(120, 24000)));
+  const tts = await createTts({ config: minimaxConfig(), log: () => {}, fetchImpl: fetchMock });
+  await tts.synthesize({ text: '你好', voiceId: 'male-qn-qingse', speed: 1 });
+  await tts.synthesize({ text: '你好', voiceId: 'female-shaonv', speed: 1 }); // 不同 voiceId -> miss
+  await tts.synthesize({ text: '你好', voiceId: 'male-qn-qingse', speed: 1.5 }); // 不同 speed -> miss
+  await tts.synthesize({ text: '你好', voiceId: 'male-qn-qingse', speed: 1 }); // hit
+  assert.equal(fetchMock.calls.length, 3);
+  assert.equal(tts.stats().cache.hits, 1);
+});
+
+test('v0.2 cache: speed 先钳制再进缓存 key（speed=5 与 speed=2 视为同一请求）', async () => {
+  const fetchMock = makeFetchMock(async () => t2aResponse(makePcm(80, 24000)));
+  const tts = await createTts({ config: minimaxConfig(), log: () => {}, fetchImpl: fetchMock });
+  await tts.synthesize({ text: '钳制键', speed: 5 });
+  await tts.synthesize({ text: '钳制键', speed: 2 });
+  assert.equal(fetchMock.calls.length, 1);
+  assert.equal(JSON.parse(fetchMock.calls[0].init.body).voice_setting.speed, 2);
+});
+
+test('v0.2 cache: 关闭缓存时行为不变（每次都请求），stats 可见', async () => {
+  const fetchMock = makeFetchMock(async () => t2aResponse(makePcm(100, 24000)));
+  const tts = await createTts({
+    config: minimaxConfig({ cache: { enabled: false } }),
+    log: () => {},
+    fetchImpl: fetchMock,
+  });
+  await tts.synthesize({ text: '不缓存', voiceId: 'male-qn-qingse' });
+  await tts.synthesize({ text: '不缓存', voiceId: 'male-qn-qingse' });
+  assert.equal(fetchMock.calls.length, 2);
+  const st = tts.stats().cache;
+  assert.equal(st.enabled, false);
+  assert.equal(st.lookups, 0);
+  assert.equal(st.entries, 0);
+});
+
+test('v0.2 cache: 超过 maxTextChars 的长文本不缓存（避免长句占内存）', async () => {
+  const fetchMock = makeFetchMock(async () => t2aResponse(makePcm(100, 24000)));
+  const tts = await createTts({
+    config: minimaxConfig({ cache: { enabled: true, maxEntries: 64, maxTextChars: 10 } }),
+    log: () => {},
+    fetchImpl: fetchMock,
+  });
+  await tts.synthesize({ text: '短文本' }); // 3 字 -> 缓存
+  await tts.synthesize({ text: '短文本' }); // hit
+  await tts.synthesize({ text: '这是一个明显超过十个字符的较长中文句子' }); // 超长不缓存
+  await tts.synthesize({ text: '这是一个明显超过十个字符的较长中文句子' }); // 再次 miss
+  assert.equal(fetchMock.calls.length, 3);
+  const st = tts.stats().cache;
+  assert.equal(st.hits, 1);
+  assert.equal(st.skipped, 2);
+  assert.equal(st.entries, 1);
+});
+
+test('v0.2 cache: LRU 淘汰最久未用的条目', async () => {
+  const fetchMock = makeFetchMock(async () => t2aResponse(makePcm(60, 24000)));
+  const tts = await createTts({
+    config: minimaxConfig({ cache: { enabled: true, maxEntries: 2, maxTextChars: 120 } }),
+    log: () => {},
+    fetchImpl: fetchMock,
+  });
+  await tts.synthesize({ text: 'T1' });
+  await tts.synthesize({ text: 'T2' });
+  await tts.synthesize({ text: 'T3' }); // 淘汰 T1
+  let st = tts.stats().cache;
+  assert.equal(st.entries, 2);
+  assert.equal(st.evictions, 1);
+  await tts.synthesize({ text: 'T1' }); // 已淘汰 -> 重新请求
+  assert.equal(fetchMock.calls.length, 4);
+  st = tts.stats().cache;
+  assert.equal(st.entries, 2);
+  assert.equal(st.misses, 4);
+});
+
+test('v0.2 cache: 流式结果可被随后命中（命中时单块返回，不重复请求）', async () => {
+  const a = makePcm(150, 24000);
+  const b = makePcm(200, 24000);
+  const full = Buffer.concat([a, b]);
+  const sse = sseText([
+    { data: { audio: a.toString('hex'), status: 1 }, base_resp: { status_code: 0 } },
+    { data: { audio: b.toString('hex'), status: 1 }, base_resp: { status_code: 0 } },
+    { data: { audio: full.toString('hex'), status: 2 }, base_resp: { status_code: 0 } },
+  ]);
+  const fetchMock = makeFetchMock(async (url, init) => {
+    const body = JSON.parse(init.body);
+    return body.stream ? sseResponse(sse, { splitBytes: 256 }) : t2aResponse(full);
+  });
+  const tts = await createTts({ config: minimaxConfig(), log: () => {}, fetchImpl: fetchMock });
+
+  const first = await collect(tts.synthesizeStream({ text: '流式缓存', voiceId: 'male-qn-qingse' }));
+  assert.equal(first.length, 2);
+  assert.equal(Buffer.concat(first.map((c) => c.pcm)).equals(full), true);
+
+  const second = await collect(tts.synthesizeStream({ text: '流式缓存', voiceId: 'male-qn-qingse' }));
+  assert.equal(second.length, 1, '缓存命中时按单块返回');
+  assert.equal(second[0].pcm.equals(full), true);
+
+  const viaSynthesize = await tts.synthesize({ text: '流式缓存', voiceId: 'male-qn-qingse' });
+  assert.equal(viaSynthesize.pcm.equals(full), true);
+  assert.equal(fetchMock.calls.length, 1, '流式写入缓存后 synthesize 也应命中');
+  assert.equal(tts.stats().cache.hits, 2);
+});
+
+test('v0.2 cache: 消费者中途 break 不写缓存', async () => {
+  const a = makePcm(100, 24000);
+  const sse = sseText([
+    { data: { audio: a.toString('hex'), status: 1 }, base_resp: { status_code: 0 } },
+    { data: { audio: a.toString('hex'), status: 1 }, base_resp: { status_code: 0 } },
+    { data: { audio: Buffer.concat([a, a]).toString('hex'), status: 2 }, base_resp: { status_code: 0 } },
+  ]);
+  const fetchMock = makeFetchMock(async (url, init) => {
+    const body = JSON.parse(init.body);
+    return body.stream ? sseResponse(sse, { splitBytes: 256 }) : t2aResponse(a);
+  });
+  const tts = await createTts({ config: minimaxConfig(), log: () => {}, fetchImpl: fetchMock });
+  const iter = tts.synthesizeStream({ text: '半途而废', voiceId: 'male-qn-qingse' });
+  const first = await iter.next();
+  assert.equal(first.done, false);
+  await iter.return();
+  assert.equal(tts.stats().cache.entries, 0, '未消费完不应写缓存');
+  await tts.synthesize({ text: '半途而废', voiceId: 'male-qn-qingse' });
+  assert.equal(fetchMock.calls.length, 2, '第二次应重新请求（无缓存）');
+});
+
+test('v0.2 cache: clearCache() 后重新请求', async () => {
+  const fetchMock = makeFetchMock(async () => t2aResponse(makePcm(90, 24000)));
+  const tts = await createTts({ config: minimaxConfig(), log: () => {}, fetchImpl: fetchMock });
+  await tts.synthesize({ text: '清理缓存' });
+  assert.equal(tts.stats().cache.entries, 1);
+  tts.clearCache();
+  assert.equal(tts.stats().cache.entries, 0);
+  await tts.synthesize({ text: '清理缓存' });
+  assert.equal(fetchMock.calls.length, 2);
+});
+
+// ---------------------------------------------------------------------------
+// v0.2：可中断（signal 贯穿 fetch / 子进程；abort 不写缓存）
+// ---------------------------------------------------------------------------
+
+test('v0.2 abort: signal 已取消时立刻抛 AbortError，不发请求', async () => {
+  const fetchMock = makeFetchMock(async () => t2aResponse(makePcm(50, 24000)));
+  const tts = await createTts({ config: minimaxConfig(), log: () => {}, fetchImpl: fetchMock });
+  const ac = new AbortController();
+  ac.abort();
+  await assert.rejects(() => tts.synthesize({ text: '已取消', signal: ac.signal }), (err) => err.name === 'AbortError');
+  await assert.rejects(
+    async () => {
+      for await (const _ of tts.synthesizeStream({ text: '已取消', signal: ac.signal })) {
+        /* noop */
+      }
+    },
+    (err) => err.name === 'AbortError'
+  );
+  assert.equal(fetchMock.calls.length, 0);
+  assert.equal(tts.stats().cache.entries, 0);
+});
+
+test('v0.2 abort: 合成中途取消 -> AbortError 且不写缓存', async () => {
+  const fetchMock = makeFetchMock(
+    (url, init) =>
+      new Promise((resolve, reject) => {
+        const sig = init?.signal;
+        const fail = () => reject(new DOMException('aborted', 'AbortError'));
+        if (sig?.aborted) return fail();
+        sig?.addEventListener('abort', fail, { once: true });
+      })
+  );
+  const tts = await createTts({ config: minimaxConfig(), log: () => {}, fetchImpl: fetchMock });
+  const ac = new AbortController();
+  const pending = tts.synthesize({ text: '中途取消测试', signal: ac.signal });
+  setTimeout(() => ac.abort(), 10);
+  await assert.rejects(pending, (err) => err.name === 'AbortError');
+  assert.equal(tts.stats().cache.entries, 0);
+  assert.equal(tts.stats().cache.stores, 0);
+});
+
+test('v0.2 abort: 流式中途取消 -> AbortError 且不写缓存（无未处理 rejection）', async () => {
+  const firstPcm = makePcm(60, 24000);
+  const firstEvent = `data: ${JSON.stringify({ data: { audio: firstPcm.toString('hex'), status: 1 }, base_resp: { status_code: 0 } })}\n\n`;
+  const fetchMock = makeFetchMock((url, init) => ({
+    ok: true,
+    status: 200,
+    async text() {
+      return '';
+    },
+    body: (async function* stream() {
+      yield new TextEncoder().encode(firstEvent);
+      await new Promise((resolve) => {
+        const sig = init?.signal;
+        const fallback = setTimeout(resolve, 2000); // 兜底，避免测试挂死
+        fallback.unref?.();
+        if (sig?.aborted) return resolve();
+        sig?.addEventListener('abort', () => resolve(), { once: true });
+      });
+      throw new DOMException('aborted', 'AbortError');
+    })(),
+  }));
+  const tts = await createTts({ config: minimaxConfig(), log: () => {}, fetchImpl: fetchMock });
+  const ac = new AbortController();
+  const iter = tts.synthesizeStream({ text: '流式中途取消', signal: ac.signal });
+  const first = await iter.next();
+  assert.equal(first.done, false);
+  ac.abort();
+  await assert.rejects(() => iter.next(), (err) => err.name === 'AbortError');
+  assert.equal(tts.stats().cache.entries, 0);
+});
+
+// ---------------------------------------------------------------------------
+// v0.2：warmup（失败不致命、幂等、预热 listVoices TTL）
+// ---------------------------------------------------------------------------
+
+test('v0.2 warmup: minimax 用一次轻量 get_voice 预热，并顺带填满 listVoices TTL 缓存', async () => {
+  const fetchMock = makeFetchMock(async (url) => {
+    assert.match(url, /\/get_voice$/);
+    return voicesResponse([
+      { voice_id: 'male-qn-qingse', voice_name: '青涩青年音色' },
+      { voice_id: 'female-shaonv', voice_name: '少女音色' },
+    ]);
+  });
+  const tts = await createTts({ config: minimaxConfig(), log: () => {}, fetchImpl: fetchMock });
+  const result = await tts.warmup();
+  assert.equal(result.ok, true);
+  assert.equal(result.provider, 'minimax');
+  assert.equal(result.voices, 2);
+  assert.ok(result.elapsedMs >= 0);
+  assert.equal(fetchMock.calls.length, 1, 'warmup 只应发 1 次轻量 get_voice');
+  const voices = await tts.listVoices();
+  assert.equal(voices.length, 2);
+  assert.equal(fetchMock.calls.length, 1, 'warmup 后 listVoices 应命中 TTL 缓存');
+  const w = tts.stats().warmup;
+  assert.equal(w.called, true);
+  assert.equal(w.ok, true);
+});
+
+test('v0.2 warmup: provider 失败只记录不抛，之后合成仍可用', async () => {
+  const pcm = makePcm(100, 24000);
+  const fetchMock = makeFetchMock(async (url, init, idx) => {
+    if (idx === 0) throw new TypeError('warmup network down');
+    return t2aResponse(pcm);
+  });
+  const tts = await createTts({ config: minimaxConfig(), log: () => {}, fetchImpl: fetchMock });
+  const result = await tts.warmup();
+  assert.equal(result.ok, false);
+  assert.match(result.error, /network/);
+  assert.equal(tts.stats().warmup.ok, false);
+  const res = await tts.synthesize({ text: '预热失败后合成' });
+  assert.equal(res.pcm.equals(pcm), true);
+});
+
+test('v0.2 warmup: 幂等（多次调用只预热一次）', async () => {
+  const fetchMock = makeFetchMock(async () => voicesResponse());
+  const tts = await createTts({ config: minimaxConfig(), log: () => {}, fetchImpl: fetchMock });
+  const [a, b] = await Promise.all([tts.warmup(), tts.warmup()]);
+  assert.equal(a.ok, true);
+  assert.equal(b.ok, true);
+  assert.equal(fetchMock.calls.length, 1);
+});
+
+test('v0.2 warmup: macos-say / mock 也有 warmup 且不 throw', async () => {
+  const say = await createTts({
+    config: { tts: { provider: 'macos-say', sampleRate: 24000, fallbacks: [{ provider: 'macos-say', voice: 'Tingting' }] } },
+    log: () => {},
+  });
+  const sayResult = await say.warmup();
+  assert.equal(sayResult.provider, 'macos-say');
+  assert.equal(typeof sayResult.ok, 'boolean');
+
+  const mock = await createTts({ config: { tts: { provider: 'mock', sampleRate: 24000 } }, log: () => {} });
+  const mockResult = await mock.warmup();
+  assert.equal(mockResult.ok, true);
+  assert.deepEqual(Object.keys(mock.stats()).sort(), ['cache', 'name', 'provider', 'voiceList', 'warmup']);
+});
+
+// ---------------------------------------------------------------------------
+// v0.2：参数校验（voiceId / speed / 文本）+ listVoices TTL
+// ---------------------------------------------------------------------------
+
+test('v0.2 参数校验: 非法 voiceId / 空文本 / 超长文本在请求前抛清晰错误', async () => {
+  const fetchMock = makeFetchMock(async () => t2aResponse(makePcm(50, 24000)));
+  const tts = await createTts({ config: minimaxConfig(), log: () => {}, fetchImpl: fetchMock });
+  await assert.rejects(() => tts.synthesize({ text: 'x', voiceId: 123 }), /voiceId 必须是字符串/);
+  await assert.rejects(() => tts.synthesize({ text: 'x', voiceId: 'bad\u0000id' }), /控制字符/);
+  await assert.rejects(() => tts.synthesize({ text: 'x', voiceId: 'x'.repeat(129) }), /voiceId 过长/);
+  await assert.rejects(() => tts.synthesize({ text: '   ' }), /文本为空/);
+  await assert.rejects(() => tts.synthesize({ text: '字'.repeat(5001) }), /文本过长/);
+  assert.equal(fetchMock.calls.length, 0);
+});
+
+test('v0.2 speed 钳制: 0.5 <= speed <= 2.0 后再传给 provider', async () => {
+  const fetchMock = makeFetchMock(async () => t2aResponse(makePcm(50, 24000)));
+  const tts = await createTts({ config: minimaxConfig({ cache: { enabled: false } }), log: () => {}, fetchImpl: fetchMock });
+  const speedOf = (call) => JSON.parse(call.init.body).voice_setting.speed;
+  await tts.synthesize({ text: '速度一', speed: 5 });
+  await tts.synthesize({ text: '速度二', speed: 0.1 });
+  await tts.synthesize({ text: '速度三', speed: 'not-a-number' });
+  await tts.synthesize({ text: '速度四', speed: 1.3 });
+  assert.deepEqual(fetchMock.calls.map(speedOf), [2, 0.5, 1, 1.3]);
+});
+
+test('v0.2 listVoices: 短 TTL 缓存，过期后重新获取', async () => {
+  const fetchMock = makeFetchMock(async () => voicesResponse());
+  const tts = await createTts({
+    config: minimaxConfig({ voiceListTtlMs: 30 }),
+    log: () => {},
+    fetchImpl: fetchMock,
+  });
+  const a = await tts.listVoices();
+  const b = await tts.listVoices();
+  assert.equal(a, b, 'TTL 内应返回同一份缓存');
+  assert.equal(fetchMock.calls.length, 1);
+  await new Promise((resolve) => setTimeout(resolve, 45));
+  await tts.listVoices();
+  assert.equal(fetchMock.calls.length, 2, 'TTL 过期后应重新请求');
+  assert.equal(tts.stats().voiceList.fetches, 2);
+  assert.equal(typeof tts.stats().voiceList.ttlMs, 'number');
+});
+
+test('v0.2 降级链: warmup / stats / 缓存 均可用', async () => {
+  const fetchMock = makeFetchMock(async () => {
+    throw new TypeError('primary down');
+  });
+  const cfg = minimaxConfig();
+  cfg.tts.fallbacks = [{ provider: 'mock' }];
+  const tts = await createTtsWithFallback({ config: cfg, log: () => {}, fetchImpl: fetchMock });
+  const warm = await tts.warmup();
+  assert.equal(warm.providers.length, 2);
+  assert.equal(typeof warm.ok, 'boolean');
+  const first = await tts.synthesize({ text: '降级链缓存' });
+  const second = await tts.synthesize({ text: '降级链缓存' });
+  assert.equal(first.pcm.equals(second.pcm), true);
+  const stats = tts.stats();
+  assert.equal(stats.providers.length, 2);
+  assert.ok(stats.providers[1].cache.hits >= 1, 'fallback provider 的缓存应在工作');
+  assert.ok(stats.providers[1].cache.entries >= 1);
+  tts.clearCache();
+  const afterClear = tts.stats();
+  assert.equal(afterClear.providers[0].cache.entries, 0);
+  assert.equal(afterClear.providers[1].cache.entries, 0);
+});
+
+// ---------------------------------------------------------------------------
 // 真机测试（默认跳过）：LIVEDUB_INTEGRATION=1 node --test tests/tts.test.mjs
 // ---------------------------------------------------------------------------
 
@@ -881,6 +1259,56 @@ test('integration: MiniMax 真实流式合成（首包延迟）', { skip: !INTEG
   assert.ok(bytes > 0);
   assert.ok(firstMs < 5000, `首包太慢: ${firstMs}ms`);
   console.log(`[integration] minimax stream: first=${firstMs}ms chunks=${chunks} bytes=${bytes} duration=${pcmDurationMs(Buffer.alloc(bytes), 24000)}ms`);
+});
+
+test('integration: v0.2 warmup + 流式首包 + 缓存 miss/hit（2 次 TTS + 1 次轻量预热）', { skip: !INTEGRATION }, async () => {
+  const { loadConfig } = await import('../engine/config.mjs');
+  const config = loadConfig();
+  const tts = await createTts({ config, log: () => {} });
+
+  // 预热：1 次轻量 get_voice（不计 TTS 字符），同时建立/复用 HTTP 连接
+  const w0 = Date.now();
+  const warm = await tts.warmup();
+  const warmMs = Date.now() - w0;
+  assert.equal(warm.ok, true);
+  assert.ok(tts.stats().voiceList.cached, 'warmup 应填满 listVoices TTL 缓存');
+  assert.ok(warm.voices > 0);
+
+  // TTS #1/#2：预热后两条流式 -> 首包延迟（不同文本，避免缓存互相干扰）
+  const streamSamples = [];
+  for (const streamText of ['梯度下降是一种一阶迭代优化算法。', '学习率决定每次参数更新的步长。']) {
+    const t0 = Date.now();
+    let firstMs = null;
+    let streamBytes = 0;
+    for await (const chunk of tts.synthesizeStream({ text: streamText, voiceId: 'male-qn-qingse' })) {
+      if (firstMs == null) firstMs = Date.now() - t0;
+      streamBytes += chunk.pcm.length;
+    }
+    streamSamples.push({ text: streamText, firstMs, totalMs: Date.now() - t0, bytes: streamBytes });
+  }
+  const firstMs = streamSamples[0].firstMs;
+
+  // TTS #3：非流式 cache miss
+  const text = '反向传播通过链式法则计算每一层的梯度。';
+  const m0 = Date.now();
+  const miss = await tts.synthesize({ text, voiceId: 'male-qn-qingse' });
+  const missMs = Date.now() - m0;
+
+  // cache hit：本地内存命中，不应该再发请求
+  const h0 = Date.now();
+  const hit = await tts.synthesize({ text, voiceId: 'male-qn-qingse' });
+  const hitMs = Date.now() - h0;
+
+  assert.equal(hit.pcm.equals(miss.pcm), true, '命中缓存音频应与 miss 一致');
+  assert.ok(hitMs <= missMs, `缓存命中(${hitMs}ms)不应慢于 miss(${missMs}ms)`);
+  assert.ok(hitMs < 200, `缓存命中耗时异常：${hitMs}ms`);
+  const cacheStats = tts.stats().cache;
+  assert.ok(cacheStats.hits >= 1);
+  assert.ok(missMs < 5000, `cache miss 太慢：${missMs}ms`);
+
+  console.log(
+    `[integration-v0.2] warmup=${warmMs}ms ok=${warm.ok} voices=${warm.voices} | stream first=${streamSamples.map((x) => x.firstMs).join('/')}ms total=${streamSamples.map((x) => x.totalMs).join('/')}ms | cache miss=${missMs}ms hit=${hitMs}ms pcm=${miss.pcm.length}B@${miss.sampleRate}Hz duration=${miss.durationMs}ms | cache=${JSON.stringify({ hits: cacheStats.hits, misses: cacheStats.misses, hitRate: cacheStats.hitRate, entries: cacheStats.entries })}`
+  );
 });
 
 test('integration: MiniMax 真实 clone 返回 2061 并带 code', { skip: !INTEGRATION }, async () => {

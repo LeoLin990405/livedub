@@ -21,7 +21,7 @@
       * { box-sizing: border-box; }
       body {
         margin: 0;
-        width: 340px;
+        width: 348px;
         padding: 14px;
         background: var(--bg);
         color: var(--text);
@@ -42,7 +42,7 @@
         padding: 5px 9px; border-radius: 999px; background: var(--card);
         border: 1px solid var(--line); color: var(--muted); font-size: 11px; white-space: nowrap;
       }
-      .dot { width: 7px; height: 7px; border-radius: 50%; background: #7c8196; }
+      .dot { width: 7px; height: 7px; border-radius: 50%; background: #7c8196; flex: none; }
       .status[data-tone="live"] .dot { background: var(--ok); box-shadow: 0 0 6px var(--ok); }
       .status[data-tone="busy"] .dot { background: var(--warn); }
       .status[data-tone="translate"] .dot { background: #5aa9ff; }
@@ -60,14 +60,14 @@
         outline: none; font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
       }
       input[type="text"]:focus, select:focus { border-color: var(--accent-2); }
-      select { font-family: inherit; }
-      .actions { display: flex; gap: 8px; margin-top: 9px; }
+      select { font-family: inherit; font-size: 12.5px; }
+      .actions { display: flex; gap: 6px; margin-top: 9px; flex-wrap: wrap; }
       button {
         border: none; border-radius: 9px; padding: 8px 10px; font-size: 12px; cursor: pointer;
         font-family: inherit; transition: background 0.15s ease, opacity 0.15s ease;
       }
       button:disabled { opacity: 0.55; cursor: default; }
-      .ghost { background: var(--card-2); border: 1px solid var(--line); color: var(--text); flex: 1; }
+      .ghost { background: var(--card-2); border: 1px solid var(--line); color: var(--text); flex: 1; min-width: 86px; }
       .ghost:hover:not(:disabled) { background: #262b3c; }
       .primary {
         width: 100%; padding: 11px; margin-bottom: 10px; font-size: 13px; font-weight: 700;
@@ -76,13 +76,16 @@
       .primary:hover:not(:disabled) { background: #5570f0; }
       .primary[data-mode="stop"] { background: #b8434f; }
       .primary[data-mode="stop"]:hover:not(:disabled) { background: #c94d5a; }
-      .grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; margin-bottom: 10px; }
+      .grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 6px; margin-bottom: 10px; }
       .metric {
         background: var(--card); border: 1px solid var(--line); border-radius: 10px;
-        padding: 8px 9px; display: flex; flex-direction: column; gap: 3px;
+        padding: 7px 8px; display: flex; flex-direction: column; gap: 3px; min-width: 0;
       }
-      .metric span { color: var(--muted); font-size: 10px; }
-      .metric b { font-size: 12px; font-weight: 600; font-variant-numeric: tabular-nums; }
+      .metric span { color: var(--muted); font-size: 10px; white-space: nowrap; }
+      .metric b { font-size: 12px; font-weight: 600; font-variant-numeric: tabular-nums; overflow: hidden; text-overflow: ellipsis; }
+      .kv { display: flex; gap: 8px; padding: 3px 0; font-size: 12px; line-height: 1.45; }
+      .kv span { color: var(--muted); flex: none; width: 34px; }
+      .kv b { font-weight: 500; word-break: break-all; color: #d7dbe8; }
       .hint { margin: 6px 0 0; color: var(--muted); font-size: 10.5px; line-height: 1.5; }
       .footer { margin-top: 4px; }
       .error {
@@ -91,7 +94,28 @@
       }
       .error[data-kind="info"] { background: rgba(90, 169, 255, 0.13); border-color: rgba(90, 169, 255, 0.4); color: #cfe4ff; }
       .error[hidden] { display: none; }
-      a { color: var(--accent-2); }
+      .health {
+        display: flex; align-items: center; gap: 6px; margin-top: 8px;
+        font-size: 11px; color: var(--muted);
+      }
+      .health .dot { width: 7px; height: 7px; }
+      .health[data-state="online"] { color: #9fe9bd; }
+      .health[data-state="online"] .dot { background: var(--ok); box-shadow: 0 0 6px var(--ok); }
+      .health[data-state="offline"] { color: #ffb3ba; }
+      .health[data-state="offline"] .dot { background: var(--err); }
+      .health[data-state="checking"] .dot { background: var(--warn); }
+      .health-detail { margin-top: 4px; color: var(--muted); font-size: 10.5px; line-height: 1.55; word-break: break-all; }
+      .health-detail[hidden] { display: none; }
+      .guidance {
+        margin-bottom: 10px; padding: 10px 11px; border-radius: 11px;
+        background: rgba(90, 169, 255, 0.12); border: 1px solid rgba(90, 169, 255, 0.34);
+        font-size: 11.5px; line-height: 1.55; color: #d6e6ff;
+      }
+      .guidance[hidden] { display: none; }
+      .guidance-title { font-weight: 700; margin-bottom: 4px; }
+      .guidance-body { white-space: pre-line; color: #b9cbe4; }
+      .guidance-actions { display: flex; gap: 6px; margin-top: 8px; }
+      .guidance-actions button { flex: 1; font-size: 11.5px; padding: 6px 8px; }
     </style>
   </head>
   <body>
@@ -115,17 +139,38 @@
       </label>
       <div class="actions">
         <button id="save-url" class="ghost" type="button">保存地址</button>
-        <button id="open-studio" class="ghost" type="button">打开本地工作台</button>
+        <button id="probe-engine" class="ghost" type="button">检测引擎</button>
+        <button id="open-studio" class="ghost" type="button">打开工作台</button>
       </div>
-      <p class="hint" id="url-hint">默认 ws://127.0.0.1:8787/ws；先在本机启动引擎：node engine/server.mjs</p>
+      <div class="health" id="health" data-state="unknown">
+        <span class="dot"></span><span id="health-text">引擎未检测</span>
+      </div>
+      <div class="health-detail" id="health-detail" hidden></div>
+      <p class="hint" id="url-hint">默认 ws://127.0.0.1:8787/ws；启动引擎：cd livedub &amp;&amp; npm start</p>
     </section>
+
+    <div id="guidance" class="guidance" hidden>
+      <div class="guidance-title" id="guidance-title"></div>
+      <div class="guidance-body" id="guidance-body"></div>
+      <div class="guidance-actions">
+        <button id="retry-engine" class="ghost" type="button">重试连接</button>
+        <button id="probe-again" class="ghost" type="button">重新检测</button>
+      </div>
+    </div>
 
     <button id="toggle" class="primary" type="button" data-mode="start">开始同传</button>
 
     <section class="grid">
-      <div class="metric"><span>延迟</span><b id="latency">—</b></div>
-      <div class="metric"><span>音色</span><b id="voice">—</b></div>
-      <div class="metric"><span>引擎</span><b id="engine">未连接</b></div>
+      <div class="metric"><span>ASR</span><b id="lat-asr">—</b></div>
+      <div class="metric"><span>翻译</span><b id="lat-mt">—</b></div>
+      <div class="metric"><span>配音</span><b id="lat-tts">—</b></div>
+      <div class="metric"><span>端到端</span><b id="lat-e2e">—</b></div>
+    </section>
+
+    <section class="card">
+      <div class="kv"><span>引擎</span><b id="providers">—</b></div>
+      <div class="kv"><span>音色</span><b id="voice-detail">—</b></div>
+      <div class="kv"><span>语言</span><b id="languages">—</b></div>
     </section>
 
     <section class="card">
@@ -138,7 +183,9 @@
       </label>
       <div class="actions">
         <button id="show-overlay" class="ghost" type="button">显示字幕浮层</button>
+        <button id="export-srt" class="ghost" type="button">导出本次 SRT</button>
       </div>
+      <p class="hint" id="caption-count">本次会话字幕 0 条</p>
     </section>
 
     <p class="hint footer">

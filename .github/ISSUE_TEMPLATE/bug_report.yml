@@ -1,0 +1,68 @@
+name: Bug report
+description: 报告一个可复现的问题（先搜一下已有 issue）
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        感谢反馈！请尽量提供可复现信息。**不要在 issue 里粘贴 API Key 或完整隐私音频**。
+  - type: input
+    id: version
+    attributes:
+      label: livedub 版本 / commit
+      placeholder: "0.2.0 / 5f12efb"
+    validations:
+      required: true
+  - type: dropdown
+    id: surface
+    attributes:
+      label: 出问题的部分
+      options:
+        - Chrome 扩展
+        - 本地工作台 studio
+        - 引擎 / 管线（ASR/翻译/TTS）
+        - 批处理 batch / demo 生成
+        - 文档 / 安装
+        - 其它
+    validations:
+      required: true
+  - type: input
+    id: env
+    attributes:
+      label: 环境
+      placeholder: "macOS 14.8.9 Apple M2 / Node v26.3.1 / Chrome 156"
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: 复现步骤
+      placeholder: |
+        1. npm start
+        2. 打开 /studio/，加载视频...
+        3. 点击开始同传
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: 期望行为 vs 实际行为
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: 日志 / 截图（脱敏）
+      description: 引擎终端输出、浏览器 console、扩展 popup 状态等。请删除 Key、隐私内容。
+      render: shell
+    validations:
+      required: false
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: 已确认
+      options:
+        - label: 我搜索过现有 issues，没有重复
+          required: true
+        - label: 我没有粘贴任何 API Key / 隐私数据
+          required: true

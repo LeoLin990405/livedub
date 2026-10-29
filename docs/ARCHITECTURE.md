@@ -42,7 +42,7 @@
                                    ├─ 第一个子句译完 ──▶ TTS 流式合成 ──▶ 配音首包（≈1s）
                                    ├─ 原声 duck 到 18%，播放中文配音
                                    └─ metrics 事件：asrFinalMs / mtFirstMs / ttsFirstMs / e2eLagMs
-┌──────────────── 实测 e2eLagMs 中位 3.4s（本机 52.7s 示例课）──────────┐
+┌──────────── 实测 e2eLagMs 中位 3.0s（快速档 2.4s，本机 52.7s 示例课）────────────┐
 ```
 
 为什么不是「全句译完才配音」：长句等待会累积到 3–5s。livedub 在**子句级**触发 TTS，让第一声尽快出来，后面子句边译边补。
@@ -53,20 +53,23 @@
 
 - 能量 VAD + 自适应阈值，帧长 20ms；支持 pre-roll（保留句首前 200ms）和 tail pad（句尾补 150ms），避免吞字；
 - 句尾静音 300ms 或句长超 7s 触发 final；
-- 句内每 ~1.5s 对最近 9s 窗口做一次「滚动 partial」，partial 是覆盖式字幕；
+- **partial 默认关闭**：每次 partial 推理同样占用 whisper 串行队列（~1.4s），实测会把 final 推后 ~0.8–1.1s；需要「字幕边听边长」可在 config 开启 `asr.whisper.partial.enabled`；
+- 失败的「speculative final」实验：推理 1.4s ≫ 静音确认 280ms，只会增加队列争用（实测 e2e +0.7s），因此默认关闭，仅保留 opt-in + 推理耗时门限；
 - `/inference` 带**领域初始 prompt**（如 gradient descent / loss function / learning rate），显著减少教学术语错词；线程数默认 8；
 - 常驻 `whisper-server` 进程复用模型；会话关闭不杀进程，进程崩溃自动重启。
-- 延迟旋钮：换 `ggml-small` 可把 7s 段推理从 ~1.6s 压到 ~0.55s（e2e 约再快 1s，术语准确率略降），见 `docs/MEASUREMENTS.md`。
+- 延迟旋钮：`LIVEDUB_PROFILE=fast`（或 `npm run start:fast`）换 `ggml-small`，7s 段推理 ~1.6s→~0.55s，e2e 3.0s→~2.4s，术语准确率略降，见 `docs/MEASUREMENTS.md`。
 
 ### 4.2 翻译（`engine/translate`）
 
 - 每句一次流式 chat/completions；prompt 约束「忠实、口语化、可直接朗读、不解释、保留公式/标识符」；
+- **翻译流式 × TTS 重叠**：`createClauseExtractor` 在 partial 译文里提取已稳定子句，先合成配音，不等整句译完（慢 provider 下实测首包提前 ~300ms）；
 - 注入最近 3 句的双语上下文 + 术语表（强约束）；
 - `chain` 顺序 failover；每个 provider 有超时与 AbortSignal，失败不阻塞后续句子。
 
 ### 4.3 TTS 与音色（`engine/tts` + `engine/voice.mjs`）
 
-- MiniMax `t2a_v2` 优先请求 `format:pcm`（省掉 mp3 解码），流式 SSE 边到边发；
+- MiniMax `t2a_v2` 优先请求 `format:pcm`（省掉 mp3 解码），流式 SSE 边到边发；会话启动时后台 `warmup()` 预热连接与音色列表；
+- LRU 缓存同一音色/语速/文本的合成结果（教学高频重复短语），实测 cache hit 0ms vs miss ~0.9s；支持 abort 中断在途合成；
 - `splitForTts` 按中英标点/长度切片，避免 TTS 一口气等整段；
 - 克隆流程：会话累积讲师语音样本（≥`clone.minSampleSec`）→ 上传/克隆一次 → 成功则切克隆音色，失败**只记录一次 reason** 并永久降级 preset；
 - 无 key/断网兜底：`macOS say`（Tingting 等中文音色）。
@@ -123,6 +126,6 @@
 
 `npm run batch` 会对示例视频跑完整真实链路，输出 `demo/metrics.json`：
 每句的 asrFinalMs / mtFirstMs / mtDoneMs / ttsFirstMs / e2eLagMs，以及中位数汇总。
-本机 52.7s 示例课实测（M2 / 16GB）：ASR 中位 2.1s、翻译首字 0.8s、TTS 首包 0.2s、**e2e 中位 3.4s**；
-逐句表格与模型对比见 [MEASUREMENTS.md](MEASUREMENTS.md)。
+本机 52.7s 示例课实测（M2 / 16GB）：ASR 中位 1.8s、翻译首字 0.8s、TTS 首包 0.25s、**e2e 中位 3.0s**（快速档 2.4s）；
+逐句表格、失败的 speculative-final 实验与 partial A/B 数据见 [MEASUREMENTS.md](MEASUREMENTS.md)。
 调参（VAD 阈值、partial 间隔、TTS 切块长度、调度阈值）后重跑即可对比。

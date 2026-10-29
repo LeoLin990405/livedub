@@ -1,18 +1,12 @@
 /**
  * livedub Chrome MV3 扩展 —— popup（点击工具栏图标打开）。
  *
- * 职责：
- * - 引擎地址输入/保存（chrome.storage.local，与浮层共享）
- * - 连接状态、延迟、音色、开始/停止
- * - 音色模式（clone-first / preset）
- * - 打开本地工作台（由 WS 地址推导 http 地址）
- * - 错误提示（含「需要用户手势」的排障提示）
- *
- * 关键点：chrome.tabCapture.getMediaStreamId 必须在用户手势内调用。
- * 这里在「开始同传」按钮的点击回调里直接调用（弹窗点击 = 用户手势），
- * 拿到 streamId 再交给 background 创建 offscreen document。若直接调用失败，
- * 会退回到让 background 在消息链里再试一次（部分 Chrome 版本可用），
- * 两条路都失败时展示可读错误（让用户用快捷键 / 重新点击图标）。
+ * v0.2：
+ * - 引擎未连接引导：显示 `npm start` 步骤 + 「检测引擎」(/health) + 「重试连接」；
+ * - ready 后显示 provider / voice / 语言方向；
+ * - 延迟拆分为 ASR / 翻译 / 配音 / 端到端；
+ * - 导出本次 SRT（background 累积字幕，popup 只负责下载）；
+ * - 保留 v0.1：引擎地址保存、开始/停止（手势内 getMediaStreamId）、音色模式、工作台、错误提示。
  */
 
 import {
@@ -20,6 +14,7 @@ import {
   DEFAULT_SETTINGS,
   MSG,
   STORAGE_KEYS,
+  deriveHealthUrl,
   deriveStudioUrl,
   isCapturablePage,
   normalizeEngineUrl,
@@ -35,13 +30,28 @@ const ui = {
   engineUrl: $('engine-url'),
   urlHint: $('url-hint'),
   saveUrl: $('save-url'),
+  probeEngine: $('probe-engine'),
   openStudio: $('open-studio'),
+  health: $('health'),
+  healthText: $('health-text'),
+  healthDetail: $('health-detail'),
+  guidance: $('guidance'),
+  guidanceTitle: $('guidance-title'),
+  guidanceBody: $('guidance-body'),
+  retryEngine: $('retry-engine'),
+  probeAgain: $('probe-again'),
   toggle: $('toggle'),
-  latency: $('latency'),
-  voice: $('voice'),
-  engine: $('engine'),
+  latAsr: $('lat-asr'),
+  latMt: $('lat-mt'),
+  latTts: $('lat-tts'),
+  latE2e: $('lat-e2e'),
+  providers: $('providers'),
+  voiceDetail: $('voice-detail'),
+  languages: $('languages'),
   voiceMode: $('voice-mode'),
   showOverlay: $('show-overlay'),
+  exportSrt: $('export-srt'),
+  captionCount: $('caption-count'),
 };
 
 const runtime = {
@@ -49,6 +59,7 @@ const runtime = {
   bgState: null,
   busy: false,
   errorTimer: null,
+  health: { state: 'unknown', data: null, error: '' },
 };
 
 // ---------------------------------------------------------------------------
@@ -80,36 +91,129 @@ function statusSummary() {
   return { label: '未连接', tone: 'idle' };
 }
 
+function healthProviders() {
+  const state = runtime.bgState;
+  if (state && state.ready && state.ready.providers) return state.ready.providers;
+  if (runtime.health.state === 'online' && runtime.health.data && runtime.health.data.providers) {
+    return runtime.health.data.providers;
+  }
+  return null;
+}
+
+function providerLabel() {
+  const providers = healthProviders();
+  if (!providers) return '—';
+  const names = [providers.asr, providers.translate, providers.tts].filter(Boolean);
+  return names.length > 0 ? names.join(' · ') : '—';
+}
+
 function voiceLabel() {
   const state = runtime.bgState;
   const voice = (state && state.voice) || (state && state.ready && state.ready.voice) || null;
   if (!voice) return '—';
   const mode = voice.mode === 'clone' ? '克隆' : '预设';
-  if (voice.degraded) return `${mode}·降级`;
-  return voice.voiceId ? `${mode}·${String(voice.voiceId).slice(0, 14)}` : mode;
+  if (voice.degraded) return `${mode}·已降级`;
+  return voice.voiceId ? `${mode}·${String(voice.voiceId).slice(0, 20)}` : mode;
 }
 
-function engineLabel() {
+function languageLabel() {
   const state = runtime.bgState;
-  if (!state) return '未连接';
-  if (state.phase !== 'running') return state.phase === 'error' ? '异常' : '未连接';
-  if (state.connection === 'closed') return '断开';
-  if (state.connection === 'connecting') return '连接中';
-  const engineState = state.engineState || 'idle';
-  const map = {
-    idle: '空闲',
-    listening: '收听中',
-    translating: '翻译中',
-    speaking: '配音中',
-    paused: '已暂停',
-    error: '异常',
-  };
-  return map[engineState] || engineState;
+  const session = state && state.session;
+  const from = (session && session.langFrom) || runtime.settings.langFrom || 'en';
+  const to = (session && session.langTo) || runtime.settings.langTo || 'zh';
+  return `${from} → ${to}`;
+}
+
+function metricsSource() {
+  const state = runtime.bgState;
+  if (!state) return null;
+  return state.metrics || null;
+}
+
+function renderMetrics() {
+  const state = runtime.bgState;
+  const metrics = metricsSource();
+  ui.latAsr.textContent = metrics ? formatLatency(metrics.asrFinalMs) : '—';
+  ui.latMt.textContent = metrics ? formatLatency(Number.isFinite(metrics.mtFirstMs) ? metrics.mtFirstMs : metrics.mtDoneMs) : '—';
+  ui.latTts.textContent = metrics ? formatLatency(metrics.ttsFirstMs) : '—';
+  const e2e = metrics ? pickLatencyMs(metrics) : state && Number.isFinite(state.latencyMs) ? state.latencyMs : null;
+  ui.latE2e.textContent = formatLatency(e2e);
+}
+
+function renderHealth() {
+  const health = runtime.health;
+  ui.health.dataset.state = health.state;
+  if (health.state === 'checking') {
+    ui.healthText.textContent = '检测引擎中…';
+    ui.healthDetail.hidden = true;
+    return;
+  }
+  if (health.state === 'online' && health.data) {
+    const data = health.data;
+    const whisper = data.whisper && data.whisper.found ? 'whisper ✓' : 'whisper ✗';
+    ui.healthText.textContent = `引擎在线 · v${data.version || '?'} · ${whisper}`;
+    const chain = data.providers && Array.isArray(data.providers.translateChain) && data.providers.translateChain.length
+      ? data.providers.translateChain.join('/')
+      : '';
+    const parts = [
+      `whisper ${(data.whisper && data.whisper.model) || '未找到'}`,
+      chain ? `翻译链 ${chain}` : '',
+      data.providers && data.providers.tts ? `TTS ${data.providers.tts}${data.providers.ttsModel ? `/${data.providers.ttsModel}` : ''}` : '',
+    ].filter(Boolean);
+    ui.healthDetail.hidden = parts.length === 0;
+    ui.healthDetail.textContent = parts.join(' · ');
+    return;
+  }
+  if (health.state === 'offline') {
+    ui.healthText.textContent = '引擎离线';
+    ui.healthDetail.hidden = !health.error;
+    ui.healthDetail.textContent = health.error ? `原因：${health.error}` : '';
+    return;
+  }
+  ui.healthText.textContent = '引擎未检测';
+  ui.healthDetail.hidden = true;
+}
+
+function renderGuidance() {
+  const state = runtime.bgState;
+  const active = isActive();
+  let info = null;
+  if (active && state && state.connection === 'closed') {
+    info = {
+      title: '引擎连接断开，正在自动重连…',
+      body: '请确认引擎进程仍在运行（cd livedub && npm start）。也可以点「重试连接」立即重连，无需重新开始抓音。',
+      showRetry: true,
+      showProbe: false,
+    };
+  } else if (!active && state && state.phase === 'error') {
+    info = {
+      title: '抓音失败',
+      body: `${(state.error && state.error.message) || '请检查页面与引擎状态后重试。'}\n可先确认引擎已启动（cd livedub && npm start），再点「开始同传」。`,
+      showRetry: false,
+      showProbe: true,
+    };
+  } else if (!active) {
+    info = {
+      title: runtime.health.state === 'online' ? '引擎在线：点「开始同传」' : '未连接本地引擎',
+      body:
+        runtime.health.state === 'online'
+          ? '已检测到本地引擎。切到视频页面后点「开始同传」即可。'
+          : '① 打开终端，在 livedub 目录执行 npm start\n② 确认 http://127.0.0.1:8787/health 可访问\n③ 点「重新检测」，然后开始同传',
+      showRetry: false,
+      showProbe: runtime.health.state !== 'online',
+    };
+  }
+  ui.guidance.hidden = !info;
+  if (!info) return;
+  ui.guidanceTitle.textContent = info.title;
+  ui.guidanceBody.textContent = info.body;
+  ui.retryEngine.style.display = info.showRetry ? '' : 'none';
+  ui.probeAgain.style.display = info.showProbe ? '' : 'none';
 }
 
 function render() {
   const summary = statusSummary();
-  ui.status.setAttribute('data-tone', summary.tone);
+  ui.status.dataset.tone = summary.tone;
   ui.statusText.textContent = summary.label;
 
   const active = isActive();
@@ -117,19 +221,25 @@ function render() {
   ui.toggle.textContent = active ? '停止同传' : '开始同传';
   ui.toggle.disabled = runtime.busy || (runtime.bgState && runtime.bgState.phase === 'stopping');
 
-  const metrics = runtime.bgState && runtime.bgState.metrics;
-  const latency = runtime.bgState && typeof runtime.bgState.latencyMs === 'number' ? runtime.bgState.latencyMs : pickLatencyMs(metrics);
-  ui.latency.textContent = formatLatency(latency);
-  ui.voice.textContent = voiceLabel();
-  ui.engine.textContent = engineLabel();
+  renderMetrics();
+  ui.providers.textContent = providerLabel();
+  ui.voiceDetail.textContent = voiceLabel();
+  ui.languages.textContent = languageLabel();
 
   if (document.activeElement !== ui.engineUrl) ui.engineUrl.value = runtime.settings.engineUrl;
   ui.voiceMode.value = runtime.settings.voiceMode === 'preset' ? 'preset' : 'clone-first';
 
+  const captionCount = (runtime.bgState && runtime.bgState.captionCount) || 0;
+  ui.captionCount.textContent = `本次会话字幕 ${captionCount} 条`;
+  ui.exportSrt.disabled = captionCount === 0;
+  ui.exportSrt.title = captionCount === 0 ? '先开始同传并让视频说几句话，才有字幕可导出' : `导出 ${captionCount} 条字幕（SRT）`;
+
+  renderHealth();
+  renderGuidance();
+
   const state = runtime.bgState;
   if (state && state.error && state.error.message) showError(state.error.message, 'error', { autoHide: false });
   else if (state && state.notice) showError(state.notice, 'info');
-  else if (ui.error.dataset.kind !== 'info' || !runtime.errorTimer) hideError();
 }
 
 function showError(message, kind = 'error', { autoHide = true } = {}) {
@@ -157,6 +267,7 @@ function setBusy(busy) {
   ui.toggle.disabled = busy;
   ui.saveUrl.disabled = busy;
   ui.openStudio.disabled = busy;
+  ui.probeEngine.disabled = busy;
 }
 
 function humanizeError(raw) {
@@ -165,6 +276,51 @@ function humanizeError(raw) {
     return 'Chrome 要求用户手势才能抓音：请关闭本弹窗，重新点击工具栏的 livedub 图标，再点「开始同传」；也可以按 Alt+Shift+L。';
   }
   return message;
+}
+
+// ---------------------------------------------------------------------------
+// 引擎健康检测（GET <host:port>/health，需 host_permissions 本地回环）
+// ---------------------------------------------------------------------------
+
+function describeFetchError(err) {
+  const message = String((err && err.message) || err || 'unknown');
+  if (/abort|timeout/i.test(message)) return '连接超时（引擎可能未启动）';
+  if (/Failed to fetch|NetworkError|network/i.test(message)) return '无法连接（引擎可能未启动或端口不对）';
+  return message;
+}
+
+async function probeEngineHealth({ silent = false } = {}) {
+  const healthUrl = deriveHealthUrl(runtime.settings.engineUrl);
+  if (!healthUrl) {
+    runtime.health = { state: 'offline', data: null, error: '引擎地址格式无效' };
+    renderHealth();
+    return;
+  }
+  runtime.health = { state: 'checking', data: runtime.health.data, error: '' };
+  renderHealth();
+  try {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 1800);
+    let response;
+    try {
+      response = await fetch(healthUrl, { cache: 'no-store', signal: controller.signal });
+    } finally {
+      clearTimeout(timer);
+    }
+    if (!response.ok) throw new Error(`/health 返回 HTTP ${response.status}`);
+    const data = await response.json();
+    runtime.health = { state: 'online', data, error: '' };
+  } catch (err) {
+    runtime.health = { state: 'offline', data: null, error: describeFetchError(err) };
+    if (!silent) {
+      showError(
+        `无法连接本地引擎（${runtime.health.error}）。请在 livedub 目录执行 npm start，确认 http://127.0.0.1:8787/health 可访问后点「重新检测」。`,
+        'error',
+      );
+    }
+  }
+  renderHealth();
+  renderGuidance();
 }
 
 // ---------------------------------------------------------------------------
@@ -204,7 +360,7 @@ async function refreshState() {
 }
 
 // ---------------------------------------------------------------------------
-// 开始 / 停止
+// 开始 / 停止 / 重试 / 导出
 // ---------------------------------------------------------------------------
 
 async function onToggleClick() {
@@ -227,7 +383,7 @@ async function startCapture() {
     }
     if (engineUrl !== runtime.settings.engineUrl) {
       await saveSettings({ engineUrl });
-      ui.urlHint.textContent = '已保存（引擎未运行时会在下次开始时连接）';
+      ui.urlHint.textContent = '已保存（重新开始后生效）';
     }
     const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
     const tab = tabs && tabs[0];
@@ -263,6 +419,7 @@ async function startCapture() {
     }
     runtime.bgState = response.state;
     render();
+    void probeEngineHealth({ silent: true });
   } catch (err) {
     showError(humanizeError(String((err && err.message) || err)));
   } finally {
@@ -286,6 +443,59 @@ async function stopCapture() {
   }
 }
 
+async function retryConnection() {
+  hideError();
+  if (!isActive()) {
+    await probeEngineHealth();
+    return;
+  }
+  try {
+    const response = await chrome.runtime.sendMessage({ type: MSG.RECONNECT });
+    if (response && response.ok) showError('已触发立即重连引擎…', 'info');
+    else showError((response && response.error && response.error.message) || '重试失败，请停止后重新开始。', 'error');
+  } catch (err) {
+    showError(`重试失败：${String((err && err.message) || err)}`, 'error');
+  }
+  render();
+}
+
+function downloadTextFile(text, filename) {
+  const blob = new Blob([`\ufeff${text}`], { type: 'text/plain;charset=utf-8' });
+  const url = URL.createObjectURL(blob);
+  const anchor = document.createElement('a');
+  anchor.href = url;
+  anchor.download = filename || 'livedub.srt';
+  anchor.style.display = 'none';
+  document.body.appendChild(anchor);
+  try {
+    anchor.click();
+  } finally {
+    setTimeout(() => {
+      try {
+        anchor.remove();
+      } catch {
+        /* ignore */
+      }
+      URL.revokeObjectURL(url);
+    }, 1500);
+  }
+}
+
+async function exportSrt() {
+  hideError();
+  try {
+    const response = await chrome.runtime.sendMessage({ type: MSG.GET_SRT });
+    if (!response || response.ok !== true) {
+      showError((response && response.error && response.error.message) || '导出失败：暂时没有字幕数据', 'error');
+      return;
+    }
+    downloadTextFile(response.srt, response.filename);
+    showError(`已导出 ${response.count} 条字幕：${response.filename}`, 'info');
+  } catch (err) {
+    showError(`导出失败：${String((err && err.message) || err)}`, 'error');
+  }
+}
+
 // ---------------------------------------------------------------------------
 // 事件绑定 / 初始化
 // ---------------------------------------------------------------------------
@@ -305,6 +515,17 @@ function bindEvents() {
     ui.engineUrl.value = normalized;
     ui.urlHint.textContent = isActive() ? '已保存：本次会话继续用旧地址，重新开始后生效' : '已保存';
     hideError();
+    await probeEngineHealth({ silent: true });
+  });
+
+  ui.probeEngine.addEventListener('click', () => {
+    void probeEngineHealth();
+  });
+  ui.probeAgain.addEventListener('click', () => {
+    void probeEngineHealth();
+  });
+  ui.retryEngine.addEventListener('click', () => {
+    void retryConnection();
   });
 
   ui.openStudio.addEventListener('click', async () => {
@@ -323,12 +544,16 @@ function bindEvents() {
   ui.voiceMode.addEventListener('change', async () => {
     const mode = ui.voiceMode.value === 'preset' ? 'preset' : 'clone-first';
     await saveSettings({ voiceMode: mode });
-    if (isActive()) ui.urlHint.textContent = '音色模式已同步给运行中的引擎';
+    if (isActive()) showError('音色模式已同步给运行中的引擎', 'info');
   });
 
   ui.showOverlay.addEventListener('click', async () => {
     await saveSettings({ hidden: false });
     ui.urlHint.textContent = '已请求显示浮层（切回视频页面查看）';
+  });
+
+  ui.exportSrt.addEventListener('click', () => {
+    void exportSrt();
   });
 
   ui.engineUrl.addEventListener('keydown', (event) => {
@@ -349,6 +574,7 @@ async function main() {
   await loadSettings();
   render();
   await refreshState();
+  if (!isActive()) void probeEngineHealth({ silent: true });
 }
 
 void main();

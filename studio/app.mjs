@@ -9,6 +9,8 @@
  * 用会话 JSONL 驱动同一套 UI，用于离线演示与无头截图。
  */
 import {
+  buildEventJsonl,
+  buildSessionMeta,
   buildSrt,
   decodePcmBase64,
   downloadTextFile,
@@ -18,6 +20,17 @@ import {
   parseSessionJsonl,
   stateAt,
 } from './session-parse.mjs';
+import {
+  DEFAULT_SUBS_STYLE,
+  SUBS_SIZES,
+  SUBS_SIZE_LABELS,
+  SUBS_SIZE_SCALE,
+  buildSparkline,
+  isEditableTarget,
+  normalizeSubsStyle,
+  normalizeTheme,
+  resolveShortcut,
+} from './ui-kit.mjs';
 
 // ------------------------------------------------------------------ DOM 引用
 
@@ -33,6 +46,7 @@ const els = {
   btnReconnect: $('btnReconnect'),
   btnStart: $('btnStart'),
   btnStop: $('btnStop'),
+  btnTheme: $('btnTheme'),
 
   stage: $('stage'),
   stageEmpty: $('stageEmpty'),
@@ -63,10 +77,28 @@ const els = {
   toggleSubs: $('toggleSubs'),
   toggleDub: $('toggleDub'),
   toggleDuck: $('toggleDuck'),
+  captureHint: $('captureHint'),
 
   transcriptList: $('transcriptList'),
   transcriptCount: $('transcriptCount'),
   btnExportSrt: $('btnExportSrt'),
+  btnExportEvents: $('btnExportEvents'),
+  connHelp: $('connHelp'),
+  btnConnRetry: $('btnConnRetry'),
+  subsSize: $('subsSize'),
+  subsPosition: $('subsPosition'),
+  subsOpacity: $('subsOpacity'),
+  subsOpacityValue: $('subsOpacityValue'),
+  btnSubsOnly: $('btnSubsOnly'),
+  btnSubsReset: $('btnSubsReset'),
+  btnSubsOnlyExit: $('btnSubsOnlyExit'),
+  btnPanelsShow: $('btnPanelsShow'),
+  sparkSvg: $('sparkSvg'),
+  sparkCount: $('sparkCount'),
+  sparkAsr: $('sparkAsr'),
+  sparkMt: $('sparkMt'),
+  sparkTts: $('sparkTts'),
+  sparkE2e: $('sparkE2e'),
 
   sessionModeTag: $('sessionModeTag'),
   sessionState: $('sessionState'),
@@ -127,6 +159,15 @@ const HUD_FIELDS = [
 
 const savedSettings = readSettings();
 
+/** v0.1 只存了 fontSize（0.7~1.9），v0.2 迁移成 S/M/L/XL 预设 */
+function migrateLegacySubsStyle(legacy) {
+  if (legacy && legacy.subsStyle) return normalizeSubsStyle(legacy.subsStyle);
+  const fontSize = Number(legacy?.fontSize);
+  if (!Number.isFinite(fontSize)) return { ...DEFAULT_SUBS_STYLE };
+  const size = fontSize <= 0.9 ? 's' : fontSize <= 1.12 ? 'm' : fontSize <= 1.38 ? 'l' : 'xl';
+  return normalizeSubsStyle({ ...DEFAULT_SUBS_STYLE, size });
+}
+
 const state = {
   ws: null,
   wsReady: false,
@@ -139,7 +180,12 @@ const state = {
 
   config: null,
   engineInfo: null,
+  engineOnline: null,
   providers: null,
+  engineEvents: [],
+  metricsHistory: [],
+  panelsHidden: false,
+  subsOnly: { active: false, previousDub: true, previousStyle: null },
   voice: { mode: 'preset', voiceId: '' },
   status: 'idle',
   metrics: null,
@@ -151,6 +197,7 @@ const state = {
 
   capture: { ctx: null, source: null, node: null, silentGain: null, dubGain: null, ready: false },
   sending: false,
+  captureSilence: { warned: false, quietSince: 0, peak: 0 },
 
   segments: new Map(),
   transcriptEls: new Map(),
@@ -164,8 +211,9 @@ const state = {
   sim: { active: false, parsed: null, clock: 0, raf: null, playedDubs: new Set(), frozen: false },
 
   settings: {
+    theme: normalizeTheme(savedSettings.theme),
     subsVisible: savedSettings.subsVisible ?? true,
-    fontSize: clamp(Number(savedSettings.fontSize) || 1, 0.7, 1.9),
+    subsStyle: normalizeSubsStyle(savedSettings.subsStyle ?? migrateLegacySubsStyle(savedSettings)),
     dubEnabled: savedSettings.dubEnabled ?? true,
     duckEnabled: savedSettings.duckEnabled ?? true,
     volume: Number.isFinite(Number(savedSettings.volume)) ? clamp(Number(savedSettings.volume), 0, 1) : 1,
@@ -297,8 +345,16 @@ async function loadEngineInfo() {
         translate: health.providers?.translate,
         tts: { provider: health.providers?.tts, model: health.providers?.ttsModel, voiceMode: health.providers?.voiceMode },
       });
-      logEvent('engine', `健康检查通过：${health.url ?? ''}（mode=${health.mode}）`, 'ok');
+      state.engineOnline = true;
+      showConnHelp(false);
+      logEvent(
+        'engine',
+        `健康检查通过：${health.url ?? ''}（mode=${health.mode}，会话 ${health.activeSessions ?? 0}/${health.sessions?.max ?? '?'}，whisper ${health.whisper?.server?.running ? '运行中' : '未启动'}）`,
+        'ok',
+      );
     } else {
+      state.engineOnline = false;
+      showConnHelp(true);
       logEvent('engine', `/health 返回 HTTP ${healthRes.status}`, 'err');
     }
     if (configRes.ok) {
@@ -315,8 +371,10 @@ async function loadEngineInfo() {
       }
     }
   } catch (err) {
+    state.engineOnline = false;
     logEvent('engine', `无法读取引擎信息：${err.message}`, 'err');
     els.engineVersion.textContent = '引擎未启动';
+    showConnHelp(true);
     toast('无法连接本地引擎服务，请确认已运行 node engine/server.mjs', 'err', 7000);
   }
   syncSettingsUi();
@@ -419,6 +477,8 @@ function connect({ silent = false } = {}) {
       setBadge('idle', '未连接');
       setSessionState('未开始');
       logEvent('ws', `连接已关闭（code=${event.code}）`, 'warn');
+      // 引擎可能已经退出：重新探测 /health，失败则展示「启动命令 + 重试」引导
+      if (!state.sim.active) void loadEngineInfo();
     }
   });
 }
@@ -485,6 +545,10 @@ function disconnectSilently() {
 // ------------------------------------------------------------- 引擎事件处理
 
 function handleEngineEvent(event) {
+  if (event && typeof event === 'object') {
+    state.engineEvents.push(event);
+    if (state.engineEvents.length === 1) els.btnExportEvents.disabled = false;
+  }
   switch (event.type) {
     case 'ready':
       onReady(event);
@@ -595,6 +659,7 @@ function onTranslation(event) {
 function onMetrics(event) {
   state.metrics = event;
   updateMetricsHud(event);
+  pushMetricsHistory(event);
   logEvent(
     'metrics',
     `ASR ${formatMs(event.asrFinalMs)} · MT ${formatMs(event.mtFirstMs)} · TTS ${formatMs(event.ttsFirstMs)} · E2E ${formatMs(event.e2eLagMs)}`,
@@ -640,6 +705,12 @@ async function startSession() {
   }
   state.sessionActive = true;
   state.maxEndMs = 0;
+  state.engineEvents = [];
+  state.metricsHistory = [];
+  state.metrics = null;
+  els.btnExportEvents.disabled = true;
+  resetMetricsHud();
+  renderSparklines();
   updateSessionButtons();
   setSessionState('准备采集音频…');
   setBadge('busy', '启动中…');
@@ -672,6 +743,8 @@ function beginStreaming() {
   state.audioSeconds = 0;
   state.lastSentTMs = -100;
   state.maxEndMs = 0;
+  state.captureSilence = { warned: false, quietSince: 0, peak: 0 };
+  els.captureHint.hidden = true;
   els.captureChip.dataset.on = 'true';
   els.captureChip.lastElementChild.textContent = '采集中 16 kHz';
   els.sessionModeTag.textContent = '同传中';
@@ -692,6 +765,7 @@ function stopSession({ silent = false } = {}) {
   state.sessionReady = false;
   state.sending = false;
   state.lastSentTMs = -100;
+  els.captureHint.hidden = true;
   els.captureChip.dataset.on = 'false';
   els.captureChip.lastElementChild.textContent = '音频未采集';
   els.sessionModeTag.textContent = '已停止';
@@ -884,7 +958,10 @@ async function ensureCapture() {
 
 function handleCapturedFrame(data) {
   if (!data || data.type !== 'pcm') return;
-  if (typeof data.level === 'number') updateLevelMeter(data.level);
+  if (typeof data.level === 'number') {
+    updateLevelMeter(data.level);
+    detectSilentCapture(data.level);
+  }
   if (!state.sending || !state.sessionReady || !state.ws || state.ws.readyState !== WebSocket.OPEN) return;
   const bytes = new Uint8Array(data.pcm);
   if (bytes.byteLength < 2) return;
@@ -915,6 +992,28 @@ function handleCapturedFrame(data) {
 function updateLevelMeter(level) {
   const width = clamp(Math.sqrt(level) * 220, 0, 100);
   els.levelBar.style.width = `${width.toFixed(0)}%`;
+}
+
+/** 采集开始后连续 3s 峰值仍接近 0，提示用户排查静音/权限（每会话一次） */
+function detectSilentCapture(level) {
+  if (!state.sending || state.captureSilence.warned) return;
+  const value = Number(level) || 0;
+  state.captureSilence.peak = Math.max(state.captureSilence.peak, value);
+  if (value > 0.0025 || state.captureSilence.peak > 0.0025) {
+    state.captureSilence.quietSince = 0;
+    return;
+  }
+  if (!state.captureSilence.quietSince) {
+    state.captureSilence.quietSince = performance.now();
+    return;
+  }
+  if (performance.now() - state.captureSilence.quietSince < 3000) return;
+  state.captureSilence.warned = true;
+  els.captureHint.hidden = false;
+  els.captureChip.dataset.on = 'false';
+  els.captureChip.lastElementChild.textContent = '未检测到音频';
+  logEvent('capture', '连续 3 秒没有检测到音频：请检查视频静音 / 系统音量 / 音轨是否存在', 'warn');
+  toast('没有检测到音频：请确认视频没有静音、系统音量正常，或换一个带音轨的视频', 'warn', 8000);
 }
 
 // ------------------------------------------------------------------ 配音播放
@@ -1025,25 +1124,237 @@ function hideSubtitle() {
 function setSubsVisible(visible) {
   state.settings.subsVisible = Boolean(visible);
   els.toggleSubs.checked = state.settings.subsVisible;
+  els.toggleSubs.setAttribute('aria-checked', String(state.settings.subsVisible));
   saveSettings();
   if (!visible) hideSubtitle();
 }
 
-function adjustSubtitleFont(delta) {
-  state.settings.fontSize = clamp(Math.round((state.settings.fontSize + delta) * 10) / 10, 0.7, 1.9);
-  applySubtitleSettings();
-  saveSettings();
-  toast(`字幕字号 ${Math.round(state.settings.fontSize * 100)}%`, 'info', 1600);
+// ---------------------------------------------------------- 主题 / 字幕样式
+
+function applyTheme(theme, { persist = true } = {}) {
+  state.settings.theme = normalizeTheme(theme, state.settings.theme);
+  document.documentElement.dataset.theme = state.settings.theme;
+  els.btnTheme.title = state.settings.theme === 'light' ? '切换到暗色主题' : '切换到亮色主题';
+  els.btnTheme.setAttribute('aria-pressed', String(state.settings.theme === 'light'));
+  if (persist) saveSettings();
 }
 
-function applySubtitleSettings() {
-  document.documentElement.style.setProperty('--subs-scale', String(state.settings.fontSize));
-  els.subs.style.setProperty('--subs-scale', String(state.settings.fontSize));
+function toggleTheme() {
+  const next = state.settings.theme === 'light' ? 'dark' : 'light';
+  applyTheme(next);
+  toast(next === 'light' ? '已切换到亮色主题' : '已切换到暗色主题', 'info', 1800);
+}
+
+function markerButtons(container, attribute, activeValue) {
+  for (const button of container.querySelectorAll('button')) {
+    const active = button.dataset[attribute] === activeValue;
+    button.dataset.active = String(active);
+    button.setAttribute('aria-pressed', String(active));
+  }
+}
+
+/** 把 settings.subsStyle 应用到字幕层（字号/位置/背景不透明度/自定义拖拽位置） */
+function applySubsStyle() {
+  const style = normalizeSubsStyle(state.settings.subsStyle);
+  state.settings.subsStyle = style;
+  const scale = SUBS_SIZE_SCALE[style.size] ?? 1;
+  document.documentElement.style.setProperty('--subs-scale', String(scale));
+  els.subs.style.setProperty('--subs-scale', String(scale));
+  els.subs.style.setProperty('--subs-bg-alpha', String(style.opacity));
+  els.subs.dataset.position = style.position;
+  els.subsOpacity.value = String(Math.round(style.opacity * 100));
+  els.subsOpacityValue.textContent = `${Math.round(style.opacity * 100)}%`;
+  markerButtons(els.subsSize, 'size', style.size);
+  markerButtons(els.subsPosition, 'position', style.position);
   if (state.settings.subsPos) {
     els.subs.style.left = state.settings.subsPos.left;
     els.subs.style.top = state.settings.subsPos.top;
+    els.subs.style.bottom = 'auto';
     els.subs.style.transform = 'none';
+    els.subs.classList.add('custom-position');
+  } else {
+    els.subs.style.left = '';
+    els.subs.style.top = '';
+    els.subs.style.bottom = '';
+    els.subs.style.transform = '';
+    els.subs.classList.remove('custom-position');
   }
+}
+
+function setSubsSize(size, { persist = true } = {}) {
+  if (!SUBS_SIZES.includes(size)) return;
+  state.settings.subsStyle = normalizeSubsStyle({ ...state.settings.subsStyle, size });
+  applySubsStyle();
+  if (persist) saveSettings();
+  toast(`字幕字号：${SUBS_SIZE_LABELS[size] ?? size}`, 'info', 1400);
+}
+
+function setSubsPosition(position, { persist = true } = {}) {
+  state.settings.subsStyle = normalizeSubsStyle({ ...state.settings.subsStyle, position });
+  state.settings.subsPos = null;
+  applySubsStyle();
+  if (persist) saveSettings();
+}
+
+function setSubsOpacity(value, { persist = true } = {}) {
+  state.settings.subsStyle = normalizeSubsStyle({ ...state.settings.subsStyle, opacity: Number(value) / 100 });
+  applySubsStyle();
+  if (persist) saveSettings();
+}
+
+/** 兼容旧按钮：在 S/M/L/XL 档位间步进 */
+function adjustSubtitleFont(delta) {
+  const current = SUBS_SIZES.indexOf(state.settings.subsStyle.size);
+  const next = clamp((current < 0 ? 1 : current) + Math.sign(delta), 0, SUBS_SIZES.length - 1);
+  setSubsSize(SUBS_SIZES[next]);
+}
+
+// ------------------------------------------------------ 仅字幕 / 面板模式
+
+const appRoot = document.querySelector('.app');
+
+function setPanelsHidden(hidden) {
+  state.panelsHidden = Boolean(hidden);
+  appRoot.classList.toggle('panels-hidden', state.panelsHidden);
+  els.btnPanelsShow.hidden = !(state.panelsHidden && !state.subsOnly.active);
+}
+
+function enterSubsOnly() {
+  if (state.subsOnly.active) return;
+  state.subsOnly.active = true;
+  state.subsOnly.previousDub = state.settings.dubEnabled;
+  state.subsOnly.previousStyle = { ...state.settings.subsStyle };
+  setPanelsHidden(false);
+  appRoot.classList.add('subs-only');
+  els.btnSubsOnlyExit.hidden = false;
+  els.btnPanelsShow.hidden = true;
+  setDubEnabled(false, { persist: false });
+  state.settings.subsStyle = normalizeSubsStyle({ ...state.settings.subsStyle, size: 'xl' });
+  applySubsStyle();
+  setSubsVisible(true);
+  saveSettings();
+  logEvent('ui', '进入仅字幕模式（Esc 退出）', 'ok');
+  toast('已进入仅字幕模式：放大字幕、关闭配音；按 Esc 退出', 'info', 3200);
+}
+
+function exitSubsOnly() {
+  if (!state.subsOnly.active) return;
+  state.subsOnly.active = false;
+  appRoot.classList.remove('subs-only');
+  els.btnSubsOnlyExit.hidden = true;
+  setDubEnabled(state.subsOnly.previousDub, { persist: false });
+  state.settings.subsStyle = normalizeSubsStyle(state.subsOnly.previousStyle ?? state.settings.subsStyle);
+  applySubsStyle();
+  saveSettings();
+}
+
+// ------------------------------------------------------------ 延迟 sparkline
+
+function renderSparklines(metricsList = state.metricsHistory) {
+  const list = Array.isArray(metricsList) ? metricsList : [];
+  const series = {
+    asr: list.map((metrics) => metrics?.asrFinalMs),
+    mt: list.map((metrics) => metrics?.mtFirstMs),
+    tts: list.map((metrics) => metrics?.ttsFirstMs),
+    e2e: list.map((metrics) => metrics?.e2eLagMs),
+  };
+  const lines = {
+    asr: buildSparkline(series.asr, { width: 260, height: 96, pad: 6 }),
+    mt: buildSparkline(series.mt, { width: 260, height: 96, pad: 6 }),
+    tts: buildSparkline(series.tts, { width: 260, height: 96, pad: 6 }),
+    e2e: buildSparkline(series.e2e, { width: 260, height: 96, pad: 6 }),
+  };
+  els.sparkAsr.setAttribute('points', lines.asr.points);
+  els.sparkMt.setAttribute('points', lines.mt.points);
+  els.sparkTts.setAttribute('points', lines.tts.points);
+  els.sparkE2e.setAttribute('points', lines.e2e.points);
+  const count = Math.max(lines.asr.count, lines.mt.count, lines.tts.count, lines.e2e.count);
+  els.sparkCount.textContent = count > 0 ? `最近 ${count} 句` : '等待数据';
+  els.sparkSvg.setAttribute(
+    'aria-label',
+    count > 0
+      ? `最近 ${count} 句延迟趋势：ASR 最新 ${formatMs(lines.asr.last)}，翻译 ${formatMs(lines.mt.last)}，TTS ${formatMs(lines.tts.last)}，端到端 ${formatMs(lines.e2e.last)}`
+      : '还没有延迟数据',
+  );
+  // 单句时 polyline 只有一个点，补一个极小线段让趋势可见
+  for (const [key, line] of Object.entries(lines)) {
+    if (line.count === 1) {
+      const [x, y] = line.points.split(',');
+      els[`spark${key === 'asr' ? 'Asr' : key === 'mt' ? 'Mt' : key === 'tts' ? 'Tts' : 'E2e'}`].setAttribute(
+        'points',
+        `${x},${y} ${Number(x) + 0.8},${y}`,
+      );
+    }
+  }
+}
+
+function pushMetricsHistory(metrics) {
+  if (!metrics || typeof metrics !== 'object') return;
+  state.metricsHistory.push(metrics);
+  while (state.metricsHistory.length > 30) state.metricsHistory.shift();
+  renderSparklines();
+}
+
+// ------------------------------------------------------- 事件 JSONL 导出
+
+function currentSessionMeta() {
+  const durationMs = Number.isFinite(els.video.duration) && els.video.duration > 0 ? els.video.duration * 1000 : state.maxEndMs;
+  return buildSessionMeta({
+    sessionId: els.sessionId.textContent === '—' ? null : els.sessionId.textContent,
+    title: mediaTitle(),
+    video: state.media.isFile ? '' : state.media.url || '',
+    langFrom: 'en',
+    langTo: 'zh',
+    durationMs,
+    source: state.sim.active ? 'replay' : 'studio',
+    extra: { exportedBy: 'livedub-studio', engineMode: state.engineInfo?.mode ?? null },
+  });
+}
+
+function exportEventsJsonl() {
+  const events = state.sim.active ? state.sim.parsed?.events ?? [] : state.engineEvents;
+  if (!Array.isArray(events) || events.length === 0) {
+    toast('还没有收到可导出的事件，先开始同传或载入回放', 'warn');
+    return;
+  }
+  const meta = state.sim.active
+    ? { ...(state.sim.parsed?.meta ?? {}), exportedAt: new Date().toISOString() }
+    : currentSessionMeta();
+  const jsonl = buildEventJsonl(events, { meta });
+  if (!jsonl.trim()) {
+    toast('没有可导出的事件', 'warn');
+    return;
+  }
+  const base = mediaTitle().replace(/\.[^.]+$/, '').replace(/[\\/:*?"<>|]/g, '_') || 'livedub';
+  const stamp = new Date().toISOString().slice(0, 10);
+  downloadTextFile(`${base}-${stamp}-events.jsonl`, jsonl, 'application/x-ndjson;charset=utf-8');
+  logEvent('export', `导出事件 JSONL（${events.length} 个事件）`, 'ok');
+  toast(`事件 JSONL 已导出（${events.length} 个事件，可直接给回放页）`, 'ok', 4200);
+}
+
+// ---------------------------------------------------------- 连接引导 / 配音
+
+function showConnHelp(show) {
+  els.connHelp.hidden = !show;
+}
+
+function setDubEnabled(enabled, { announce = false, persist = true } = {}) {
+  state.settings.dubEnabled = Boolean(enabled);
+  els.toggleDub.checked = state.settings.dubEnabled;
+  els.toggleDub.setAttribute('aria-checked', String(state.settings.dubEnabled));
+  if (!state.settings.dubEnabled) {
+    for (const source of state.dub.active) {
+      try {
+        source.stop();
+      } catch {
+        /* ignore */
+      }
+    }
+    state.dub.active.clear();
+    duckOriginal(false);
+  }
+  if (persist) saveSettings();
+  if (announce) toast(`配音${state.settings.dubEnabled ? '已开启' : '已关闭'}`, 'info', 1800);
 }
 
 function setupSubtitleDrag() {
@@ -1088,16 +1399,16 @@ function setupSubtitleDrag() {
     drag = null;
     els.subs.classList.remove('dragging');
     state.settings.subsPos = { left: els.subs.style.left, top: els.subs.style.top };
+    applySubsStyle();
     saveSettings();
+    logEvent('ui', '字幕已自定义位置（双击或「重置位置」恢复预设）', 'mt');
   };
   els.subs.addEventListener('pointerup', finish);
   els.subs.addEventListener('pointercancel', finish);
   els.subs.addEventListener('dblclick', () => {
     state.settings.subsPos = null;
+    applySubsStyle();
     saveSettings();
-    els.subs.style.left = '';
-    els.subs.style.top = '';
-    els.subs.style.transform = '';
     toast('字幕位置已重置', 'info', 1600);
   });
 }
@@ -1229,6 +1540,8 @@ function resetMetricsHud() {
 
 function applyVoice(info) {
   if (!info) return;
+  const previous = `${state.voice.mode}/${state.voice.voiceId}/${Boolean(info.degraded)}`;
+  const next = `${info.mode ?? 'preset'}/${info.voiceId ?? ''}/${Boolean(info.degraded)}`;
   state.voice = { mode: info.mode ?? 'preset', voiceId: info.voiceId ?? '' };
   els.voiceId.textContent = state.voice.voiceId || '—';
   els.voiceId.title = state.voice.voiceId || '';
@@ -1236,17 +1549,22 @@ function applyVoice(info) {
   setVoiceModeButtons(mode);
   if (info.degraded && info.reason) {
     els.voiceNote.textContent = `已降级：${info.reason}`;
+    els.voiceNote.title = String(info.reason);
   } else if (state.voice.mode === 'clone') {
     els.voiceNote.textContent = '已使用克隆音色';
   } else {
     els.voiceNote.textContent = '';
   }
-  logEvent('voice', `音色 ${state.voice.mode} / ${state.voice.voiceId}${info.degraded ? '（降级）' : ''}`, 'ok');
+  if (previous !== next) {
+    logEvent('voice', `音色 ${state.voice.mode} / ${state.voice.voiceId}${info.degraded ? '（降级）' : ''}`, 'ok');
+  }
 }
 
 function setVoiceModeButtons(mode) {
   for (const button of els.voiceMode.querySelectorAll('button')) {
-    button.dataset.active = String(button.dataset.mode === mode);
+    const active = button.dataset.mode === mode;
+    button.dataset.active = String(active);
+    button.setAttribute('aria-pressed', String(active));
   }
 }
 
@@ -1315,16 +1633,22 @@ function resetGlossary() {
 // --------------------------------------------------------------- 设置同步
 
 function syncSettingsUi() {
+  applyTheme(state.settings.theme, { persist: false });
   els.toggleSubs.checked = state.settings.subsVisible;
+  els.toggleSubs.setAttribute('aria-checked', String(state.settings.subsVisible));
   els.toggleDub.checked = state.settings.dubEnabled;
+  els.toggleDub.setAttribute('aria-checked', String(state.settings.dubEnabled));
   els.toggleDuck.checked = state.settings.duckEnabled;
+  els.toggleDuck.setAttribute('aria-checked', String(state.settings.duckEnabled));
   els.volume.value = String(Math.round(state.settings.volume * 100));
   els.video.volume = state.settings.volume;
   els.glossaryInput.value = state.settings.glossaryText || '';
   updateGlossaryCount();
-  applySubtitleSettings();
+  applySubsStyle();
   if (state.settings.voiceMode) setVoiceModeButtons(state.settings.voiceMode);
   if (!state.settings.subsVisible) hideSubtitle();
+  renderSparklines();
+  els.btnExportEvents.disabled = state.engineEvents.length === 0;
 }
 
 // -------------------------------------------------------------- 演示回放模式
@@ -1346,28 +1670,35 @@ async function setupSimMode(params) {
   els.sessionModeTag.classList.add('accent');
   els.stage.classList.add('sim-stage');
   els.btnReconnect.disabled = true;
+  els.btnStart.disabled = true;
+  els.btnStop.disabled = true;
   els.engineVersion.textContent = '离线回放（未连接引擎）';
   els.whisperState.textContent = '演示数据';
+  showConnHelp(false);
   logEvent('demo', '进入演示回放模式（不连接引擎）', 'ok');
-
-  const videoUrl = params.get('video');
-  if (videoUrl) {
-    try {
-      els.video.muted = true;
-      els.video.volume = 0;
-      setMedia(videoUrl, filenameFromUrl(videoUrl), { isFile: false });
-      els.stage.classList.add('has-media');
-      els.stage.classList.remove('sim-stage');
-    } catch (err) {
-      logEvent('demo', `视频载入失败：${err.message}`, 'warn');
-    }
-  }
 
   try {
     const text = await fetchSessionJsonl(sessionUrl);
     const parsed = parseSessionJsonl(text);
     state.sim.parsed = parsed;
+    state.engineEvents = parsed.events;
     state.sim.playedDubs.clear();
+    els.btnExportEvents.disabled = parsed.events.length === 0;
+
+    // 视频：优先 ?video=，否则用会话 meta.video（真实 demo 会话自带 /demo/original.mp4）
+    const videoUrl = params.get('video') || parsed.meta?.video || '';
+    if (videoUrl) {
+      try {
+        els.video.muted = true;
+        els.video.volume = 0;
+        setMedia(videoUrl, filenameFromUrl(videoUrl), { isFile: false });
+        els.stage.classList.add('has-media');
+        els.stage.classList.remove('sim-stage');
+      } catch (err) {
+        logEvent('demo', `视频载入失败：${err.message}`, 'warn');
+      }
+    }
+
     applyParsedSession(parsed);
     const tParam = Number(params.get('t'));
     const autoplay = params.get('autoplay') === '1';
@@ -1378,12 +1709,13 @@ async function setupSimMode(params) {
     } else {
       startSimPlayback(Number.isFinite(tParam) ? tParam : 0);
     }
-    logEvent('demo', `载入回放 ${parsed.events.length} 个事件、${parsed.segments.size} 句字幕`, 'ok');
+    logEvent('demo', `载入回放 ${parsed.events.length} 个事件、${parsed.segments.size} 句字幕、${parsed.dubs.length} 段配音`, 'ok');
     toast(`演示回放：${parsed.meta?.title ?? sessionUrl}`, 'info', 5000);
   } catch (err) {
     logEvent('demo', `加载回放失败：${err.message}`, 'err');
     toast(`加载回放失败：${err.message}`, 'err', 7000);
     els.transcriptList.innerHTML = `<div class="list-empty">${escapeHtml(err.message)}</div>`;
+    els.captureHint.hidden = true;
   }
   return true;
 }
@@ -1401,6 +1733,10 @@ function applyParsedSession(parsed) {
     els.pvTts.textContent = '回放';
   }
   const meta = parsed.meta ?? {};
+  els.engineModeTag.textContent = '录制时';
+  els.engineModeTag.classList.remove('warn');
+  els.captureChip.lastElementChild.textContent = '离线回放';
+  els.captureChip.dataset.on = 'false';
   if (Array.isArray(meta.glossary) && meta.glossary.length > 0) {
     state.settings.glossaryText = meta.glossary.map((term) => `${term.src}=${term.dst}`).join('\n');
     els.glossaryInput.value = state.settings.glossaryText;
@@ -1413,6 +1749,8 @@ function applyParsedSession(parsed) {
   for (const dub of parsed.dubs) end = Math.max(end, dub.startMs + (dub.durationMs || 0));
   state.sim.maxMs = end;
   els.transcriptCount.textContent = '0 句';
+  state.engineEvents = parsed.events;
+  els.btnExportEvents.disabled = parsed.events.length === 0;
 }
 
 function applySimAt(tMs) {
@@ -1435,6 +1773,21 @@ function applySimAt(tMs) {
   if (snapshot.status) {
     const meta = STATUS_META[snapshot.status.state] ?? { label: snapshot.status.state };
     setSessionState(`回放 · ${meta.label}`);
+  }
+  // sparkline 只展示当前时间点之前已经发生的 metrics
+  const metricsSoFar = (parsed.eventsWithTimeline ?? []).filter((event) => event.type === 'metrics' && event.atMs <= tMs);
+  state.metricsHistory = metricsSoFar;
+  renderSparklines(metricsSoFar);
+  // 冻结模式：把视频 seek 到对应帧（首帧/poster 对截图很重要）
+  if (state.sim.frozen && els.video.src && Number.isFinite(els.video.duration) && els.video.duration > 0) {
+    const target = Math.min(els.video.duration, Math.max(0, tMs / 1000));
+    if (Math.abs(els.video.currentTime - target) > 0.08) {
+      try {
+        els.video.currentTime = target;
+      } catch {
+        /* ignore */
+      }
+    }
   }
   const durationSec = Number.isFinite(els.video.duration) && els.video.duration > 0 ? els.video.duration : state.sim.maxMs / 1000;
   els.stageClock.textContent = `${formatClock(tMs)} / ${formatClock(durationSec * 1000)}`;
@@ -1481,11 +1834,56 @@ function playSimDubsUpTo(tMs) {
 
 // ---------------------------------------------------------------- 事件绑定
 
+/** 键盘快捷键动作分发（纯函数 resolveShortcut 决定动作，这里只做副作用） */
+function handleShortcut(action) {
+  switch (action) {
+    case 'toggle-play':
+      if (!els.video.src) {
+        toast('先载入视频后再播放', 'warn', 1800);
+        return;
+      }
+      if (state.sim.active && state.sim.frozen) {
+        startSimPlayback(state.sim.clock);
+        toast('演示回放：开始播放', 'info', 1600);
+        return;
+      }
+      videoPlayPause();
+      return;
+    case 'toggle-subs': {
+      const next = !state.settings.subsVisible;
+      setSubsVisible(next);
+      toast(`字幕${next ? '已显示' : '已隐藏'}（S）`, 'info', 1500);
+      return;
+    }
+    case 'toggle-dub':
+      setDubEnabled(!state.settings.dubEnabled, { announce: true });
+      return;
+    case 'escape':
+      if (state.subsOnly.active) exitSubsOnly();
+      else {
+        setPanelsHidden(!state.panelsHidden);
+        toast(state.panelsHidden ? '面板已隐藏，按 Esc 恢复（仅字幕按钮可进入专注模式）' : '面板已显示', 'info', 1600);
+      }
+      return;
+    default:
+      return;
+  }
+}
+
 function bindEvents() {
   // 顶栏
   els.btnStart.addEventListener('click', () => void startSession());
   els.btnStop.addEventListener('click', () => stopSession());
   els.btnReconnect.addEventListener('click', reconnect);
+  els.btnTheme.addEventListener('click', toggleTheme);
+  els.btnConnRetry.addEventListener('click', async () => {
+    toast('正在重试连接本地引擎…', 'info', 2000);
+    await loadEngineInfo();
+    if (state.engineOnline) {
+      showConnHelp(false);
+      if (state.sessionActive && !state.wsReady) reconnect();
+    }
+  });
 
   // 媒体
   els.fileInput.addEventListener('change', () => {
@@ -1582,6 +1980,11 @@ function bindEvents() {
     }
   });
   els.video.addEventListener('seeked', () => {
+    if (state.sim.active) {
+      // 回放/演示模式：seek 是为了显示对应帧，不能把字幕清掉
+      if (state.sim.frozen) applySimAt(state.sim.clock);
+      return;
+    }
     hideSubtitle();
     clearTranscriptActive();
     state.lastSentTMs = -100;
@@ -1603,33 +2006,43 @@ function bindEvents() {
 
   // 字幕控制
   els.toggleSubs.addEventListener('change', () => setSubsVisible(els.toggleSubs.checked));
-  els.subsSmaller.addEventListener('click', () => adjustSubtitleFont(-0.1));
-  els.subsBigger.addEventListener('click', () => adjustSubtitleFont(0.1));
+  els.subsSmaller.addEventListener('click', () => adjustSubtitleFont(-1));
+  els.subsBigger.addEventListener('click', () => adjustSubtitleFont(1));
   els.subsHide.addEventListener('click', () => setSubsVisible(false));
-  els.toggleDub.addEventListener('change', () => {
-    state.settings.dubEnabled = els.toggleDub.checked;
-    if (!state.settings.dubEnabled) {
-      for (const source of state.dub.active) {
-        try {
-          source.stop();
-        } catch {
-          /* ignore */
-        }
-      }
-      state.dub.active.clear();
-      duckOriginal(false);
-    }
-    saveSettings();
-    toast(`配音${state.settings.dubEnabled ? '已开启' : '已关闭'}`, 'info', 1800);
-  });
+  els.toggleDub.addEventListener('change', () => setDubEnabled(els.toggleDub.checked, { announce: true }));
   els.toggleDuck.addEventListener('change', () => {
     state.settings.duckEnabled = els.toggleDuck.checked;
+    els.toggleDuck.setAttribute('aria-checked', String(state.settings.duckEnabled));
     if (!state.settings.duckEnabled && state.dub.ducking) {
       state.dub.ducking = false;
       applyVolume();
     }
     saveSettings();
   });
+
+  // 字幕样式预设（字号 / 位置 / 背景不透明度）+ 仅字幕模式
+  els.subsSize.addEventListener('click', (event) => {
+    const button = event.target.closest('button[data-size]');
+    if (button) setSubsSize(button.dataset.size);
+  });
+  els.subsPosition.addEventListener('click', (event) => {
+    const button = event.target.closest('button[data-position]');
+    if (button) {
+      state.settings.subsPos = null;
+      setSubsPosition(button.dataset.position);
+    }
+  });
+  els.subsOpacity.addEventListener('input', () => setSubsOpacity(els.subsOpacity.value, { persist: false }));
+  els.subsOpacity.addEventListener('change', () => setSubsOpacity(els.subsOpacity.value));
+  els.btnSubsReset.addEventListener('click', () => {
+    state.settings.subsPos = null;
+    applySubsStyle();
+    saveSettings();
+    toast('字幕位置已重置', 'info', 1600);
+  });
+  els.btnSubsOnly.addEventListener('click', enterSubsOnly);
+  els.btnSubsOnlyExit.addEventListener('click', exitSubsOnly);
+  els.btnPanelsShow.addEventListener('click', () => setPanelsHidden(false));
 
   // 音色模式
   els.voiceMode.addEventListener('click', (event) => {
@@ -1648,19 +2061,17 @@ function bindEvents() {
 
   // 导出 / 日志
   els.btnExportSrt.addEventListener('click', exportSrt);
+  els.btnExportEvents.addEventListener('click', exportEventsJsonl);
   els.btnClearLog.addEventListener('click', () => {
     els.eventLog.innerHTML = '<div class="log-empty">日志已清空</div>';
   });
 
-  // 键盘：空格播放/暂停（输入框内不拦截）
+  // 键盘快捷键：Space 播放/暂停、S 字幕、D 配音、Esc 面板（输入框内不触发）
   document.addEventListener('keydown', (event) => {
-    const tag = event.target?.tagName;
-    if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'BUTTON' || event.target?.isContentEditable) return;
-    if (event.code === 'Space') {
-      event.preventDefault();
-      if (state.sim.active) return;
-      videoPlayPause();
-    }
+    const action = resolveShortcut(event, { editable: isEditableTarget(event.target) });
+    if (!action) return;
+    event.preventDefault();
+    handleShortcut(action);
   });
 
   // 离开页面：优雅关闭会话
@@ -1682,11 +2093,20 @@ async function bootstrap() {
   setupSubtitleDrag();
   updateSessionButtons();
   resetMetricsHud();
-  applySubtitleSettings();
+  applySubsStyle();
   updatePlayButton();
+  renderSparklines();
+  els.btnExportEvents.disabled = true;
 
   const params = new URLSearchParams(location.search);
+  // ?theme=light|dark 允许临时覆盖持久化主题（截图/分享用，不写回 localStorage）
+  const themeParam = params.get('theme');
+  if (themeParam) applyTheme(normalizeTheme(themeParam), { persist: false });
+  else applyTheme(state.settings.theme, { persist: false });
+
   const simMode = await setupSimMode(params);
+  // 调试入口（本地工作台，无敏感信息；便于自动化截图/排查）
+  globalThis.__livedubStudio = { state, applySimAt, renderSparklines, version: '0.2.0' };
   if (!simMode) {
     await loadEngineInfo();
     syncSettingsUi();

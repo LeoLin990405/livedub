@@ -51,6 +51,8 @@ import { createMockAsr, createMockTranslator, createMockTts } from './mock.mjs';
 
 export const DEFAULT_PORT = 8787;
 export const DEFAULT_HOST = '127.0.0.1';
+/** 最大并发会话（config.server.maxSessions 可覆盖） */
+export const DEFAULT_MAX_SESSIONS = 4;
 /** 会话初始化上限：whisper-server 冷启动 ~20-30s，留余量 */
 export const DEFAULT_READY_TIMEOUT_MS = 35_000;
 /** 建链后必须尽快发 hello，否则关闭空连接 */
@@ -278,6 +280,23 @@ function serveStaticFile(req, res, file, log) {
 
 // ------------------------------------------------------------- HTTP API data
 
+/** 正在占用会话槽位的连接数（初始化中 + 已就绪） */
+export function countActiveSessions(state) {
+  let count = 0;
+  for (const conn of state.sessions ?? []) {
+    if (conn.phase === 'initializing' || conn.phase === 'ready') count += 1;
+  }
+  return count;
+}
+
+/** server.maxSessions 解析：优先 options，其次 config.server.maxSessions，非法回退 4 */
+export function resolveMaxSessions(config, options = {}) {
+  const raw = options.maxSessions ?? config?.server?.maxSessions;
+  const number = Number(raw);
+  if (Number.isInteger(number) && number > 0) return number;
+  return DEFAULT_MAX_SESSIONS;
+}
+
 function buildHealth(state) {
   const config = state.config;
   const model = resolveWhisperModel(config);
@@ -301,13 +320,120 @@ function buildHealth(state) {
     },
     whisper: { found: Boolean(model), model: toProjectRelative(model) },
     sayless: { configPath: saylessPath, found: Boolean(saylessPath) },
-    sessions: { active: state.sessions.size },
+    // activeSessions：已发 hello 并正在初始化/已就绪的会话数（不含仅建链未 hello 的空连接）
+    activeSessions: countActiveSessions(state),
+    sessions: { active: countActiveSessions(state), total: state.totalSessions, max: state.maxSessions },
     limits: {
       audioFrameMs: AUDIO_FRAME_MS,
       sampleRate: AUDIO_INPUT_SAMPLE_RATE,
       maxAudioFrameBytes: MAX_AUDIO_FRAME_BYTES,
     },
   };
+}
+
+/**
+ * whisper-server 运行状态（尽力而为）：
+ * 1) 本进程共享 server（engine/asr/index.mjs#listSharedServers）；
+ * 2) 若本进程没有，再对 config 里 host:port 做一次 300ms HTTP 探测（跨进程复用场景）。
+ * 任何异常都不影响 /health 返回。
+ */
+async function whisperRuntimeStatus(state) {
+  const now = Date.now();
+  if (state.whisperStatusCache && now - state.whisperStatusCache.at < 2000) return state.whisperStatusCache.value;
+  const config = state.config;
+  const whisperCfg = config?.asr?.whisper ?? {};
+  const host = String(whisperCfg.host ?? '127.0.0.1');
+  const port = Number(whisperCfg.port) || 18765;
+
+  let inProcess = [];
+  try {
+    const mod = await import('./asr/index.mjs');
+    if (typeof mod.listSharedServers === 'function') inProcess = mod.listSharedServers() ?? [];
+  } catch {
+    /* ASR 模块不可用时忽略 */
+  }
+  const servers = (Array.isArray(inProcess) ? inProcess : []).map((server) => ({
+    pid: server?.pid ?? null,
+    status: server?.status ?? null,
+    baseUrl: server?.baseUrl ?? null,
+    model: server?.modelPath ? toProjectRelative(server.modelPath) : null,
+    refs: server?.refs ?? null,
+    lastInferMs: server?.lastInferMs ?? null,
+    avgInferMs: server?.avgInferMs ?? null,
+  }));
+  const inProcessRunning = servers.some((server) => server.status === 'ready' || server.status === 'starting');
+
+  let reachable = null;
+  if (!inProcessRunning && config?.asr?.provider === 'whisper-local') {
+    reachable = await probeHttpHealth(`http://${host}:${port}/health`, 300);
+  }
+
+  const value = {
+    running: inProcessRunning || reachable === true,
+    source: inProcessRunning ? 'in-process' : reachable === true ? 'probe' : 'none',
+    host,
+    port,
+    reachable,
+    inProcessServers: servers,
+  };
+  state.whisperStatusCache = { at: now, value };
+  return value;
+}
+
+/** 极短 HTTP 健康探测；失败/超时返回 false，不拖慢 /health */
+function probeHttpHealth(url, timeoutMs) {
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = (value) => {
+      if (settled) return;
+      settled = true;
+      resolve(value);
+    };
+    let request;
+    try {
+      request = http.get(url, (response) => {
+        response.resume();
+        finish(Number(response.statusCode) >= 200 && Number(response.statusCode) < 500);
+      });
+    } catch {
+      finish(false);
+      return;
+    }
+    request.on('error', () => finish(false));
+    request.setTimeout(timeoutMs, () => {
+      request.destroy();
+      finish(false);
+    });
+    const timer = setTimeout(() => {
+      try {
+        request.destroy();
+      } catch {
+        /* ignore */
+      }
+      finish(false);
+    }, timeoutMs + 50);
+    timer.unref?.();
+  });
+}
+
+/** 关闭共享 whisper-server，避免 SIGINT/SIGTERM 后留下孤儿进程（尽力而为） */
+async function closeSharedWhisperServers(state) {
+  try {
+    const mod = await import('./asr/index.mjs');
+    if (typeof mod.closeSharedServer !== 'function') return;
+    const closePromise = Promise.resolve().then(() => mod.closeSharedServer());
+    let timer = null;
+    const timeout = new Promise((resolve) => {
+      timer = setTimeout(() => resolve('timeout'), 8000);
+      timer.unref?.();
+    });
+    const result = await Promise.race([closePromise.then(() => 'ok'), timeout]);
+    clearTimeout(timer);
+    if (result === 'timeout') state.log('关闭共享 whisper-server 超时（已放弃等待，进程退出会兜底清理）');
+    else state.log('共享 whisper-server 已关闭');
+  } catch (err) {
+    state.log(`关闭共享 whisper-server 失败（不影响退出）：${err?.message ?? err}`);
+  }
 }
 
 function buildPublicConfigPayload(state) {
@@ -318,6 +444,8 @@ function buildPublicConfigPayload(state) {
     host: state.host,
     port: state.port,
     mode: state.mode,
+    maxSessions: state.maxSessions,
+    activeSessions: countActiveSessions(state),
     studioUrl: `${state.url}/studio/`,
     replayUrl: `${state.url}/replay/`,
   };
@@ -462,7 +590,17 @@ function createRequestHandler(state) {
     }
 
     try {
-      if (pathname === '/health') return sendJson(res, 200, buildHealth(state), { head: method === 'HEAD' });
+      if (pathname === '/health') {
+        const health = buildHealth(state);
+        try {
+          health.whisper.server = await whisperRuntimeStatus(state);
+          health.whisper.running = health.whisper.server.running;
+        } catch (err) {
+          state.log(`whisper 状态探测失败（不影响 /health）：${err?.message ?? err}`);
+          health.whisper.server = { running: null, source: 'unknown', error: 'status probe failed' };
+        }
+        return sendJson(res, 200, health, { head: method === 'HEAD' });
+      }
 
       if (pathname === '/api/config') {
         return sendJson(res, 200, buildPublicConfigPayload(state), { head: method === 'HEAD' });
@@ -688,7 +826,7 @@ function handleWebSocketConnection(ws, req, state) {
   };
 
   const handleHello = (msg) => {
-    if (conn.closed) return;
+    if (conn.closed || conn.phase === 'rejected') return;
     clearTimeout(conn.helloTimer);
     conn.helloTimer = null;
     if (conn.phase !== 'awaiting-hello') {
@@ -702,6 +840,21 @@ function handleWebSocketConnection(ws, req, state) {
       });
       try {
         ws.close(1002, 'bad hello');
+      } catch {
+        /* ignore */
+      }
+      return;
+    }
+
+    const activeSessions = countActiveSessions(state);
+    if (activeSessions >= state.maxSessions) {
+      const message = `并发会话已达上限（${activeSessions}/${state.maxSessions}）：请先关闭其他工作台/扩展标签页，或重启引擎提高 server.maxSessions 后重试。`;
+      conn.phase = 'rejected';
+      log(`拒绝新会话：${message}`);
+      sendError('session', message, { recoverable: false, code: 'MAX_SESSIONS' });
+      send(statusEvent('error', message, 0));
+      try {
+        ws.close(1013, 'max sessions');
       } catch {
         /* ignore */
       }
@@ -1115,6 +1268,7 @@ export async function startServer(options = {}) {
     mode,
     sessions: new Set(),
     totalSessions: 0,
+    maxSessions: resolveMaxSessions(config, options),
     startedAt: Date.now(),
     host: options.host ?? config?.server?.host ?? DEFAULT_HOST,
     port: 0,
@@ -1126,6 +1280,8 @@ export async function startServer(options = {}) {
       Number.isFinite(options.helloTimeoutMs) && options.helloTimeoutMs >= 0 ? options.helloTimeoutMs : DEFAULT_HELLO_TIMEOUT_MS,
     voiceLister: typeof options.voiceLister === 'function' ? options.voiceLister : null,
     voicesCache: null,
+    whisperStatusCache: null,
+    closeAsrOnShutdown: options.closeAsrOnShutdown !== false,
     env,
   };
 
@@ -1220,6 +1376,8 @@ export async function startServer(options = {}) {
       server.closeAllConnections?.();
       setTimeout(done, 1000).unref?.();
     });
+    // 重要：共享 whisper-server 不随会话关闭；引擎退出时必须显式收尾，避免 18765 残留孤儿进程。
+    if (state.closeAsrOnShutdown) await closeSharedWhisperServers(state);
     log('livedub 引擎已关闭');
   }
 
@@ -1232,6 +1390,7 @@ export async function startServer(options = {}) {
     port: state.port,
     url: state.url,
     studioUrl: state.studioUrl,
+    maxSessions: state.maxSessions,
     sessions: state.sessions,
     close,
   };
@@ -1352,6 +1511,7 @@ async function main(argv = process.argv.slice(2)) {
   line('ASR', `${config?.asr?.provider ?? '?'}${whisperModel ? `（模型 ${toProjectRelative(whisperModel)}）` : '（⚠ 未找到 whisper 模型）'}`);
   line('翻译', `${config?.translate?.provider ?? '?'}${Array.isArray(config?.translate?.chain) ? `（链：${config.translate.chain.join(' → ')}）` : ''}`);
   line('配音', `${config?.tts?.provider ?? '?'} · ${config?.tts?.voiceMode ?? 'preset'}`);
+  line('并发', `最多 ${started.maxSessions} 个会话（config.server.maxSessions）`);
   line('凭据', saylessPath ? `~/.sayless 配置已发现` : '未发现 ~/.sayless/config.json（可使用 --demo 体验）');
   console.log('  ─────────────────────────────────────────────');
   console.log('  按 Ctrl+C 退出');

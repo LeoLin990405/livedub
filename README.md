@@ -1,8 +1,20 @@
 # livedub · 看视频，像原声一样同传
 
+[简体中文](README.md) | [English](README.en.md)
+
+[![CI](https://github.com/LeoLin990405/livedub/actions/workflows/ci.yml/badge.svg)](https://github.com/LeoLin990405/livedub/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![Node](https://img.shields.io/badge/node-%E2%89%A522-brightgreen.svg)](package.json)
+[![runtime deps](https://img.shields.io/badge/runtime%20deps-0-blue.svg)](package.json)
+[![stars](https://img.shields.io/github/stars/LeoLin990405/livedub.svg?style=social)](https://github.com/LeoLin990405/livedub)
+
 > 本地优先的**实时同声传译引擎**：抓取视频声音 → 流式识别 → 增量翻译 → 克隆音色配音 + 双语字幕。
 > 面向**教学视频**（公开课/网课/技术讲座）优化：术语表约束、子句级低延迟配音、原声自动压音。
 >
+
+**v0.2（2026-10-29）**：翻译流式 × TTS 重叠、TTS 预热/LRU 缓存、成片时轴修正；
+工作台明暗主题/字幕预设/快捷键/延迟趋势/JSONL 导出；扩展原生全屏浮层/SRT 导出/断连引导；
+服务端会话上限与优雅退出；**实测 e2e 3.4s → 3.0s（快速档 2.4s）**；MIT 开源。详见 [CHANGELOG](CHANGELOG.md)。
 > 形态：Chrome 扩展（任意网页视频） + 本地工作台（本地课程文件 / 回放 / 导出）。
 
 ```text
@@ -13,7 +25,7 @@ YouTube / B站 / 网课页面       本地引擎 (127.0.0.1)               输�
 │ 本地工作台        │ ◀────────── │ → 流式 TTS（MiniMax）       │   │ 原声自动压低（ducking）     │
 └──────────────────┘   WS 事件    │ → 调度/压音/字幕/指标        │   └──────────────────────────┘
                                   └───────────────────────────┘
-                    实测：语音结束后 ~3.4s 出中文配音（本机数据，见 docs/MEASUREMENTS.md）
+              实测：语音结束后 ~3.0s 出中文配音（快速档 ~2.4s，见 docs/MEASUREMENTS.md）
 ```
 
 ## 它解决什么问题
@@ -32,7 +44,7 @@ YouTube / B站 / 网课页面       本地引擎 (127.0.0.1)               输�
 | 翻译 | OpenAI 兼容流式 LLM，默认 `deepseek-flash`，可配置 failover 链 | 首字 **≈1.0s** |
 | TTS | MiniMax `speech-2.8-hd` 流式（PCM），默认男声讲师音色 | 短句首包 **≈1.1–1.5s** |
 | 音色克隆 | 优先免费申请克隆讲师音色；失败自动降级 preset 并给出原因 | 当前 MiniMax Token Plan 不支持克隆（API 明确返回 2061），**已实现自动降级**；换按量付费 key 即生效 |
-| 管线 | Node 零依赖引擎，VAD 切分 + 子句级 TTS + 调度压音 | 52.7s 示例课实测：ASR 2.1s → 翻译首字 0.8s → TTS 首包 0.2s，**e2e 中位 3.4s**（[完整数据](docs/MEASUREMENTS.md)） |
+| 管线 | Node 零依赖引擎，VAD 切分 + 子句级 TTS + 调度压音 | 52.7s 示例课实测：**质量档 e2e 3.0s** / **快速档 2.4s**（ASR 1.8s→0.9s、翻译首字 0.8s、TTS 首包 0.25s；[完整数据](docs/MEASUREMENTS.md)） |
 
 > ⚠️ 声音克隆能力取决于你的 TTS 服务套餐（MiniMax 按量付费 / 火山语音复刻等）。livedub 的原则是：**克隆能通就用克隆，不能通也保证同传可用**，不会因为克隆失败让整条链路挂掉。
 
@@ -41,6 +53,10 @@ YouTube / B站 / 网课页面       本地引擎 (127.0.0.1)               输�
 | 本地工作台（真实链路回放，HUD 为实测延迟） | 成片：中文配音 + 烧录双语字幕 |
 |---|---|
 | ![studio](docs/assets/studio-real-session.png) | ![dubbed](docs/assets/demo-bilingual-subtitled.png) |
+
+| 亮色主题 | 仅字幕模式 |
+|---|---|
+| ![light](docs/assets/studio-light.png) | ![subs-only](docs/assets/studio-subs-only.png) |
 
 - 完整演示视频：`demo/dubbed.mp4`（原声自动压低 + 中文 AI 配音 + 双语字幕）
 - 原始英文视频：`demo/original.mp4`；双语字幕：`demo/bilingual.srt`；回放事件流：`demo/session.jsonl`
@@ -105,10 +121,11 @@ npm start
 # http://127.0.0.1:8787/replay/?session=/demo/session.jsonl&video=/demo/original.mp4
 ```
 
-低延迟模式（ASR 换 small 模型，实测 7s 段推理从 ~1.6s 降到 ~0.55s，e2e 约再快 1s）：
+低延迟「快速档」（ASR 换 small 模型，实测 e2e **3.0s → 2.4s**，术语准确率略降）：
 
 ```bash
-LIVEDUB_WHISPER_MODEL=~/.sayless/ggml-small.bin npm start
+npm run start:fast      # 工作台，等价于 LIVEDUB_PROFILE=fast npm start
+npm run batch:fast      # 成片批处理，输出到 demo-fast/
 ```
 
 完整实测数字、逐句延迟、模型对比见 [docs/MEASUREMENTS.md](docs/MEASUREMENTS.md)。
@@ -158,8 +175,21 @@ livedub/
 
 - 声音克隆需要按量付费 TTS 套餐（见 `docs/PROVIDERS.md`）；当前默认 key 会降级为高质量 preset 音色。
 - 扩展的 `tabCapture` 依赖用户手势，不能全自动启动；受 DRM 保护的页面可能抓不到声音。
+- 默认关闭 ASR partial（会占用 whisper 队列拖慢 final，实测 +0.8s e2e）；想要「字幕边听边长」可在 config 开启 `asr.whisper.partial.enabled`。
 - 实时字幕延迟受翻译/配音网络影响，弱网时建议关配音只用字幕。
 - 计划：桌面悬浮窗（任意播放器/网课客户端）、云端流式 ASR 适配器、幻灯片 OCR 上下文、课程术语自动学习。详见 [docs/ROADMAP.md](docs/ROADMAP.md)。
+
+## 开源
+
+- 许可证：MIT（[LICENSE](LICENSE)）
+- 贡献指南：[CONTRIBUTING.md](CONTRIBUTING.md) · 行为准则：[CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md)
+- 安全报告：[SECURITY.md](SECURITY.md)（请勿公开 Issue）
+- 变更历史：[CHANGELOG.md](CHANGELOG.md) · 路线图：[docs/ROADMAP.md](docs/ROADMAP.md)
+- CI：GitHub Actions（Node 22/24；语法检查 + 离线单测 + 密钥扫描）
+- 运行时**零 npm 依赖**（只用 Node 内置能力），测试用 `node:test`
+
+欢迎 Issue / PR：尤其欢迎新的 TTS/ASR provider 适配器、桌面端（ScreenCaptureKit）实现、
+以及真实课程场景的延迟/质量评测。
 
 ## 致谢与许可
 

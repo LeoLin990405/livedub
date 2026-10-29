@@ -13,7 +13,7 @@ npm run batch        # scripts/batch.mjs    -> 下面这些文件
 | `dubbed.mp4` | **成品**：原声在配音区间自动压到 18% + 中文 AI 配音 + 烧录双语字幕（字幕由真实 ASR/翻译结果渲染） |
 | `bilingual.srt` | 双语字幕（原文 + 中文译文），可直接给播放器用 |
 | `session.jsonl` | 引擎事件回放流（每行一个事件：partial/segment/translation/dub/metrics…），回放页用 |
-| `metrics.json` | 每句延迟指标（ASR / 翻译首字 / TTS 首包 / e2e），汇总见 `docs/MEASUREMENTS.md` |
+| `metrics.json` | 每句延迟指标（ASR / 翻译首字 / TTS 首包 / e2e），汇总见 `docs/MEASUREMENTS.md`：质量档 e2e 中位 3.0s |
 | `demo-meta.json` | 示例视频的幻灯片时间轴与旁白脚本文本 |
 | `tmp/` | 中间产物（16k/48k WAV、混音轨、无字幕版 mp4、字幕 PNG），可删除 |
 
@@ -26,6 +26,10 @@ npm start
 ```
 
 回放会按事件时间轴渲染双语字幕，并按 `startMs` 播放当时合成的中文配音（base64 s16le）。
+
+> 成片时间轴说明：batch 会把配音块重排到「句子开始 + ~320ms」并顺序排布，同时用 TTS 语速 1.15
+> 适配中文通常比英文长 5–15% 的时长；本示例 52.7s 视频的配音在 52.1s 结束，无裁剪。
+> 重新生成请用 `npm run batch`（质量档）或 `npm run batch:fast`（快速档）。
 
 ## 截图
 

@@ -71,6 +71,348 @@ function normalizeText(text, { maxChars = MAX_TTS_CHARS } = {}) {
 }
 
 // ---------------------------------------------------------------------------
+// v0.2：LRU 音频缓存 / 参数校验 / 预热（Lead 在 session ready 时调用 tts.warmup?.()）
+// ---------------------------------------------------------------------------
+
+const CACHE_DEFAULTS = Object.freeze({
+  enabled: true,
+  maxEntries: 64, // 最多缓存 64 条短语（教学视频重复短语/术语很多）
+  maxTextChars: 120, // 只缓存短文本；长句缓存收益低且占内存
+  maxBytes: 32 * 1024 * 1024, // 额外内存上限（防御性，正常远达不到）
+});
+const DEFAULT_VOICE_LIST_TTL_MS = 300000; // listVoices 短 TTL：5 分钟
+const SPEED_MIN = 0.5;
+const SPEED_MAX = 2;
+const MAX_VOICE_ID_CHARS = 128;
+
+/** 读 config.tts.cache（缺省即启用，符合 v0.2 默认行为） */
+function resolveCacheConfig(ttsCfg) {
+  const raw = ttsCfg?.cache ?? {};
+  const num = (value, fallback) => {
+    const n = Math.floor(Number(value));
+    return Number.isFinite(n) && n >= 0 ? n : fallback;
+  };
+  return {
+    enabled: raw.enabled === undefined ? CACHE_DEFAULTS.enabled : Boolean(raw.enabled),
+    maxEntries: num(raw.maxEntries, CACHE_DEFAULTS.maxEntries),
+    maxTextChars: num(raw.maxTextChars, CACHE_DEFAULTS.maxTextChars),
+    maxBytes: num(raw.maxBytes, CACHE_DEFAULTS.maxBytes),
+  };
+}
+
+/** voiceId 归一化 + 校验：空/未传 -> presetVoices.default；非法值给出可操作错误 */
+function resolveVoiceId(ttsCfg, voiceId) {
+  const fallback = typeof ttsCfg?.presetVoices?.default === 'string' ? ttsCfg.presetVoices.default : null;
+  if (voiceId == null) return fallback;
+  if (typeof voiceId !== 'string') {
+    throw ttsError(`voiceId 必须是字符串（收到 ${typeof voiceId}），例如 "male-qn-qingse"`, { code: 'bad_voice_id' });
+  }
+  const raw = voiceId.trim();
+  if (!raw) return fallback;
+  if (raw.length > MAX_VOICE_ID_CHARS) {
+    throw ttsError(`voiceId 过长（${raw.length} > ${MAX_VOICE_ID_CHARS}）：检查 config.tts.presetVoices / 克隆音色 ID`, {
+      code: 'bad_voice_id',
+    });
+  }
+  if (/[\u0000-\u001f\u007f]/.test(raw)) {
+    throw ttsError('voiceId 含控制字符：请传 MiniMax 音色 ID（如 male-qn-qingse）或 macOS 音色名（如 Tingting）', {
+      code: 'bad_voice_id',
+    });
+  }
+  return raw;
+}
+
+/** 进程内 LRU 音频缓存（key = voiceId + speed + text，value = 整段 PCM） */
+class TtsAudioCache {
+  constructor({ config, log = () => {} }) {
+    this.config = config;
+    this.log = log;
+    this.map = new Map();
+    this.bytes = 0;
+    this.lookups = 0;
+    this.hits = 0;
+    this.misses = 0;
+    this.stores = 0;
+    this.evictions = 0;
+    this.skipped = 0;
+  }
+
+  /** 该文本是否值得缓存（关闭 / 空 / 超长 都不缓存） */
+  eligible(text) {
+    return (
+      this.config.enabled &&
+      this.config.maxEntries > 0 &&
+      typeof text === 'string' &&
+      text.length > 0 &&
+      text.length <= this.config.maxTextChars
+    );
+  }
+
+  get(key) {
+    this.lookups += 1;
+    const entry = this.map.get(key);
+    if (!entry) {
+      this.misses += 1;
+      return null;
+    }
+    // LRU：命中后移到 Map 队尾
+    this.map.delete(key);
+    this.map.set(key, entry);
+    this.hits += 1;
+    return entry;
+  }
+
+  set(key, entry) {
+    if (!this.config.enabled || this.config.maxEntries <= 0) return false;
+    if (this.map.has(key)) {
+      this.bytes -= this.map.get(key).bytes;
+      this.map.delete(key);
+    }
+    this.map.set(key, entry);
+    this.bytes += entry.bytes;
+    this.stores += 1;
+    while (this.map.size > this.config.maxEntries || (this.config.maxBytes > 0 && this.bytes > this.config.maxBytes)) {
+      const oldestKey = this.map.keys().next().value;
+      if (oldestKey === undefined) break;
+      const evicted = this.map.get(oldestKey);
+      this.map.delete(oldestKey);
+      this.bytes -= evicted.bytes;
+      this.evictions += 1;
+    }
+    return true;
+  }
+
+  clear() {
+    this.map.clear();
+    this.bytes = 0;
+  }
+
+  stats() {
+    return {
+      enabled: this.config.enabled,
+      maxEntries: this.config.maxEntries,
+      maxTextChars: this.config.maxTextChars,
+      maxBytes: this.config.maxBytes,
+      entries: this.map.size,
+      bytes: this.bytes,
+      lookups: this.lookups,
+      hits: this.hits,
+      misses: this.misses,
+      stores: this.stores,
+      evictions: this.evictions,
+      skipped: this.skipped,
+      hitRate: this.lookups > 0 ? Math.round((this.hits / this.lookups) * 1000) / 1000 : 0,
+    };
+  }
+}
+
+/** 把 provider 包一层：参数校验 + LRU 缓存 + listVoices TTL + warmup + stats */
+function createManagedTts(provider, { config = {}, log = () => {} } = {}) {
+  const ttsCfg = config?.tts ?? {};
+  const cache = new TtsAudioCache({ config: resolveCacheConfig(ttsCfg), log });
+  const name = provider.name ?? 'tts';
+  const defaultSpeed = clampSpeed(ttsCfg.speed ?? 1);
+  const voiceListTtlMs = positiveInt(ttsCfg.voiceListTtlMs, DEFAULT_VOICE_LIST_TTL_MS);
+  const fallbackSampleRate = positiveInt(ttsCfg.sampleRate, positiveInt(provider.sampleRate, 24000));
+
+  let voicesCache = null; // { list, at }
+  let voiceFetches = 0;
+  let warmupPromise = null;
+  const warmupStats = { called: false, ok: null, elapsedMs: 0, error: null };
+
+  /** 统一入口校验：空文本/非法 voiceId/speed 钳制 -> 内存里的请求描述 */
+  function normalizeRequest(opts = {}) {
+    const text = normalizeText(opts?.text);
+    const speed = clampSpeed(opts?.speed ?? defaultSpeed);
+    const voiceId = resolveVoiceId(ttsCfg, opts?.voiceId);
+    const signal = opts?.signal ?? null;
+    return { text, speed, voiceId, signal, key: `${voiceId ?? ''}\u0001${speed}\u0001${text}` };
+  }
+
+  function toResult(entry) {
+    return {
+      pcm: entry.pcm,
+      sampleRate: entry.sampleRate,
+      format: 's16le',
+      durationMs: entry.durationMs,
+      voiceId: entry.voiceId ?? null,
+    };
+  }
+
+  function makeEntry(res, voiceId) {
+    const pcm = Buffer.isBuffer(res?.pcm) ? res.pcm : Buffer.from(res?.pcm ?? []);
+    const sampleRate = positiveInt(res?.sampleRate, fallbackSampleRate);
+    return {
+      pcm,
+      sampleRate,
+      format: 's16le',
+      durationMs: Number.isFinite(res?.durationMs) ? res.durationMs : pcmDurationMs(pcm, sampleRate),
+      voiceId: res?.voiceId ?? voiceId ?? null,
+      bytes: pcm.length + 64,
+      storedAt: Date.now(),
+    };
+  }
+
+  async function synthesize(opts = {}) {
+    const req = normalizeRequest(opts);
+    if (req.signal?.aborted) throw abortError();
+    const cacheable = cache.eligible(req.text);
+    if (cacheable) {
+      const hit = cache.get(req.key);
+      if (hit) {
+        log(`[tts:${name}] cache hit（${req.text.length} 字 / ${hit.durationMs}ms 音频）`);
+        return toResult(hit);
+      }
+    } else {
+      cache.skipped += 1;
+    }
+
+    const res = await provider.synthesize({ text: req.text, voiceId: req.voiceId, speed: req.speed, signal: req.signal });
+    if (req.signal?.aborted) throw abortError(); // 会话已关闭：结果丢弃，且不写缓存
+    const entry = makeEntry(res, req.voiceId);
+    if (cacheable && entry.pcm.length > 0) {
+      cache.set(req.key, entry);
+      log(`[tts:${name}] cache store（${req.text.length} 字 / ${entry.durationMs}ms 音频 / entries=${cache.stats().entries}）`);
+    }
+    return toResult(entry);
+  }
+
+  async function* synthesizeStream(opts = {}) {
+    const req = normalizeRequest(opts);
+    if (req.signal?.aborted) throw abortError();
+    const cacheable = cache.eligible(req.text);
+    if (cacheable) {
+      const hit = cache.get(req.key);
+      if (hit) {
+        log(`[tts:${name}] cache hit（流式直接回放缓存 ${hit.durationMs}ms）`);
+        yield toResult(hit);
+        return;
+      }
+    } else {
+      cache.skipped += 1;
+    }
+
+    const parts = []; // 只有可缓存的短文本才累积，避免长文本额外占内存
+    let sampleRate = fallbackSampleRate;
+    if (typeof provider.synthesizeStream === 'function') {
+      for await (const chunk of provider.synthesizeStream({ text: req.text, voiceId: req.voiceId, speed: req.speed, signal: req.signal })) {
+        const pcm = Buffer.isBuffer(chunk?.pcm) ? chunk.pcm : Buffer.from(chunk?.pcm ?? []);
+        if (pcm.length === 0) continue;
+        sampleRate = positiveInt(chunk?.sampleRate, sampleRate);
+        const durationMs = Number.isFinite(chunk?.durationMs) ? chunk.durationMs : pcmDurationMs(pcm, sampleRate);
+        if (cacheable) parts.push(pcm);
+        yield { pcm, sampleRate, format: 's16le', durationMs };
+      }
+    } else {
+      const res = await provider.synthesize({ text: req.text, voiceId: req.voiceId, speed: req.speed, signal: req.signal });
+      const entry = makeEntry(res, req.voiceId);
+      if (entry.pcm.length > 0) {
+        if (cacheable) parts.push(entry.pcm);
+        yield toResult(entry);
+      }
+    }
+    // 被 abort 的请求不写缓存；正常消费完才写（消费者中途 break 也不会写）
+    if (cacheable && parts.length > 0 && !req.signal?.aborted) {
+      const pcm = parts.length === 1 ? parts[0] : Buffer.concat(parts);
+      cache.set(req.key, {
+        pcm,
+        sampleRate,
+        format: 's16le',
+        durationMs: pcmDurationMs(pcm, sampleRate),
+        voiceId: req.voiceId ?? null,
+        bytes: pcm.length + 64,
+        storedAt: Date.now(),
+      });
+      log(`[tts:${name}] cache store（流式 ${req.text.length} 字 / entries=${cache.stats().entries}）`);
+    }
+  }
+
+  async function listVoices() {
+    const now = Date.now();
+    if (voicesCache && now - voicesCache.at < voiceListTtlMs) return voicesCache.list;
+    const list = await provider.listVoices();
+    voiceFetches += 1;
+    voicesCache = { list, at: Date.now() };
+    return list;
+  }
+
+  /** 预热：失败只 log 不 throw（Lead 在 session ready 时调用，任何异常都不能影响会话） */
+  async function warmup() {
+    if (warmupPromise) return warmupPromise;
+    warmupStats.called = true;
+    const started = Date.now();
+    warmupPromise = (async () => {
+      try {
+        let detail = null;
+        if (typeof provider.warmup === 'function') detail = await provider.warmup();
+        if (Array.isArray(detail?.voices) && detail.voices.length > 0) {
+          voicesCache = { list: detail.voices, at: Date.now() };
+          voiceFetches += 1;
+        } else if (!voicesCache) {
+          // provider 没有 warmup（mock/macos-say）时顺手暖一下音色列表（本地/静态，几乎零成本）
+          try {
+            const list = await listVoices();
+            if (Array.isArray(list) && list.length > 0) voicesCache = { list, at: Date.now() };
+          } catch {
+            /* 音色列表失败不影响 warmup 成功与否 */
+          }
+        }
+        warmupStats.ok = detail?.ok !== false;
+        warmupStats.elapsedMs = Date.now() - started;
+        warmupStats.error = warmupStats.ok ? null : String(detail?.error ?? 'unknown');
+        log(`[tts:${name}] warmup ${warmupStats.ok ? 'ok' : '失败'} ${warmupStats.elapsedMs}ms`);
+        return {
+          ok: warmupStats.ok,
+          provider: name,
+          elapsedMs: warmupStats.elapsedMs,
+          voices: voicesCache?.list?.length ?? 0,
+          ...(detail?.error ? { error: String(detail.error) } : {}),
+        };
+      } catch (err) {
+        warmupStats.ok = false;
+        warmupStats.elapsedMs = Date.now() - started;
+        warmupStats.error = String(err?.message ?? err);
+        log(`[tts:${name}] warmup 失败（不影响配音）：${warmupStats.error}`);
+        return { ok: false, provider: name, elapsedMs: warmupStats.elapsedMs, error: warmupStats.error };
+      }
+    })();
+    return warmupPromise;
+  }
+
+  function stats() {
+    const now = Date.now();
+    return {
+      name,
+      provider: name,
+      cache: cache.stats(),
+      voiceList: {
+        cached: Boolean(voicesCache),
+        entries: voicesCache?.list?.length ?? 0,
+        ageMs: voicesCache ? now - voicesCache.at : null,
+        ttlMs: voiceListTtlMs,
+        fetches: voiceFetches,
+      },
+      warmup: { ...warmupStats },
+    };
+  }
+
+  const managed = {
+    ...provider,
+    name,
+    sampleRate: provider.sampleRate ?? fallbackSampleRate,
+    synthesize,
+    synthesizeStream,
+    listVoices,
+    warmup,
+    stats,
+    clearCache: () => cache.clear(),
+  };
+  if (typeof provider.cloneVoice === 'function') managed.cloneVoice = provider.cloneVoice.bind(provider);
+  else delete managed.cloneVoice;
+  return managed;
+}
+
+// ---------------------------------------------------------------------------
 // splitForTts：按子句切块（pipeline 低延迟配音用）
 // ---------------------------------------------------------------------------
 
@@ -276,10 +618,13 @@ export async function createTts({ config = {}, log = () => {}, fetchImpl = globa
   if (!provider) {
     throw ttsError('config.tts.provider 未配置（可选 minimax | macos-say | mock）', { code: 'missing_provider' });
   }
-  if (provider === 'minimax') return createMinimaxTts({ config, log, fetchImpl });
-  if (provider === 'macos-say') return createMacosSayTts({ config, log });
-  if (provider === 'mock') return createMockTts({ config, log });
-  throw new Error(`unknown provider: ${provider}（tts.provider 仅支持 minimax | macos-say | mock）`);
+  let base;
+  if (provider === 'minimax') base = createMinimaxTts({ config, log, fetchImpl });
+  else if (provider === 'macos-say') base = createMacosSayTts({ config, log });
+  else if (provider === 'mock') base = createMockTts({ config, log });
+  else throw new Error(`unknown provider: ${provider}（tts.provider 仅支持 minimax | macos-say | mock）`);
+  // v0.2：统一加 LRU 缓存 / 预热 / 参数校验 / listVoices TTL（契约外的可选扩展，只增不减）
+  return createManagedTts(base, { config, log });
 }
 
 /**
@@ -382,7 +727,38 @@ export async function createTtsWithFallback({ config = {}, log = () => {}, fetch
     synthesize,
     synthesizeStream,
     listVoices: (...args) => primary.listVoices(...args),
-    cloneVoice: (...args) => primary.cloneVoice(...args),
+    cloneVoice: (...args) => {
+      if (typeof primary.cloneVoice !== 'function') {
+        throw ttsError(`主 provider ${primary.name} 不支持 cloneVoice`, { code: 'clone_unsupported' });
+      }
+      return primary.cloneVoice(...args);
+    },
+    // v0.2：链上所有 provider 并发预热（各自失败不致命），主 provider 优先
+    async warmup() {
+      const results = await Promise.all(
+        instances.map((inst) =>
+          typeof inst.warmup === 'function'
+            ? inst.warmup().catch((err) => ({ ok: false, provider: inst.name, error: String(err?.message ?? err) }))
+            : Promise.resolve({ ok: true, provider: inst.name, noop: true })
+        )
+      );
+      return { ok: Boolean(results[0]?.ok), primary: results[0] ?? null, providers: results };
+    },
+    stats() {
+      return {
+        name: primary.name,
+        providers: instances.map((inst) => (typeof inst.stats === 'function' ? inst.stats() : { name: inst.name })),
+      };
+    },
+    clearCache() {
+      for (const inst of instances) {
+        try {
+          inst.clearCache?.();
+        } catch {
+          /* ignore */
+        }
+      }
+    },
   };
 }
 
@@ -564,11 +940,21 @@ function createMinimaxTts({ config = {}, log = () => {}, fetchImpl = globalThis.
     }
   }
 
-  /** 底层请求：统一超时/取消/网络错误文案 */
-  async function requestRaw(url, { method = 'POST', headers = {}, body, signal, timeout } = {}) {
+  /**
+   * 底层请求：统一超时/取消/网络错误文案。
+   * keepOpen=true 用于流式响应：fetch 只解析到响应头就返回，但「外部 signal -> 内部 controller」
+   * 的桥接与超时计时器必须保持到 body 读完，否则流中途 stall / 会话 close 时无法真正中断。
+   * 调用方在 finally 里执行 res.__livedubCleanup?.() 释放。
+   */
+  async function requestRaw(url, { method = 'POST', headers = {}, body, signal, timeout, keepOpen = false } = {}) {
     const tmo = positiveInt(timeout, timeoutMs);
     const controller = new AbortController();
     let timedOut = false;
+    let handedOff = false;
+    const cleanup = () => {
+      clearTimeout(timer);
+      if (signal) signal.removeEventListener('abort', onAbort);
+    };
     const timer = setTimeout(() => {
       timedOut = true;
       controller.abort();
@@ -583,13 +969,24 @@ function createMinimaxTts({ config = {}, log = () => {}, fetchImpl = globalThis.
     };
     if (signal) {
       if (signal.aborted) {
-        clearTimeout(timer);
+        cleanup();
         throw abortError();
       }
       signal.addEventListener('abort', onAbort, { once: true });
     }
     try {
-      return await fetchImpl(url, { method, headers, body, signal: controller.signal });
+      const res = await fetchImpl(url, { method, headers, body, signal: controller.signal });
+      if (keepOpen && res && typeof res === 'object') {
+        handedOff = true;
+        try {
+          res.__livedubCleanup = cleanup;
+        } catch {
+          /* 某些 Response 实现是 frozen 的，退化为立即清理 */
+          cleanup();
+        }
+        return res;
+      }
+      return res;
     } catch (err) {
       if (timedOut) {
         throw ttsError(`请求超时（>${tmo}ms）：${url}；检查网络/代理，或调大 config.tts.timeoutMs`, {
@@ -605,8 +1002,7 @@ function createMinimaxTts({ config = {}, log = () => {}, fetchImpl = globalThis.
         cause: err,
       });
     } finally {
-      clearTimeout(timer);
-      if (signal) signal.removeEventListener('abort', onAbort);
+      if (!handedOff) cleanup();
     }
   }
 
@@ -664,13 +1060,16 @@ function createMinimaxTts({ config = {}, log = () => {}, fetchImpl = globalThis.
     const started = Date.now();
     let yielded = 0;
     let firstChunkMs = null;
+    let streamRes = null;
     try {
       const res = await requestRaw(`${baseUrl}${t2aPath}`, {
         headers: { 'Content-Type': 'application/json', ...authHeaders },
         body: JSON.stringify(payload),
         signal,
         timeout: timeoutMs,
+        keepOpen: true,
       });
+      streamRes = res;
       if (res.ok === false || (typeof res.status === 'number' && res.status >= 400)) {
         let detail = '';
         try {
@@ -725,10 +1124,16 @@ function createMinimaxTts({ config = {}, log = () => {}, fetchImpl = globalThis.
       log(`[tts:minimax] 流式失败，自动回退非流式：${err?.message ?? err}`);
       const full = await synthesize({ text: clean, voiceId, speed, signal });
       yield { pcm: full.pcm, sampleRate: full.sampleRate, format: 's16le', durationMs: full.durationMs };
+    } finally {
+      // 流式 body 读完后释放 abort 桥接与超时计时器
+      try {
+        streamRes?.__livedubCleanup?.();
+      } catch {
+        /* ignore */
+      }
     }
   }
 
-  let voicesCache = null;
   let voicesInFlight = null;
 
   function staticVoices() {
@@ -747,38 +1152,48 @@ function createMinimaxTts({ config = {}, log = () => {}, fetchImpl = globalThis.
     return [...ids].map((id) => ({ id, label: id, gender: inferGender(id), cloned: false }));
   }
 
-  async function fetchVoices() {
-    try {
-      const json = await postJson('/get_voice', { voice_type: 'all' }, { timeout: Math.min(timeoutMs, 15000), label: 'minimax listVoices' });
-      const system = Array.isArray(json?.system_voice) ? json.system_voice : [];
-      const cloning = Array.isArray(json?.voice_cloning) ? json.voice_cloning : [];
-      const list = [];
-      for (const v of system) {
-        if (!v?.voice_id) continue;
-        list.push({ id: v.voice_id, label: v.voice_name || v.voice_id, gender: inferGender(v.voice_id), cloned: false });
-      }
-      for (const v of cloning) {
-        if (!v?.voice_id) continue;
-        list.push({ id: v.voice_id, label: v.voice_name || `克隆音色 ${v.voice_id}`, gender: inferGender(v.voice_id), cloned: true });
-      }
-      if (list.length === 0) throw ttsError('get_voice 返回空列表', { provider: 'minimax', code: 'empty_voice_list' });
-      log(`[tts:minimax] listVoices: ${list.length} 个（system=${system.length} cloned=${cloning.length}）`);
-      return dedupeVoices(list);
-    } catch (err) {
-      log(`[tts:minimax] listVoices 失败，回退静态预设列表：${err?.message ?? err}`);
-      return staticVoices();
+  /** 真请求 get_voice（失败会 throw，由调用方决定回退） */
+  async function fetchVoicesStrict() {
+    const json = await postJson('/get_voice', { voice_type: 'all' }, { timeout: Math.min(timeoutMs, 15000), label: 'minimax listVoices' });
+    const system = Array.isArray(json?.system_voice) ? json.system_voice : [];
+    const cloning = Array.isArray(json?.voice_cloning) ? json.voice_cloning : [];
+    const list = [];
+    for (const v of system) {
+      if (!v?.voice_id) continue;
+      list.push({ id: v.voice_id, label: v.voice_name || v.voice_id, gender: inferGender(v.voice_id), cloned: false });
     }
+    for (const v of cloning) {
+      if (!v?.voice_id) continue;
+      list.push({ id: v.voice_id, label: v.voice_name || `克隆音色 ${v.voice_id}`, gender: inferGender(v.voice_id), cloned: true });
+    }
+    if (list.length === 0) throw ttsError('get_voice 返回空列表', { provider: 'minimax', code: 'empty_voice_list' });
+    log(`[tts:minimax] listVoices: ${list.length} 个（system=${system.length} cloned=${cloning.length}）`);
+    return dedupeVoices(list);
   }
 
   async function listVoices() {
-    if (voicesCache) return voicesCache;
     if (voicesInFlight) return voicesInFlight;
-    voicesInFlight = fetchVoices().then((list) => {
-      voicesCache = list;
-      voicesInFlight = null;
-      return list;
-    });
+    voicesInFlight = fetchVoicesStrict()
+      .catch((err) => {
+        log(`[tts:minimax] listVoices 失败，回退静态预设列表：${err?.message ?? err}`);
+        return staticVoices();
+      })
+      .finally(() => {
+        voicesInFlight = null;
+      });
     return voicesInFlight;
+  }
+
+  /**
+   * v0.2 预热：一次轻量 get_voice（不计 TTS 字符），顺带建立/复用 HTTP 连接（keep-alive），
+   * 让会话里第一条 synthesizeStream 少一次 DNS/TLS/连接建立；同时把音色列表交给 wrapper 的 TTL 缓存。
+   */
+  async function warmup() {
+    const started = Date.now();
+    const voices = await fetchVoicesStrict();
+    const elapsedMs = Date.now() - started;
+    log(`[tts:minimax] warmup: get_voice ok ${elapsedMs}ms（${voices.length} 个音色）`);
+    return { ok: true, provider: 'minimax', elapsedMs, voices };
   }
 
   function buildVoiceId(name) {
@@ -845,6 +1260,7 @@ function createMinimaxTts({ config = {}, log = () => {}, fetchImpl = globalThis.
     synthesizeStream,
     listVoices,
     cloneVoice,
+    warmup,
   };
 }
 
@@ -989,19 +1405,32 @@ function createMacosSayTts({ config = {}, log = () => {} } = {}) {
     yield { pcm: result.pcm, sampleRate: result.sampleRate, format: 's16le', durationMs: result.durationMs };
   }
 
+  /** v0.2 预热：本地检查（不 spawn say、不产生任何 API 调用） */
+  async function warmup() {
+    const started = Date.now();
+    if (process.platform !== 'darwin') {
+      return { ok: false, provider: 'macos-say', elapsedMs: Date.now() - started, error: `unsupported platform: ${process.platform}` };
+    }
+    try {
+      await fs.access('/usr/bin/say');
+    } catch (err) {
+      return { ok: false, provider: 'macos-say', elapsedMs: Date.now() - started, error: `/usr/bin/say 不可用：${err?.message ?? err}` };
+    }
+    return { ok: true, provider: 'macos-say', elapsedMs: Date.now() - started, voice, noop: true };
+  }
+
   return {
     name: 'macos-say',
     sampleRate: requestedSampleRate,
     synthesize,
     synthesizeStream,
-    async listVoices() {
-      return MACOS_KNOWN_VOICES.map((v) => ({ ...v, cloned: false }));
-    },
+    listVoices: async () => MACOS_KNOWN_VOICES.map((v) => ({ ...v, cloned: false })),
     async cloneVoice() {
       throw ttsError('macos-say 不支持声音克隆；请用 minimax 克隆或保持预设音色', {
         provider: 'macos-say',
         code: 'clone_unsupported',
       });
     },
+    warmup,
   };
 }
