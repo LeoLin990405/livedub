@@ -11,6 +11,12 @@
  * - 延迟细分展示（ASR / 翻译 / 配音 / 端到端）；
  * - 结束时恢复所有被压音元素、清理定时器与拖拽状态。
  *
+ * v0.3：
+ * - 全局限定压音（offscreen 原声总线 GainNode）成为主方案：开启时 content 不再改
+ *   <video>.volume（避免双重压音），只保留兜底路径（关闭全局限定压音时生效）；
+ * - 裸 <video> 全屏：与 MAIN world 的 page-hook.js 通过 window.postMessage 协作，
+ *   由 page-hook 把裸 video 包进容器再全屏，content 负责把浮层迁进该容器。
+ *
  * 只做「显示 + 压音」，不直接连引擎：从 background 的 runtime 消息增量更新。
  * 为什么是 classic script：MV3 content_scripts 不能 import ESM。因此这里内联了与
  * extension/lib/{pcm,ui,constants,srt}.js 等价的少量纯逻辑（有注释标注），
@@ -51,6 +57,10 @@
     dx: 0,
     subsOpacity: 0.82,
     subsBg: 'dark',
+    captureReplay: true,
+    globalDuck: true,
+    duckRecoverMs: 800,
+    fullscreenWorkaround: true,
     langFrom: 'en',
     langTo: 'zh',
     hidden: false,
@@ -70,6 +80,11 @@
   const BLOCK_TTL_MS = 25000;
   /** 浮层轮询间隔（压音 tick / 字幕过期 / SPA / 全屏兜底检查） */
   const TICK_MS = 500;
+  /** v0.3：与 page-hook.js（MAIN world）的 postMessage 协作协议 */
+  const PAGE_HOOK_SOURCE = 'livedub-page-hook';
+  const CONTENT_MESSAGE_SOURCE = 'livedub-content';
+  const DUCK_RECOVER_MS_MIN = 300;
+  const DUCK_RECOVER_MS_MAX = 3000;
 
   const runtime = {
     settings: { ...DEFAULT_SETTINGS },
@@ -92,6 +107,8 @@
     mounted: false,
     fullscreenBareVideo: false,
     fullscreenHintShown: false,
+    pageHookConfigKey: '',
+    pageHookWrappedHinted: false,
   };
 
   const now = () => (typeof performance !== 'undefined' && performance.now ? performance.now() : Date.now());
@@ -127,6 +144,10 @@
     merged.dubEnabled = merged.dubEnabled !== false;
     merged.showOriginal = merged.showOriginal !== false;
     merged.hidden = merged.hidden === true;
+    merged.captureReplay = merged.captureReplay !== false;
+    merged.globalDuck = merged.globalDuck !== false;
+    merged.fullscreenWorkaround = merged.fullscreenWorkaround !== false;
+    merged.duckRecoverMs = Math.round(clampNumber(merged.duckRecoverMs, DUCK_RECOVER_MS_MIN, DUCK_RECOVER_MS_MAX, 800));
     merged.panelPos =
       merged.panelPos && typeof merged.panelPos === 'object'
         ? { dx: Math.round(Number(merged.panelPos.dx) || 0), dy: Math.round(Number(merged.panelPos.dy) || 0) }
@@ -156,18 +177,57 @@
 
   function applySettings(settings) {
     runtime.settings = normalizeSettings(settings);
+    if (runtime.settings.globalDuck !== false) {
+      // 主方案在 offscreen 原声总线压音：content 侧必须恢复页面音量，避免双重压音
+      restoreVolumes();
+    }
     syncPanelControls();
     applyOverlayVisibility();
     applySubsLayout();
     applyPanelPosition();
+    postPageHookConfig();
     renderSubtitles();
     renderMeta();
+  }
+
+  // ---- v0.3：与 MAIN world page-hook.js 的协作 ----
+
+  /** 把「裸 video 全屏兼容」等开关同步给页面主世界的 page-hook（同值不重复发送） */
+  function postPageHookConfig() {
+    const key = `${runtime.settings.fullscreenWorkaround === true}:${runtime.settings.captureReplay !== false}`;
+    if (key === runtime.pageHookConfigKey) return;
+    runtime.pageHookConfigKey = key;
+    try {
+      window.postMessage(
+        {
+          source: CONTENT_MESSAGE_SOURCE,
+          type: 'config',
+          fullscreenWorkaround: runtime.settings.fullscreenWorkaround === true,
+          captureReplay: runtime.settings.captureReplay !== false,
+        },
+        '*',
+      );
+    } catch {
+      /* ignore */
+    }
+  }
+
+  function onPageHookMessage(event) {
+    const data = event && event.data;
+    if (!data || typeof data !== 'object' || data.source !== PAGE_HOOK_SOURCE) return;
+    if (data.type === 'wrap' && !runtime.pageHookWrappedHinted) {
+      runtime.pageHookWrappedHinted = true;
+      showError('已启用「裸 video 全屏兼容」：已把 <video> 包进全屏容器，字幕浮层在原生全屏下可见。', 'info');
+    } else if (data.type === 'error' && data.message) {
+      showError(`全屏兼容失败，已回退原生全屏：${data.message}`, 'info');
+    }
   }
 
   function formatSettingValue(key, value) {
     if (key === 'fontSize') return `${value}px`;
     if (key === 'offsetY') return `${value}px`;
     if (key === 'subsOpacity') return `${Math.round(value * 100)}%`;
+    if (key === 'duckRecoverMs') return `${value}ms`;
     if (key === 'duckRatio') return String(value);
     return String(value);
   }
@@ -383,13 +443,17 @@
           </div>
           <div class="livedub-panel-body" data-part="panel-body">
             <div class="row"><label><input type="checkbox" data-set="dubEnabled" /> 中文配音</label></div>
+            <div class="row"><label><input type="checkbox" data-set="captureReplay" /> 原声重放（关闭 = 只听配音）</label></div>
+            <div class="row"><label><input type="checkbox" data-set="globalDuck" /> 全局限定压音（iframe/WebAudio 也生效）</label></div>
             <div class="row"><label>压音 <input type="range" data-set="duckRatio" min="0.02" max="0.6" step="0.01" /></label><span class="val" data-val="duckRatio"></span></div>
+            <div class="row"><label>恢复延迟 <input type="range" data-set="duckRecoverMs" min="300" max="3000" step="100" /></label><span class="val" data-val="duckRecoverMs"></span></div>
             <div class="row"><label><input type="checkbox" data-set="showOriginal" /> 显示原文</label></div>
             <div class="row"><label>字号 <input type="range" data-set="fontSize" min="14" max="32" step="1" /></label><span class="val" data-val="fontSize"></span></div>
             <div class="row"><span class="row-label">位置</span><span class="seg"><button type="button" data-act="dock-bottom">底部</button><button type="button" data-act="dock-top">顶部</button></span></div>
             <div class="row"><label>避让 <input type="range" data-set="offsetY" min="-200" max="320" step="10" /></label><span class="val" data-val="offsetY"></span></div>
             <div class="row"><label>背景 <select data-set="subsBg"><option value="dark">深色</option><option value="light">浅色</option><option value="none">无背景</option></select></label></div>
             <div class="row"><label>不透明度 <input type="range" data-set="subsOpacity" min="0.2" max="1" step="0.02" /></label><span class="val" data-val="subsOpacity"></span></div>
+            <div class="row"><label><input type="checkbox" data-set="fullscreenWorkaround" /> video 全屏兼容（包裹容器）</label></div>
             <div class="livedub-guide" data-part="guide" hidden>
               <div class="guide-title" data-part="guide-title"></div>
               <div class="guide-body" data-part="guide-body"></div>
@@ -618,6 +682,8 @@
     });
     document.addEventListener('fullscreenchange', onFullscreenChange, true);
     document.addEventListener('webkitfullscreenchange', onFullscreenChange, true);
+    // v0.3：MAIN world page-hook 的包裹/回退通知
+    window.addEventListener('message', onPageHookMessage);
   }
 
   function togglePanel(force) {
@@ -673,6 +739,9 @@
     if (key === 'fontSize') value = Math.round(clampNumber(value, 14, 32, 22));
     if (key === 'offsetY') value = Math.round(clampNumber(value, OFFSET_Y_MIN, OFFSET_Y_MAX, 0));
     if (key === 'subsOpacity') value = clampNumber(value, 0.2, 1, 0.82);
+    if (key === 'duckRecoverMs') {
+      value = Math.round(clampNumber(value, DUCK_RECOVER_MS_MIN, DUCK_RECOVER_MS_MAX, 800));
+    }
     const valueEl = runtime.els.panel && runtime.els.panel.querySelector(`[data-val="${key}"]`);
     if (valueEl) valueEl.textContent = formatSettingValue(key, value);
     void saveSettings({ [key]: value });
@@ -851,6 +920,11 @@
   }
 
   function duckStart() {
+    // v0.3 主方案：offscreen 原声总线 GainNode 已负责压音；content 只在兜底模式下改 volume
+    if (runtime.settings.globalDuck !== false) {
+      restoreVolumes();
+      return;
+    }
     const fresh = collectMedia();
     if (!runtime.duck.ducking) {
       runtime.duck.ducking = true;
@@ -863,6 +937,10 @@
   }
 
   function duckActivity() {
+    if (runtime.settings.globalDuck !== false) {
+      restoreVolumes();
+      return;
+    }
     if (!runtime.duck.ducking) {
       duckStart();
       return;
@@ -1074,6 +1152,12 @@
     if (providers) lines.push(`引擎 ${providers}`);
     if (voice) lines.push(`音色 ${voice}`);
     if (language) lines.push(`语言 ${language}`);
+    const audioMode = runtime.settings.captureReplay !== false
+      ? runtime.settings.globalDuck !== false
+        ? '原声重放 · 全局压音'
+        : '原声重放 · 页面音量兜底'
+      : '原声关闭（只听配音）';
+    lines.push(`原声 ${audioMode}`);
     const latency = latencyBreakdownLines();
     if (latency.length > 0) lines.push(`延迟 ${latency.join(' · ')}`);
     const count = (runtime.bgState && runtime.bgState.captionCount) || 0;
@@ -1390,6 +1474,7 @@
 
   async function main() {
     ensureMounted();
+    postPageHookConfig();
     await loadSettings();
     startObservers();
     announceReady();

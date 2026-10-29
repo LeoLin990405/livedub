@@ -15,3 +15,6 @@ demo/*.aiff
 demo-fast/
 .env
 .env.*
+demo-cloud/
+apps/macos/build/
+apps/macos/.build/

@@ -3,6 +3,29 @@
 All notable changes to livedub are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/), versioning: [SemVer](https://semver.org/).
 
+## [0.3.0] - 2026-10-29
+
+「全部补齐」版本：云端 ASR、火山声音复刻、macOS 桌面悬浮窗、全局限定压音、裸视频全屏。
+
+### Added
+
+- **云端 ASR（MiniMax asr-1.0）**：新增 `minimax-cloud` ASR provider，VAD 切句后整段上传（4s≈0.79s / 12s≈1.0-1.2s），
+  失败自动降级本地 whisper；新增 `cloud` 档位（`npm run start:cloud` / `batch:cloud`），工作台显示上云隐私提示。
+- **火山引擎 TTS + 声音复刻**：新增 `volcengine` TTS provider（v3 流式 PCM + `voice_clone` v3），
+  支持真正的讲师音色克隆（需豆包语音控制台 UUID Key，缺失时给出可读提示并降级 preset）。
+- **macOS 桌面悬浮窗**（`apps/macos/`）：ScreenCaptureKit 抓系统/应用音频 + 原生透明字幕浮层 + 中文配音，
+  覆盖 Zoom/腾讯会议/本地播放器等浏览器外场景；含 `--simulate` 演示模式与 `--self-test`。
+- **扩展全局限定压音**：tabCapture 原声经 GainNode 回放并平滑 duck —— iframe/WebAudio 站点也能压原声。
+- **裸视频全屏叠加**：content script 可选包装裸 `<video>` 再全屏，解决原生 video 全屏无法叠加 DOM 的限制。
+- 工作台：ASR 引擎切换（本地/云端）、隐私提示、桌面 App 入口、`GET/PUT /api/settings`。
+- CI 增加 macOS 构建/自检 job；新增 `scripts/build-macos.sh --check`。
+
+### Changed
+
+- 工作台新增 `GET/PUT /api/settings`（白名单 asr.provider/tts.voiceMode/dub.enabled，下一次会话生效）与隐私提示。
+- 延迟档位三档：默认（本地 large）~3.0s、快速（本地 small）~2.4s、**云端（MiniMax ASR）~2.2–2.4s**（52.7s 示例课两次实测：2204/2385ms）。
+- 版本 0.3.0。
+
 ## [0.2.0] - 2026-10-29
 
 性能与体验迭代 + 开源发布。

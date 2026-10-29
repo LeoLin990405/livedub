@@ -129,3 +129,43 @@
 本机 52.7s 示例课实测（M2 / 16GB）：ASR 中位 1.8s、翻译首字 0.8s、TTS 首包 0.25s、**e2e 中位 3.0s**（快速档 2.4s）；
 逐句表格、失败的 speculative-final 实验与 partial A/B 数据见 [MEASUREMENTS.md](MEASUREMENTS.md)。
 调参（VAD 阈值、partial 间隔、TTS 切块长度、调度阈值）后重跑即可对比。
+
+## 10. v0.3 新增组件
+
+### 10.1 云端 ASR（MiniMax asr-1.0）
+
+- 新 provider `minimax-cloud`（`engine/asr/minimax-cloud.mjs`）：仍用本地 VAD 切句，每个 final 段上传 WAV（16k mono）到
+  `POST /v1/speech_to_text`（multipart `model=asr-1.0`，可选 `language` header），解析 `{ text }`。
+- 延迟：4s 音频 ≈0.79s、12s ≈1.0–1.2s（含上传/网络），比本地 whisper 的 ~1.4s 快。
+- **隐私**：音频会上传。默认档仍是本地 whisper；云端档需显式 `LIVEDUB_PROFILE=cloud` / `npm run start:cloud`，工作台显示隐私提示。
+- 失败降级：网络/401/超时/空文本 → 本段自动切 `asr.fallback`（本地 whisper 懒创建），连续失败熔断；云端可用时后台可预热本地兜底。
+
+### 10.2 火山引擎 TTS + 声音复刻 v3（真正原声克隆）
+
+- provider `volcengine`（`engine/tts/index.mjs`）：
+  - TTS v3：`POST /api/v3/tts/unidirectional`，NDJSON 流式（`data` base64 → PCM 24k），`X-Api-Resource-Id` 按音色代际自动推断；
+  - 声音复刻 v3：`POST /api/v3/tts/voice_clone`（`speaker_id` + 讲师音频 base64 WAV），status=2/4 可用、1=训练中；
+  - 凭据必须是**豆包语音控制台 UUID Key**（方舟 `ark-` Key 不适用，实测 401）。
+- `engine/voice.mjs` 克隆候选链 `tts.clone.chain`（默认 minimax → volcengine）：逐家尝试、失败只记一次原因，全失败降级 preset；`voice` 事件带每家原因。
+
+### 10.3 macOS 桌面悬浮窗（ScreenCaptureKit 原生 App）
+
+```text
+apps/macos/  Swift (无第三方依赖)
+  菜单栏 App ── SCStream 抓系统/应用音频（音频 only）
+             ── CMSampleBuffer → 16kHz mono s16le → 100ms 帧
+             ── URLSessionWebSocketTask → ws://127.0.0.1:8787/ws（线协议与浏览器端一致）
+             ← 事件：partial/segment/translation/dub/status/…
+  悬浮层：NSPanel（无边框/透明/置顶/可拖动/点击穿透），双语字幕两行 + 状态/延迟
+  配音：AVAudioEngine + AVAudioPlayerNode 调度 24k PCM（按 startMs 顺序）
+```
+
+覆盖 Zoom/腾讯会议/本地播放器等浏览器之外的场景；含 `--simulate`（无权限演示 UI）与 `--self-test`（协议/帧自检）。
+限制：系统音频不会被静音 → 原声与配音同时存在（可先静音播放器；后续可用虚拟声卡方案）。
+
+### 10.4 扩展：全局限定压音 + 裸视频全屏
+
+- Chrome `tabCapture` 会静音标签页本身，声音只在 capture stream 中：offscreen 把原声经 GainNode 回放，
+  `status=speaking` 时 160ms 渐变 duck 到设定比例，空闲恢复 → **iframe / WebAudio 站点也能压原声**（不再依赖 DOM 音量）。
+- 裸 `<video>` 原生全屏无法叠加 DOM：content script 在 MAIN world 猴补 `requestFullscreen`，对替换元素先包一层容器再对容器全屏；
+  退出/失败自动回滚（`settings.fullscreenWorkaround`，默认开）。

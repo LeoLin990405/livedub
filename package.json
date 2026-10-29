@@ -1,6 +1,6 @@
 {
   "name": "livedub",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "private": true,
   "type": "module",
   "description": "本地优先的实时同传引擎：看教学视频时流式 ASR -> 增量翻译 -> 克隆音色配音 + 双语字幕（Chrome 扩展 + 本地工作台，零运行时依赖）",
@@ -21,7 +21,12 @@
     "check": "node scripts/lint.mjs && node --test tests/*.test.mjs",
     "start:fast": "LIVEDUB_PROFILE=fast node engine/server.mjs",
     "batch:fast": "LIVEDUB_PROFILE=fast node scripts/batch.mjs --out demo-fast --no-burn",
-    "demo:fast": "LIVEDUB_PROFILE=fast node scripts/batch.mjs --out demo-fast"
+    "demo:fast": "LIVEDUB_PROFILE=fast node scripts/batch.mjs --out demo-fast",
+    "start:cloud": "LIVEDUB_PROFILE=cloud node engine/server.mjs",
+    "batch:cloud": "LIVEDUB_PROFILE=cloud node scripts/batch.mjs --out demo-cloud --no-burn",
+    "demo:cloud": "LIVEDUB_PROFILE=cloud node scripts/batch.mjs --out demo-cloud",
+    "build:macos": "bash scripts/build-macos.sh",
+    "test:macos": "node --test tests/macos.test.mjs"
   },
   "license": "MIT",
   "keywords": [

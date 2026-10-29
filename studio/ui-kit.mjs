@@ -120,3 +120,115 @@ export function buildSparklineArea(values, { width = 240, height = 44, pad = 3 }
   const lastX = last.split(',')[0];
   return { ...line, areaPoints: `${firstX},${round2(baseline)} ${line.points} ${lastX},${round2(baseline)}` };
 }
+
+// =============================================================== v0.3
+// ASR 引擎选择 / 隐私文案 / 桌面 App 引导 / 设置补丁（供工作台与测试复用）
+
+/** 工作台可选的 ASR 引擎（与 server ASR_ENGINE_META 的展示字段保持一致） */
+export const ASR_ENGINE_OPTIONS = Object.freeze([
+  {
+    id: 'whisper-local',
+    label: '本地 whisper',
+    shortLabel: '本地',
+    cloud: false,
+    privacyTitle: '音频不离开本机',
+    privacyDetail: '本地 whisper 识别，音频与字幕只在你的电脑内处理，不上传云端。',
+  },
+  {
+    id: 'minimax-cloud',
+    label: '云端 MiniMax',
+    shortLabel: '云端',
+    cloud: true,
+    privacyTitle: '音频会上传到 MiniMax',
+    privacyDetail: '云端语音识别会把音频上传到 MiniMax 用于转写；不经过浏览器厂商等其它第三方。',
+  },
+]);
+
+/** ASR provider 规范化：未知值回退本地 whisper（工作台只展示两种） */
+export function normalizeAsrEngine(value, fallback = 'whisper-local') {
+  const raw = typeof value === 'string' ? value.trim() : '';
+  if (ASR_ENGINE_OPTIONS.some((engine) => engine.id === raw)) return raw;
+  return ASR_ENGINE_OPTIONS.some((engine) => engine.id === fallback) ? fallback : 'whisper-local';
+}
+
+/** ASR 引擎展示名；mock/未知值给出可读名称 */
+export function asrEngineLabel(value) {
+  const provider = typeof value === 'string' && value.trim() ? value.trim() : 'whisper-local';
+  if (provider === 'mock') return 'Mock（开发用）';
+  return ASR_ENGINE_OPTIONS.find((engine) => engine.id === provider)?.label ?? provider;
+}
+
+/** 隐私文案：{ tone:'local'|'cloud', title, detail, cloud } */
+export function asrPrivacyCopy(value) {
+  const provider = normalizeAsrEngine(value);
+  const engine = ASR_ENGINE_OPTIONS.find((item) => item.id === provider) ?? ASR_ENGINE_OPTIONS[0];
+  return {
+    tone: engine.cloud ? 'cloud' : 'local',
+    cloud: Boolean(engine.cloud),
+    title: engine.privacyTitle,
+    detail: engine.privacyDetail,
+  };
+}
+
+/** 桌面 App 入口文案：已构建 -> open 命令；未构建 -> build 命令 */
+export function desktopAppInstructions(desktopApp = {}) {
+  const available = Boolean(desktopApp?.available);
+  const appPath = String(desktopApp?.appPath ?? 'apps/macos/build/livedub.app');
+  const buildCommand = String(desktopApp?.buildCommand ?? 'bash scripts/build-macos.sh');
+  const openCommand = String(desktopApp?.openCommand ?? `open ${appPath}`);
+  if (available) {
+    return {
+      available: true,
+      badge: '已构建',
+      title: '桌面 App 已就绪',
+      command: openCommand,
+      commandLabel: '启动命令',
+      hint: String(desktopApp?.hint ?? '双击 .app，或在终端运行 open 命令启动桌面版；桌面版会复用本机 127.0.0.1 引擎。'),
+      tone: 'ok',
+    };
+  }
+  return {
+    available: false,
+    badge: '未构建',
+    title: '桌面 App 未构建',
+    command: buildCommand,
+    commandLabel: '构建命令',
+    hint: String(
+      desktopApp?.hint ??
+        '在项目根目录运行构建命令生成 apps/macos/build/livedub.app；需要 macOS + Xcode Command Line Tools。',
+    ),
+    tone: 'warn',
+  };
+}
+
+/** 把工作台选择组装成 PUT /api/settings 的白名单补丁（空字段自动省略） */
+export function buildSettingsPatch({ asrProvider, ttsVoiceMode, dubEnabled } = {}) {
+  const patch = {};
+  if (typeof asrProvider === 'string' && ASR_ENGINE_OPTIONS.some((engine) => engine.id === asrProvider)) {
+    patch.asr = { provider: asrProvider };
+  }
+  if (ttsVoiceMode === 'clone-first' || ttsVoiceMode === 'preset') {
+    patch.tts = { voiceMode: ttsVoiceMode };
+  }
+  if (typeof dubEnabled === 'boolean') {
+    patch.dub = { enabled: dubEnabled };
+  }
+  return patch;
+}
+
+/** 从 /api/settings 响应合并出工作台状态（server 值优先，缺失回退 defaults） */
+export function mergeSettingsSnapshot(snapshot = {}, defaults = ASR_ENGINE_OPTIONS[0].id) {
+  const settings = snapshot?.settings ?? {};
+  const overrides = snapshot?.overrides ?? {};
+  const voiceMode = settings?.tts?.voiceMode === 'clone-first' || settings?.tts?.voiceMode === 'preset' ? settings.tts.voiceMode : 'clone-first';
+  return {
+    asrProvider: normalizeAsrEngine(settings?.asr?.provider ?? overrides?.asr?.provider, normalizeAsrEngine(defaults)),
+    ttsVoiceMode: voiceMode,
+    dubEnabled: settings?.dub?.enabled !== false,
+    overrides,
+    updatedAt: snapshot?.updatedAt ?? null,
+    fileExists: Boolean(snapshot?.fileExists),
+    warnings: Array.isArray(snapshot?.warnings) ? snapshot.warnings : [],
+    asrEngine: snapshot?.asrEngine ?? null,
+  };
+}

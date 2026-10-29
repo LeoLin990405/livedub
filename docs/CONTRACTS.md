@@ -193,6 +193,22 @@ createScheduler({ config, log }) -> {
 4. 任务板上认领自己的 task（team_task_get/update），完成就 complete。
 5. 不要 kill 别人的进程；不要占用 8787/18765 端口做测试。
 
+## 7.5 工作台设置 API（v0.3，HTTP）
+
+引擎（`engine/server.mjs`）提供只影响**之后建立的会话**的 UI 设置：
+
+- `GET /api/settings` → `{ok, version:1, path, fileExists, updatedAt, overrides, settings, defaults, asrEngine, desktopApp, warnings}`
+- `PUT /api/settings`：body `{settings:{asr?:{provider},tts?:{voiceMode},dub?:{enabled}}}`（也接受裸 patch）
+  - 白名单：`asr.provider ∈ {whisper-local, minimax-cloud, mock}`、`tts.voiceMode ∈ {clone-first, preset}`、`dub.enabled:boolean`
+  - 非法值/未知字段/坏 JSON → 400；>16KB → 413；落盘 `data/ui-settings.json`（0600，仅白名单，无密钥）
+- 生效：下一次 WS `hello` 建会话时注入 `options.overrides`（客户端 `hello.overrides` 优先级更高）；已建立会话不变。
+- `/health` 的 `providers.asr` 为「生效的 ASR 引擎」（含 UI 选择），另有 `asrEngine`（privacy local/cloud、engines、fallback）
+  与 `desktopApp`（macOS bundle 是否构建）、`uiSettings`。
+
+v0.3 新增 provider（均按 §4 契约）：ASR `minimax-cloud`（`asr.minimaxCloud.*`、`asr.fallback`）；
+TTS `volcengine`（`providers.volcengine`、`tts.volcengine.*`、`tts.clone.chain`，含 `cloneVoice`/`voiceCloneStatus`）。
+macOS 桌面 App（`apps/macos/`）是线协议 §3 的另一个客户端，行为与浏览器端一致。
+
 ## 8. 已知坑（别重复踩）
 
 - `~/.sayless/models/` 目录在本机曾消失，`ggml-large-v3-turbo.bin` 已不可用；用项目内 `models/ggml-large-v3-turbo-q5_0.bin`。

@@ -85,6 +85,14 @@ export const DEFAULT_SETTINGS = Object.freeze({
   subsOpacity: 0.82,
   /** 字幕背景：dark | light | none */
   subsBg: 'dark',
+  /** v0.3：offscreen 是否把抓到的原声重放给用户（tabCapture 会静音标签页，关闭=只听配音） */
+  captureReplay: true,
+  /** v0.3：全局限定压音（offscreen 对重放原声做 GainNode duck，覆盖 iframe/WebAudio 站点） */
+  globalDuck: true,
+  /** v0.3：说话结束后多少 ms 恢复原声（300~3000，duck 渐变 120-200ms） */
+  duckRecoverMs: 800,
+  /** v0.3：裸 <video> 全屏兼容（拦截站点 requestFullscreen 包一层容器） */
+  fullscreenWorkaround: true,
   langFrom: 'en',
   langTo: 'zh',
   /** 是否隐藏浮层（从 popup 可重新打开） */

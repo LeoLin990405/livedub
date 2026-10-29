@@ -37,3 +37,12 @@ npm start
 - `docs/assets/replay-real-session.png` —— 离线回放页（334 个真实事件、12 句字幕、91 段配音）
 - `docs/assets/demo-bilingual-subtitled.png` —— `dubbed.mp4` 中的一帧（底部双语字幕卡片）
 - `docs/assets/demo-original.png` —— 原始视频同一帧（无字幕）
+
+## 云端档证据（v0.3）
+
+`demo/cloud/` 是 `npm run batch:cloud`（MiniMax 云端 ASR）的真实产物摘要：
+
+- `demo/cloud/metrics.json` — 云端档逐句延迟（e2e 中位 ~2.2–2.4s）
+- `demo/cloud/bilingual.srt` — 云端 ASR + 翻译的字幕
+
+完整成片与小节见 `docs/MEASUREMENTS.md` 的「云端档」。

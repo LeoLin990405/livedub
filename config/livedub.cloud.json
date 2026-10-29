@@ -1,0 +1,16 @@
+{
+  "_comment": "LIVEDUB_PROFILE=cloud：ASR 走 MiniMax 云端（音频会上传，需要 ~/.sayless providers.minimax Key），延迟更低；失败自动降级本地 whisper。",
+  "asr": {
+    "provider": "minimax-cloud",
+    "fallback": "whisper-local",
+    "minimaxCloud": {
+      "model": "asr-1.0",
+      "timeoutMs": 20000,
+      "languageHeader": true,
+      "partial": {
+        "enabled": false,
+        "mode": "final-only"
+      }
+    }
+  }
+}

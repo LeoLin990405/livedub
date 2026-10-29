@@ -12,9 +12,9 @@
 > 面向**教学视频**（公开课/网课/技术讲座）优化：术语表约束、子句级低延迟配音、原声自动压音。
 >
 
-**v0.2（2026-10-29）**：翻译流式 × TTS 重叠、TTS 预热/LRU 缓存、成片时轴修正；
-工作台明暗主题/字幕预设/快捷键/延迟趋势/JSONL 导出；扩展原生全屏浮层/SRT 导出/断连引导；
-服务端会话上限与优雅退出；**实测 e2e 3.4s → 3.0s（快速档 2.4s）**；MIT 开源。详见 [CHANGELOG](CHANGELOG.md)。
+**v0.3（2026-10-29）**：新增 **云端 ASR（MiniMax，e2e ~2.2s）**、**火山引擎 TTS + 声音复刻（真正原声克隆）**、
+**macOS 桌面悬浮窗（ScreenCaptureKit，覆盖 Zoom/会议/播放器）**、扩展**全局限定压音**（iframe/WebAudio 可压）、
+**裸 video 全屏叠加**；工作台支持本地/云端 ASR 切换与隐私提示。v0.2 的翻译×TTS 重叠、TTS 缓存、三档延迟等见 [CHANGELOG](CHANGELOG.md)。
 > 形态：Chrome 扩展（任意网页视频） + 本地工作台（本地课程文件 / 回放 / 导出）。
 
 ```text
@@ -25,7 +25,7 @@ YouTube / B站 / 网课页面       本地引擎 (127.0.0.1)               输�
 │ 本地工作台        │ ◀────────── │ → 流式 TTS（MiniMax）       │   │ 原声自动压低（ducking）     │
 └──────────────────┘   WS 事件    │ → 调度/压音/字幕/指标        │   └──────────────────────────┘
                                   └───────────────────────────┘
-              实测：语音结束后 ~3.0s 出中文配音（快速档 ~2.4s，见 docs/MEASUREMENTS.md）
+       实测：语音结束后 ~3.0s（快速档 ~2.4s / 云端档 ~2.2s）出中文配音，见 docs/MEASUREMENTS.md
 ```
 
 ## 它解决什么问题
@@ -43,7 +43,9 @@ YouTube / B站 / 网课页面       本地引擎 (127.0.0.1)               输�
 | ASR | 本地 `whisper-server`（large-v3-turbo q5，常驻进程） | 29.4s 音频热推理 **≈1.4s**（RTF≈0.05），离线、不上传声音 |
 | 翻译 | OpenAI 兼容流式 LLM，默认 `deepseek-flash`，可配置 failover 链 | 首字 **≈1.0s** |
 | TTS | MiniMax `speech-2.8-hd` 流式（PCM），默认男声讲师音色 | 短句首包 **≈1.1–1.5s** |
-| 音色克隆 | 优先免费申请克隆讲师音色；失败自动降级 preset 并给出原因 | 当前 MiniMax Token Plan 不支持克隆（API 明确返回 2061），**已实现自动降级**；换按量付费 key 即生效 |
+| 音色克隆 | 火山声音复刻 v3 / MiniMax / 自动降级 preset | 协议已实现（火山需豆包语音 UUID Key，目前本机无此 Key，真机验证了 401→降级路径）；MiniMax Token Plan 返回 2061 自动降级 |
+| 云端 ASR | MiniMax `asr-1.0`（`npm run start:cloud`） | 4s≈0.79s / 12s≈1.0-1.2s；**云端档 e2e ≈2.2–2.4s**，音频会上传、失败自动降级本地 |
+| 桌面端 | macOS 原生悬浮窗（ScreenCaptureKit） | `apps/macos/` 源码 + `scripts/build-macos.sh`（见 [apps/macos/README.md](apps/macos/README.md)） |
 | 管线 | Node 零依赖引擎，VAD 切分 + 子句级 TTS + 调度压音 | 52.7s 示例课实测：**质量档 e2e 3.0s** / **快速档 2.4s**（ASR 1.8s→0.9s、翻译首字 0.8s、TTS 首包 0.25s；[完整数据](docs/MEASUREMENTS.md)） |
 
 > ⚠️ 声音克隆能力取决于你的 TTS 服务套餐（MiniMax 按量付费 / 火山语音复刻等）。livedub 的原则是：**克隆能通就用克隆，不能通也保证同传可用**，不会因为克隆失败让整条链路挂掉。
@@ -53,6 +55,10 @@ YouTube / B站 / 网课页面       本地引擎 (127.0.0.1)               输�
 | 本地工作台（真实链路回放，HUD 为实测延迟） | 成片：中文配音 + 烧录双语字幕 |
 |---|---|
 | ![studio](docs/assets/studio-real-session.png) | ![dubbed](docs/assets/demo-bilingual-subtitled.png) |
+
+| 本地/云端 ASR 切换 + 隐私提示 | macOS 桌面悬浮窗（任意应用之上） |
+|---|---|
+| ![asr](docs/assets/studio-asr-cloud.png) | ![macos](docs/assets/macos-app-overlay.png) |
 
 | 亮色主题 | 仅字幕模式 |
 |---|---|
@@ -126,6 +132,21 @@ npm start
 ```bash
 npm run start:fast      # 工作台，等价于 LIVEDUB_PROFILE=fast npm start
 npm run batch:fast      # 成片批处理，输出到 demo-fast/
+```
+
+最低延迟「云端档」（ASR 走 MiniMax 云端，**e2e ~2.2–2.4s**；音频会上传，失败自动降级本地）：
+
+```bash
+npm run start:cloud     # 工作台，等价于 LIVEDUB_PROFILE=cloud npm start
+npm run batch:cloud     # 成片批处理，输出到 demo-cloud/
+```
+
+macOS 桌面悬浮窗（抓系统/应用音频，覆盖 Zoom/腾讯会议/本地播放器）：
+
+```bash
+bash scripts/build-macos.sh   # 生成 apps/macos/build/livedub.app
+open apps/macos/build/livedub.app
+# 首次使用在 系统设置 → 隐私与安全 → 屏幕录制 中授权
 ```
 
 完整实测数字、逐句延迟、模型对比见 [docs/MEASUREMENTS.md](docs/MEASUREMENTS.md)。

@@ -207,3 +207,86 @@ export function normalizeDisplaySettings(raw = {}) {
     panelCollapsed: source.panelCollapsed === true,
   };
 }
+
+// ---------------------------------------------------------------------------
+// v0.3：全局限定压音（offscreen 原声 GainNode）+ 裸 video 全屏包裹
+// ---------------------------------------------------------------------------
+
+/** duck / 恢复的平滑渐变时长（毫秒，契约 120-200ms） */
+export const DUCK_RAMP_MS = 160;
+export const DUCK_RECOVER_MS_MIN = 300;
+export const DUCK_RECOVER_MS_MAX = 3000;
+
+/** 恢复延迟（ms） */
+export function clampDuckRecoverMs(value) {
+  return Math.round(clampNumber(value, DUCK_RECOVER_MS_MIN, DUCK_RECOVER_MS_MAX, 800));
+}
+
+/**
+ * offscreen 原声重放 GainNode 的目标增益（0~1）。
+ * - captureReplay=false：原声完全不重放（标签页已被 Chrome 静音，等于只听配音）；
+ * - globalDuck 开且正在 ducking：压到 duckRatio（iframe/WebAudio 站点同样生效）；
+ * - 其他：1（原声正常）。
+ * @param {{captureReplay?:boolean, globalDuck?:boolean, ducking?:boolean, duckRatio?:number}} [opts]
+ * @returns {number}
+ */
+export function resolveReplayGain({ captureReplay = true, globalDuck = true, ducking = false, duckRatio = 0.18 } = {}) {
+  if (captureReplay === false) return 0;
+  if (globalDuck !== false && ducking === true) return clampDuckRatio(duckRatio);
+  return 1;
+}
+
+/**
+ * 站点 JS 调用 element.requestFullscreen 时的处理决策。
+ * 只对「无法承载 DOM 子节点的元素」（裸 <video>/<canvas>/<iframe> 等）做包裹；
+ * 容器型元素保持原生行为（content script 的 fullscreenchange 迁移已经够用）。
+ *
+ * @param {{requestedTagName?:string, workaroundEnabled?:boolean, currentFullscreenTagName?:string}} opts
+ * @returns {{mode:'native'|'wrapper', reason:string}}
+ */
+export function planFullscreenRequest({
+  requestedTagName = '',
+  workaroundEnabled = true,
+  currentFullscreenTagName = '',
+} = {}) {
+  const tag = String(requestedTagName || '').toUpperCase();
+  if (workaroundEnabled === false) return { mode: 'native', reason: 'disabled' };
+  if (currentFullscreenTagName) return { mode: 'native', reason: 'already-fullscreen' };
+  if (!tag) return { mode: 'native', reason: 'unknown-element' };
+  if (isHostableFullscreenElement({ nodeType: 1, tagName: tag })) return { mode: 'native', reason: 'hostable-element' };
+  return { mode: 'wrapper', reason: 'non-hostable-element' };
+}
+
+/**
+ * 退出全屏/异常后的 DOM 恢复决策。
+ * @param {{wrapperActive?:boolean, wrapperConnected?:boolean, videoConnected?:boolean}} opts
+ * @returns {{action:'none'|'forget'|'drop-wrapper'|'unwrap', moveVideoBack?:boolean}}
+ */
+export function planFullscreenRestore({ wrapperActive = false, wrapperConnected = false, videoConnected = false } = {}) {
+  if (!wrapperActive) return { action: 'none' };
+  if (!wrapperConnected) return { action: 'forget' };
+  if (!videoConnected) return { action: 'drop-wrapper' };
+  return { action: 'unwrap', moveVideoBack: true };
+}
+
+/**
+ * 包裹层样式（MAIN world 的 page-hook 用；抽成纯函数便于单测/复用）。
+ * 进入全屏前覆盖视口，避免 wrap 与 requestFullscreen 之间的闪烁。
+ * @returns {string}
+ */
+export function buildFullscreenWrapperStyle() {
+  return [
+    'position: fixed',
+    'inset: 0',
+    'z-index: 2147483646',
+    'background: #000',
+    'display: flex',
+    'align-items: center',
+    'justify-content: center',
+  ].join('; ');
+}
+
+/** 被包裹的 video 在内层铺满容器的样式 */
+export function buildWrappedVideoStyle() {
+  return 'width: 100%; height: 100%; object-fit: contain;';
+}

@@ -9,12 +9,25 @@
 
 v0.2 迭代（日常可用性）：
 - **原生全屏兼容**：容器型全屏（YouTube/B 站播放器）时浮层自动迁入 `document.fullscreenElement`，退出恢复；
-  `<video>` 直接全屏受浏览器限制无法叠加 DOM，会给出提示；
+  `<video>` 直接全屏受浏览器限制无法叠加 DOM（v0.3 起用 page-hook 包裹容器尽力解决）；
 - **字幕停靠/避让**：底部/顶部停靠、Y 偏移（避让平台原生字幕）、横向拖动、深/浅/无背景、背景不透明度、字号，全部持久化；
 - **导出本次 SRT**：客户端累积 segment+translation，按会话时间轴生成双语 SRT 并下载；
 - **引擎未连接引导**：`npm start` 步骤、`/health` 检测、一键重试连接；
 - **状态信息**：provider / 音色 / 语言方向、ASR/翻译/配音/端到端延迟细分；
 - 设置面板可拖拽、可收起；结束会话恢复所有压音元素并清理 offscreen。
+
+v0.3 迭代（消除两个已知限制）：
+- **全局限定压音（核心）**：tabCapture 会让标签页本身静音，声音只存在于 capture stream 里。
+  offscreen 用 `AudioContext` 把抓到的原声经 **GainNode 原声总线**重放给用户；引擎 `status=speaking` /
+  收到 `dub` 时把该 GainNode 以 **160ms 线性渐变** duck 到设置比例（默认 0.18），说话结束
+  `duckRecoverMs`（默认 800ms）后渐变恢复。因为压的是「抓到的标签页音频」本身，
+  **iframe 播放器 / WebAudio 直出音频的站点也能压原声**，不再依赖 content 改 `<video>.volume`。
+  content 层音量方案保留为兜底（开启全局限定压音时自动让位，避免双重压音）。
+  新增设置：原声重放开/关、全局限定压音开关、duck 比例、恢复延迟。
+- **裸 `<video>` 原生全屏兼容（尽力）**：MAIN world 的 `page-hook.js` 猴补
+  `Element.prototype.requestFullscreen`：站点 JS 对裸 video 请求全屏时，先把它包进一个覆盖视口的
+  `<div data-livedub-fullscreen-wrapper>` 再对容器全屏，content script 的浮层迁移逻辑因此可见；
+  退出全屏/失败自动回滚 DOM 并回退原生全屏。设置项 `fullscreenWorkaround` 默认开。
 
 > 协议、时间轴、事件定义见 `docs/CONTRACTS.md` §3；引擎入口 `engine/server.mjs`。
 > 本目录零 npm 依赖、无远程代码 / CDN / 内联脚本，所有资源随扩展本地打包。
@@ -25,8 +38,9 @@ v0.2 迭代（日常可用性）：
 extension/
 ├── manifest.json          # MV3 清单：权限 / content script / popup / service worker
 ├── background.js          # service worker（module）：开始/停止、offscreen 生命周期、事件转发、状态
-├── offscreen.html/js      # 隐藏页面：tabCapture 消费、AudioWorklet 16k PCM、WS、配音播放
-├── content.js             # classic content script：Shadow DOM 浮层、双语字幕、状态胶囊、压音
+├── offscreen.html/js      # 隐藏页面：tabCapture 消费、AudioWorklet 16k PCM、WS、配音播放、原声总线压音
+├── page-hook.js           # v0.3 MAIN world：裸 <video> requestFullscreen 包裹兼容（尽力而为）
+├── content.js             # classic content script：Shadow DOM 浮层、双语字幕、状态胶囊、压音兜底
 ├── popup.html/js          # 工具栏弹窗：引擎地址、开始/停止、音色模式、延迟、错误
 ├── lib/
 │   ├── constants.js       # 共享常量：默认地址 / storage key / 消息类型 / 设置默认值 / URL 规范化
@@ -64,6 +78,10 @@ tests/extension.test.mjs   # manifest / 静态检查 / 纯函数单测（node --
 | `activeTab` | 用户点击扩展图标/快捷键后临时获得当前标签页访问（注入浮层所需） |
 | `scripting` | 对「扩展加载前就已打开」的旧标签页兜底注入 `content.js` |
 
+content script 有两条：`page-hook.js` 运行在 `world: "MAIN"` / `document_start`，只做裸 `<video>` 全屏包裹兼容；
+`content.js` 运行在默认 ISOLATED world / `document_idle`，负责浮层 UI 与压音兜底 —— 两者通过
+`window.postMessage`（source 白名单）协作，互不共享权限。
+
 `host_permissions: http://127.0.0.1/*, http://localhost/*` 只用于连接本地引擎 / 打开本地工作台，**不会访问外网**。
 扩展不使用任何远程代码（无 `<script src="http…">`、无 CDN、无 `eval`），符合 MV3 CSP。
 
@@ -82,10 +100,16 @@ offscreen: getUserMedia(tab) ─▶ 16k AudioContext + AudioWorklet（100ms）
 - 音频时间轴：`offscreen` 每段会话（含重连后的新会话）从第一帧 `tMs=0` 起算；`dub.startMs` 与该时间轴对齐。
 - 断线重连：指数退避 0.5s→1s→2s→4s→8s→10s（上限 10s），重连成功后重新发 `hello`、时间轴归零；断线期间的音频直接丢弃（实时同传不做长缓存）。
 - 停止：offscreen 先发 `{type:'control', action:'stop'}` 再关闭 WS / 音轨 / AudioContext，background 随后关闭 offscreen document。
-- 压音：content script 记录页面 `video/audio` 原始 `volume`，引擎状态 `speaking` 或收到 `dub` 时把音量设为 `原音量 × duckRatio`（默认 0.18），空闲 800ms 后恢复；停止/异常时全部恢复。
+- 压音：v0.3 主方案是 offscreen 对「抓到的标签页原声」做 GainNode duck（见下），content script 的 `video/audio.volume` 方案保留为兜底；两种方案都按 `duckRatio`（默认 0.18）压音、说话结束 `duckRecoverMs` 后恢复，停止/异常时全部恢复。
 - 全屏：监听 `fullscreenchange`，容器型全屏元素（`<div>` 播放器壳）可承载浮层，直接把同一个 Shadow DOM host 迁进去（`position:fixed` 仍相对视口），退出后迁回 `document.documentElement`；`<video>`/`<canvas>` 等替换元素自身全屏时浏览器不允许子节点渲染，浮层保持挂载但不显示，并弹提示。
 - SRT：background 累积 `segment`（t0Ms/t1Ms/src）+ `translation`（dst）到 `chrome.storage.session`（最多 400 句），
   导出时用 `lib/srt.js` 生成双语 SRT；content 浮层与 popup 都可触发下载。
+- 全局限定压音：原声链路 `capture stream -> monitorSource -> monitorGain(原声总线) -> destination`；
+  duck 状态机在 offscreen（`status`/`dub` 驱动，100ms tick 检查恢复），`captureReplay=false` 时总线增益为 0。
+  content 只在 `globalDuck=false` 时才改页面 `video/audio.volume`（兜底，仅顶层 frame 媒体）。
+- 全屏兼容包裹：page-hook（MAIN world）与 content 通过 `window.postMessage`（source `livedub-content` /
+  `livedub-page-hook`）同步 `fullscreenWorkaround` 开关；包裹层是 `<div>`，属于「可承载子节点」元素，
+  content 的 `fullscreenchange` 迁移会把浮层放进包裹层内。
 
 ## 排障（按顺序排查）
 
@@ -139,15 +163,29 @@ offscreen: getUserMedia(tab) ─▶ 16k AudioContext + AudioWorklet（100ms）
 | 21 | 引擎未启动时打开 popup | 显示「未连接本地引擎」引导（npm start / /health 步骤）；点「检测引擎」显示离线；启动引擎后点「重新检测」变在线 |
 | 22 | 运行中 kill 引擎，再重启 | 胶囊/popup 显示重连中；点「重试连接」立即重连；字幕恢复 |
 | 23 | 停止会话 | 页面音量全部恢复；offscreen document 关闭；字幕仍在（可继续导出本次 SRT） |
-| 24 | 在 `<video>` 元素被直接全屏的站点（如部分原生播放器）进入全屏 | 弹出「浏览器限制」提示；退出全屏后浮层恢复（诚实限制，见下） |
+| 24 | 在 `<video>` 元素被直接全屏的站点（如部分原生播放器）进入全屏 | v0.3 默认已启用「video 全屏兼容」：字幕浮层进入全屏可见；失败时回退原生并提示 |
+| 25 | 打开 **iframe 播放器** 的站点（如嵌入 YouTube/B 站），播放并开始同传 | 说话时原声被压低（全局限定压音生效）、结束后恢复；字幕正常（不再依赖 iframe 内 video.volume） |
+| 26 | 打开 **WebAudio 直出** 的站点（没有 `<video>/<audio>` 或音量不受 DOM 控制） | 原声同样被压低/恢复；content 面板「原声」行显示「原声重放 · 全局压音」 |
+| 27 | 设置里关闭「全局限定压音」 | 压音改由 content 改页面 `<video>.volume` 完成（顶层 frame 生效，iframe/WebAudio 站点不再压音） |
+| 28 | 设置里关闭「原声重放」 | 标签页原声完全静音（Chrome 抓音已静音），只听到中文配音；字幕仍正常 |
+| 29 | 调节「恢复延迟」300/800/3000ms | 说话结束后原声恢复的延迟随之变化，duck/恢复是渐变（约 160ms），无爆音 |
+| 30 | 对比：未开始同传时页面声音 vs 开始后 | 开始后声音只来自扩展的 offscreen 重放（音质不变），**不会出现双声**；若听到双声/无原声见排障 |
 
 ## 已知限制 / TODO
 
 - **无法自动化验证真实 tabCapture**：本机/CI 无法在无头环境点击扩展图标并播放真实视频，自动测试只做 manifest、静态检查、纯函数单测、线协议冒烟；音画同步、真实抓音、全屏/导出/SRT 下载必须按上面的手动清单验证。
-- **原生全屏的浏览器限制**：如果站点直接把 `<video>` 元素请求全屏（而不是播放器容器），浏览器只渲染该替换元素，任何扩展/脚本都无法在其上叠加 DOM；浮层此时不可见，会给出中文提示。YouTube/B 站等容器型全屏正常工作。
+- **原生全屏的浏览器限制（v0.3 尽力解决）**：容器型全屏（YouTube/B 站）一直正常；裸 `<video>` 全屏通过
+  page-hook 包裹容器解决，但以下情况会回退原生全屏（浮层不可见，并提示）：页面用非标准方式进入全屏
+  （浏览器原生控件、iOS `webkitEnterFullscreen`、跨进程 iframe 内部全屏）、站点异步/延迟调用
+  `requestFullscreen` 导致包裹失败、页面在包裹期间重建 video 元素。
 - **SRT 时间轴**：SRT 使用客户端会话时间轴（第一段音频为 0），不是视频文件自身的 `currentTime`；若需要与视频文件精确对齐，后续可用 `tMsBase`/视频时间戳扩展协议（当前契约未要求）。
 - SRT 只累积最近 400 句（约几十分钟），超长课程可分多次导出；刷新页面/重启扩展后 background 会从 `chrome.storage.session` 恢复上次累积。
-- 压音只作用于页面里可见的 `<video>/<audio>` 元素，且只在顶层 frame（manifest `all_frames: false`）：iframe 播放器（部分网课平台）与 Web Audio API 直出音频的站点不会被压音。
+- 压音：v0.3 起主方案是对抓取到的标签页音频做全局限定压音（iframe/WebAudio 都能压）；
+  兜底方案（关闭全局限定压音时）仍只作用于页面顶层 frame 的 `<video>/<audio>` 元素。
+- **双声/无原声说明**：Chrome `tabCapture` 抓取后标签页本地声音会被静音，所以正常只有 offscreen 一条原声输出，
+  不会双声；关闭「原声重放」= 完全静音原声只听配音。若站点通过系统级/独立进程输出音频（极少数 DRM 播放器、
+  桌面客户端内嵌页），抓音可能拿不到该声音，此时原声重放/压音对它无效（页面仍可能自己出声）。
+- 全局限定压音依赖 offscreen 的 AudioContext 处于 running；若浏览器挂起 offscreen 音频，会退化为页面音量兜底。
 - 克隆音色依赖引擎侧能力：当前 Token Plan 不支持 `voice_clone` 时会自动降级为预设音色（浮层/弹窗会提示降级原因）。
 - 同一时间只支持一个标签页抓音（`tabCapture` 会话为全局单例逻辑）；引擎地址修改对运行中的会话不生效，需停止后重新开始。
 - 无扩展图标 PNG（manifest 未声明 `icons`，Chrome 显示默认图标）；如需图标请另加 PNG 并在 manifest 声明。
@@ -168,7 +206,10 @@ node --test tests/extension.test.mjs
 - `lib/pcm.js` 纯函数：float32↔s16、s16le、48k→16k 重采样、二进制音频帧与 `engine/protocol.mjs` **字节级一致**、base64、hello 与 `normalizeHello` 兼容、文本清洗/截断、duck 状态机；
 - `lib/constants.js`：默认引擎地址、URL 规范化、工作台地址推导（/studio/）、健康检查地址、消息类型/设置默认值；
 - `lib/ui.js`：全屏宿主选择/迁移决策、字幕停靠/避让布局、背景/透明度/字号/压音规范化（含 v0.1 subsPos 迁移）；
+  v0.3 原声总线增益 `resolveReplayGain`、duck 恢复延迟钳制、裸 video 全屏包裹/恢复决策；
 - `lib/srt.js`：SRT 时间戳、caption 排序/防重叠/兜底时长、双语行折叠、文件名清洗与时间戳；
 - **线协议冒烟**：用 Node 起一个 `engine/ws.mjs` 回环服务，验证扩展的 `hello` + 二进制音频帧 + `control stop` 能被引擎解析；
 - `computeDubPlayhead`：dub 按 `startMs` 排期、落后立即播；
-- content/background/offscreen/popup 的关键实现静态断言（user gesture、offscreen reasons、Shadow DOM、压音 800ms 等）。
+- `page-hook.js`：MAIN world 猴补 `requestFullscreen`、裸 video 包裹/回滚、postMessage 协作协议；
+- content/background/offscreen/popup 的关键实现静态断言（user gesture、offscreen reasons、Shadow DOM、
+  v0.3 原声总线 duck/恢复、全局限定压音让位、压音 800ms 等）。

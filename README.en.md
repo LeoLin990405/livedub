@@ -11,7 +11,9 @@
 [![Node](https://img.shields.io/badge/node-%E2%89%A522-brightgreen.svg)](package.json)
 [![Zero dependencies](https://img.shields.io/badge/runtime%20deps-0-blue.svg)](package.json)
 
-![livedub studio](docs/assets/studio-real-session.png)
+![livedub studio](docs/assets/studio-asr-local.png)
+
+![macOS overlay](docs/assets/macos-app-overlay.png)
 
 ## What it does
 
@@ -21,21 +23,25 @@ Chinese — while showing bilingual subtitles and ducking the original audio.
 
 Two surfaces:
 
-- **Chrome extension** (MV3, `tabCapture`) — works with any web video: YouTube, Bilibili,
-  Coursera, edX, Udemy, university portals, local `file://` videos.
-- **Local workbench** (`studio/`) — open a local course video, watch with live subtitles +
-  dubbed audio, edit a glossary, export bilingual SRT, replay recorded sessions.
-- **Offline batch** (`scripts/batch.mjs`) — turn a video into a dubbed MP4 with burned-in
-  bilingual subtitles, plus SRT / metrics / replayable event stream.
+- **Chrome extension** (MV3, `tabCapture`) — any web video (YouTube, Bilibili, Coursera,
+  edX, Udemy, university portals, local `file://`); since v0.3 iframe/WebAudio players get
+  original-audio ducking too.
+- **Local workbench** (`studio/`) — local course video with live subtitles + dub, glossary,
+  SRT/event export, local/cloud ASR switch, session replay.
+- **macOS desktop overlay** (`apps/macos/`) — ScreenCaptureKit captures system/app audio and
+  shows a floating bilingual subtitle panel + Chinese dub over Zoom/Meetings/players.
+- **Offline batch** (`scripts/batch.mjs`) — video → dubbed MP4 with burned-in bilingual
+  subtitles + SRT + replayable event stream.
 
 Measured on this machine (Apple M2 / 16GB, 52.7s demo lecture, real providers):
 
 | Stage | Measured |
 |---|---|
-| ASR (local whisper large-v3-turbo, 8 threads, domain prompt) | final text ~2.1s after speech ends |
+| ASR — default (local whisper large-v3-turbo) | final text ~1.8s after speech ends |
+| ASR — cloud profile (MiniMax asr-1.0) / fast profile (local small) | ~0.95s / ~0.9s |
 | Translation (deepseek-flash streaming) | first token ~0.8s |
 | TTS (MiniMax speech-2.8-hd streaming PCM) | first audio ~0.2s |
-| **End-to-end** (speech end → Chinese dub playable) | **~3.0s** (fast profile ~2.4s) |
+| **End-to-end** (speech end → Chinese dub playable) | **~3.0s** default · **~2.4s** fast · **~2.2–2.4s** cloud |
 
 Full numbers: [docs/MEASUREMENTS.md](docs/MEASUREMENTS.md) (Chinese).
 
@@ -64,7 +70,11 @@ Generate the demo end-to-end:
 ```bash
 npm run demo:video   # creates demo/original.mp4 (synthetic English lecture)
 npm run batch        # real pipeline -> demo/dubbed.mp4 + bilingual.srt + session.jsonl
-npm run batch:fast   # fast profile (small ASR) -> demo-fast/
+npm run batch:fast   # fast profile (small local ASR) -> demo-fast/
+npm run batch:cloud  # cloud ASR profile (MiniMax, audio is uploaded) -> demo-cloud/
+
+# macOS desktop overlay (system/app audio, ScreenCaptureKit)
+bash scripts/build-macos.sh && open apps/macos/build/livedub.app
 ```
 
 ## Architecture
@@ -101,8 +111,8 @@ Subtitles overlay + dubbed audio + original-audio ducking
 
 ## Limitations (honest)
 
-- End-to-end latency is ~3.0s with the default large whisper model; `npm run start:fast`
-  (small model) trades a bit of accuracy for ~2.4s.
+- Latency profiles: default ~3.0s, `npm run start:fast` (small local ASR) ~2.4s,
+  `npm run start:cloud` (MiniMax cloud ASR, audio uploaded) ~2.2–2.4s.
 - Voice cloning requires a TTS plan that supports it (current MiniMax token plan returns
   code 2061; graceful fallback implemented).
 - Chrome `tabCapture` requires a user gesture and cannot be automated; DRM-protected media

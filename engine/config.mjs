@@ -97,6 +97,7 @@ const BUILTIN_PROVIDERS = {
   deepseek: { baseUrl: 'https://api.deepseek.com', model: 'deepseek-flash', chatPath: '/chat/completions' },
   minimax: { baseUrl: 'https://api.minimaxi.com/v1', model: 'MiniMax-M3', chatPath: '/chat/completions', ttsChatPath: '/t2a_v2' },
   ark: { baseUrl: 'https://ark.cn-beijing.volces.com/api/plan/v3', chatPath: '/chat/completions' },
+  volcengine: { baseUrl: 'https://openspeech.bytedance.com' },
 };
 
 /**

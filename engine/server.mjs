@@ -39,6 +39,7 @@ import {
 import { base64Pcm, pcmFromBase64 } from './audio.mjs';
 import {
   PROJECT_ROOT,
+  deepMerge,
   loadConfig,
   publicConfig,
   readJsonIfExists,
@@ -61,6 +62,37 @@ export const DEFAULT_HELLO_TIMEOUT_MS = 30_000;
 const MAX_QUEUED_AUDIO_FRAMES = 200;
 /** 音色列表接口单步超时 */
 const VOICES_TIMEOUT_MS = 5_000;
+/** UI 设置（工作台选择，持久化到 data/ui-settings.json，只影响之后建立的会话） */
+const UI_SETTINGS_FILE = 'ui-settings.json';
+const UI_SETTINGS_VERSION = 1;
+const SETTINGS_BODY_LIMIT = 16 * 1024;
+const ASR_ENGINE_META = Object.freeze({
+  'whisper-local': {
+    label: '本地 whisper',
+    shortLabel: '本地',
+    cloud: false,
+    privacyTitle: '音频不离开本机',
+    privacyDetail: '本地 whisper 识别，音频与字幕只在你的电脑内处理，不上传云端。',
+  },
+  'minimax-cloud': {
+    label: '云端 MiniMax',
+    shortLabel: '云端',
+    cloud: true,
+    privacyTitle: '音频会上传到 MiniMax',
+    privacyDetail: '云端语音识别会把音频上传到 MiniMax 用于转写；不经过浏览器厂商等其它第三方。',
+  },
+  mock: {
+    label: 'Mock（开发用）',
+    shortLabel: 'Mock',
+    cloud: false,
+    privacyTitle: '音频不离开本机（Mock）',
+    privacyDetail: 'Mock ASR 仅用于开发与测试，不会识别真实音频，也不会上传。',
+  },
+});
+const ASR_ENGINE_VALUES = Object.freeze(Object.keys(ASR_ENGINE_META));
+const VOICE_MODE_VALUES = Object.freeze(['clone-first', 'preset']);
+const DESKTOP_APP_RELATIVE_PATH = 'apps/macos/build/livedub.app';
+const DESKTOP_BUILD_COMMAND = 'bash scripts/build-macos.sh';
 
 const MIME_TYPES = Object.freeze({
   '.html': 'text/html; charset=utf-8',
@@ -297,11 +329,254 @@ export function resolveMaxSessions(config, options = {}) {
   return DEFAULT_MAX_SESSIONS;
 }
 
+
+// ------------------------------------------------------- UI 设置（v0.3）
+
+/** config 默认值 + UI overrides 合并成生效设置（只允许白名单三个字段） */
+export function effectiveUiSettings(config, overrides = {}) {
+  const base = {
+    asr: { provider: String(config?.asr?.provider ?? 'whisper-local') },
+    tts: { voiceMode: String(config?.tts?.voiceMode ?? 'preset') },
+    dub: { enabled: config?.dub?.enabled !== false },
+  };
+  const merged = deepMerge(base, overrides && typeof overrides === 'object' ? overrides : {});
+  if (!ASR_ENGINE_VALUES.includes(merged.asr?.provider)) merged.asr = { provider: 'whisper-local' };
+  if (!VOICE_MODE_VALUES.includes(merged.tts?.voiceMode)) merged.tts = { voiceMode: 'preset' };
+  merged.dub = { enabled: Boolean(merged.dub?.enabled) };
+  return merged;
+}
+
+/**
+ * 校验 UI 设置补丁：白名单字段 asr.provider / tts.voiceMode / dub.enabled。
+ * 非法字段/值返回可读错误（HTTP 层映射 400），绝不接受密钥等其它字段。
+ */
+export function validateSettingsPatch(input) {
+  const fail = (code, message, extra = {}) => ({ ok: false, error: { code, message, ...extra } });
+  if (!input || typeof input !== 'object' || Array.isArray(input)) return fail('invalid_body', '请求体必须是 JSON 对象');
+  const patch = {};
+  for (const [group, value] of Object.entries(input)) {
+    if (!['asr', 'tts', 'dub'].includes(group)) {
+      return fail('unknown_field', `不支持的字段：${group}（允许 asr.provider / tts.voiceMode / dub.enabled）`, { field: group });
+    }
+    if (!value || typeof value !== 'object' || Array.isArray(value)) return fail('invalid_body', `字段 ${group} 必须是对象`, { field: group });
+    if (group === 'asr') {
+      for (const [key, provider] of Object.entries(value)) {
+        if (key !== 'provider') return fail('unknown_field', `不支持的字段：asr.${key}`, { field: `asr.${key}` });
+        if (typeof provider !== 'string' || !ASR_ENGINE_VALUES.includes(provider)) {
+          return fail('invalid_value', `asr.provider 非法：${String(provider)}（可选：${ASR_ENGINE_VALUES.join(' / ')}）`, {
+            field: 'asr.provider',
+            allowed: [...ASR_ENGINE_VALUES],
+          });
+        }
+        patch.asr = { provider };
+      }
+    } else if (group === 'tts') {
+      for (const [key, mode] of Object.entries(value)) {
+        if (key !== 'voiceMode') return fail('unknown_field', `不支持的字段：tts.${key}`, { field: `tts.${key}` });
+        if (typeof mode !== 'string' || !VOICE_MODE_VALUES.includes(mode)) {
+          return fail('invalid_value', `tts.voiceMode 非法：${String(mode)}（可选：${VOICE_MODE_VALUES.join(' / ')}）`, {
+            field: 'tts.voiceMode',
+            allowed: [...VOICE_MODE_VALUES],
+          });
+        }
+        patch.tts = { voiceMode: mode };
+      }
+    } else {
+      for (const [key, enabled] of Object.entries(value)) {
+        if (key !== 'enabled') return fail('unknown_field', `不支持的字段：dub.${key}`, { field: `dub.${key}` });
+        if (typeof enabled !== 'boolean') {
+          return fail('invalid_value', 'dub.enabled 必须是布尔值', { field: 'dub.enabled', allowed: [true, false] });
+        }
+        patch.dub = { enabled };
+      }
+    }
+  }
+  if (Object.keys(patch).length === 0) {
+    return fail('empty_patch', '没有可保存的字段（允许 asr.provider / tts.voiceMode / dub.enabled）');
+  }
+  return { ok: true, patch };
+}
+
+/** 兼容两种 PUT 体：{settings:{...}} 或 {...}；顶层只允许 settings/version/updatedAt */
+function normalizeSettingsInput(body) {
+  if (!body || typeof body !== 'object' || Array.isArray(body)) {
+    return { ok: false, error: { code: 'invalid_body', message: '请求体必须是 JSON 对象' } };
+  }
+  if (Object.prototype.hasOwnProperty.call(body, 'settings')) {
+    for (const key of Object.keys(body)) {
+      if (!['settings', 'version', 'updatedAt', '_comment'].includes(key)) {
+        return { ok: false, error: { code: 'unknown_field', message: `不支持的字段：${key}`, field: key } };
+      }
+    }
+    if (!body.settings || typeof body.settings !== 'object' || Array.isArray(body.settings)) {
+      return { ok: false, error: { code: 'invalid_body', message: 'settings 必须是对象' } };
+    }
+    return { ok: true, input: body.settings };
+  }
+  return { ok: true, input: body };
+}
+
+function readRequestBody(req, limit = SETTINGS_BODY_LIMIT) {
+  return new Promise((resolve, reject) => {
+    let size = 0;
+    const chunks = [];
+    req.on('data', (chunk) => {
+      size += chunk.length;
+      if (size > limit) {
+        const err = new Error('请求体过大（上限 16KB）');
+        err.code = 'BODY_TOO_LARGE';
+        req.destroy();
+        reject(err);
+        return;
+      }
+      chunks.push(chunk);
+    });
+    req.on('end', () => resolve(Buffer.concat(chunks).toString('utf8')));
+    req.on('error', (err) => reject(err));
+  });
+}
+
+/** 读取 data/ui-settings.json（不存在/脏数据都回退默认值，不抛错） */
+function loadUiSettingsFromDisk(state) {
+  const file = state.uiSettingsPath;
+  const warnings = [];
+  let persisted = null;
+  let fileExists = false;
+  try {
+    if (fs.existsSync(file)) {
+      fileExists = true;
+      persisted = readJsonIfExists(file);
+      if (persisted == null) warnings.push(`${toProjectRelative(file)} 解析失败，已回退默认设置`);
+    }
+  } catch (err) {
+    warnings.push(`读取 ${toProjectRelative(file)} 失败：${err?.message ?? err}`);
+  }
+  let overrides = {};
+  if (persisted && typeof persisted === 'object') {
+    const validated = validateSettingsPatch(persisted.settings ?? persisted);
+    if (validated.ok) overrides = validated.patch;
+    else warnings.push(`ui-settings 已忽略：${validated.error.message}`);
+  }
+  return {
+    overrides,
+    effective: effectiveUiSettings(state.config, overrides),
+    path: file,
+    fileExists,
+    updatedAt: typeof persisted?.updatedAt === 'string' ? persisted.updatedAt : null,
+    warnings,
+  };
+}
+
+/** 原子写 data/ui-settings.json（只写白名单字段 + 版本/时间，不含密钥） */
+function writeUiSettingsFile(file, overrides, updatedAt) {
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  const payload = { version: UI_SETTINGS_VERSION, updatedAt, settings: overrides };
+  const tmp = `${file}.tmp-${process.pid}-${crypto.randomBytes(4).toString('hex')}`;
+  fs.writeFileSync(tmp, `${JSON.stringify(payload, null, 2)}\n`, { mode: 0o600 });
+  fs.renameSync(tmp, file);
+}
+
+function applyUiSettingsPatch(state, patch) {
+  const overrides = deepMerge(state.uiSettings?.overrides ?? {}, patch);
+  const updatedAt = new Date().toISOString();
+  writeUiSettingsFile(state.uiSettingsPath, overrides, updatedAt);
+  state.uiSettings = {
+    ...(state.uiSettings ?? {}),
+    overrides,
+    effective: effectiveUiSettings(state.config, overrides),
+    fileExists: true,
+    updatedAt,
+    warnings: [],
+  };
+  return state.uiSettings;
+}
+
+function buildUiSettingsPayload(state) {
+  const ui = state.uiSettings ?? loadUiSettingsFromDisk(state);
+  return {
+    ok: true,
+    version: UI_SETTINGS_VERSION,
+    path: toProjectRelative(ui.path),
+    fileExists: Boolean(ui.fileExists),
+    updatedAt: ui.updatedAt ?? null,
+    overrides: ui.overrides ?? {},
+    settings: ui.effective ?? effectiveUiSettings(state.config, ui.overrides ?? {}),
+    defaults: effectiveUiSettings(state.config, {}),
+    asrEngine: asrEngineInfo(state),
+    desktopApp: detectDesktopApp(state),
+    warnings: Array.isArray(ui.warnings) ? ui.warnings : [],
+  };
+}
+
+/** 当前生效的 ASR 引擎信息（含隐私文案；供 /health、/api/config、/api/settings 复用） */
+export function asrEngineInfo(state) {
+  const overrides = state.uiSettings?.overrides ?? {};
+  const effective = state.uiSettings?.effective ?? effectiveUiSettings(state.config, overrides);
+  const provider = effective.asr.provider;
+  const meta = ASR_ENGINE_META[provider] ?? {
+    label: provider,
+    shortLabel: provider,
+    cloud: false,
+    privacyTitle: '未知 ASR 引擎',
+    privacyDetail: '未识别的 asr.provider，请检查 config/livedub.config.json 或 data/ui-settings.json。',
+  };
+  return {
+    provider,
+    label: meta.label,
+    shortLabel: meta.shortLabel ?? meta.label,
+    cloud: Boolean(meta.cloud),
+    privacy: meta.cloud ? 'cloud' : 'local',
+    privacyTitle: meta.privacyTitle,
+    privacyDetail: meta.privacyDetail,
+    configProvider: String(state.config?.asr?.provider ?? 'whisper-local'),
+    overridden: Boolean(overrides.asr?.provider),
+    fallbackProvider: state.config?.asr?.fallback ?? null,
+    engines: ASR_ENGINE_VALUES.filter((id) => id !== 'mock').map((id) => ({
+      id,
+      label: ASR_ENGINE_META[id].label,
+      cloud: Boolean(ASR_ENGINE_META[id].cloud),
+    })),
+  };
+}
+
+/** 桌面 App 检测（apps/macos/build/livedub.app；可用 options.desktopAppPath 注入测试路径） */
+export function detectDesktopApp(state) {
+  const appPath = state.desktopAppPath ?? path.join(PROJECT_ROOT, DESKTOP_APP_RELATIVE_PATH);
+  let available = false;
+  try {
+    available = fs.existsSync(appPath);
+  } catch {
+    available = false;
+  }
+  const buildScript = path.join(PROJECT_ROOT, 'scripts', 'build-macos.sh');
+  let buildScriptFound = false;
+  try {
+    buildScriptFound = fs.existsSync(buildScript);
+  } catch {
+    buildScriptFound = false;
+  }
+  const displayPath = toProjectRelative(appPath);
+  return {
+    available,
+    platform: process.platform,
+    appPath: displayPath,
+    openCommand: `open ${displayPath}`,
+    buildCommand: DESKTOP_BUILD_COMMAND,
+    buildScriptFound,
+    hint: available
+      ? '双击 .app，或在终端运行 open 命令启动桌面版；桌面版会复用本机 127.0.0.1 引擎。'
+      : '在项目根目录运行构建命令生成 apps/macos/build/livedub.app；需要 macOS + Xcode Command Line Tools。',
+  };
+}
+
 function buildHealth(state) {
   const config = state.config;
   const model = resolveWhisperModel(config);
   const saylessPath = config?._meta?.saylessConfigPath ?? null;
   const pkg = packageInfo();
+  const engine = asrEngineInfo(state);
+  const effective = state.uiSettings?.effective ?? effectiveUiSettings(config, state.uiSettings?.overrides ?? {});
+  const ui = state.uiSettings ?? {};
   return {
     ok: true,
     name: 'livedub',
@@ -311,13 +586,23 @@ function buildHealth(state) {
     uptimeMs: Date.now() - state.startedAt,
     server: { host: state.host, port: state.port, url: state.url },
     providers: {
-      asr: config?.asr?.provider ?? null,
+      asr: engine.provider,
       translate: config?.translate?.provider ?? null,
       translateChain: Array.isArray(config?.translate?.chain) ? config.translate.chain : [],
       tts: config?.tts?.provider ?? null,
       ttsModel: config?.tts?.model ?? null,
-      voiceMode: config?.tts?.voiceMode ?? null,
+      voiceMode: effective.tts.voiceMode,
     },
+    // 当前生效的 ASR 引擎（含云端/本地与隐私文案），下次会话使用
+    asrEngine: engine,
+    desktopApp: detectDesktopApp(state),
+    uiSettings: {
+      path: toProjectRelative(state.uiSettingsPath ?? path.join(state.dataDir ?? '', UI_SETTINGS_FILE)),
+      fileExists: Boolean(ui.fileExists),
+      updatedAt: ui.updatedAt ?? null,
+      overridden: Object.keys(ui.overrides ?? {}).length > 0,
+    },
+    features: { dubEnabled: effective.dub.enabled },
     whisper: { found: Boolean(model), model: toProjectRelative(model) },
     sayless: { configPath: saylessPath, found: Boolean(saylessPath) },
     // activeSessions：已发 hello 并正在初始化/已就绪的会话数（不含仅建链未 hello 的空连接）
@@ -438,6 +723,12 @@ async function closeSharedWhisperServers(state) {
 
 function buildPublicConfigPayload(state) {
   const snapshot = publicConfig(state.config);
+  const ui = state.uiSettings ?? loadUiSettingsFromDisk(state);
+  const effective = ui.effective ?? effectiveUiSettings(state.config, ui.overrides ?? {});
+  // 工作台 UI 设置（data/ui-settings.json）优先，仅影响之后建立的会话；不写密钥
+  snapshot.asr = { ...(snapshot.asr ?? {}), provider: effective.asr.provider };
+  snapshot.tts = { ...(snapshot.tts ?? {}), voiceMode: effective.tts.voiceMode };
+  snapshot.dub = { ...(snapshot.dub ?? {}), enabled: effective.dub.enabled };
   snapshot.server = { ...(snapshot.server ?? {}), host: state.host, port: state.port, url: state.url };
   snapshot.runtime = {
     ...(snapshot.runtime ?? {}),
@@ -448,6 +739,16 @@ function buildPublicConfigPayload(state) {
     activeSessions: countActiveSessions(state),
     studioUrl: `${state.url}/studio/`,
     replayUrl: `${state.url}/replay/`,
+    asrEngine: asrEngineInfo(state),
+    desktopApp: detectDesktopApp(state),
+    uiSettings: {
+      path: toProjectRelative(state.uiSettingsPath ?? path.join(state.dataDir ?? '', UI_SETTINGS_FILE)),
+      fileExists: Boolean(ui.fileExists),
+      updatedAt: ui.updatedAt ?? null,
+      overrides: ui.overrides ?? {},
+      effective,
+      warnings: Array.isArray(ui.warnings) ? ui.warnings : [],
+    },
   };
   return { ok: true, protocol: PROTOCOL_VERSION, config: scrubSecrets(snapshot) };
 }
@@ -570,22 +871,28 @@ function createRequestHandler(state) {
     res.setHeader('X-Content-Type-Options', 'nosniff');
     res.setHeader('Referrer-Policy', 'no-referrer');
 
+    const isApi = pathname === '/health' || pathname.startsWith('/api/');
+    const isSettings = pathname === '/api/settings';
+    const allowedMethods = isSettings ? ['GET', 'HEAD', 'PUT'] : ['GET', 'HEAD'];
+
     if (method === 'OPTIONS') {
       res.setHeader('Access-Control-Allow-Origin', '*');
-      res.setHeader('Access-Control-Allow-Methods', 'GET,HEAD,OPTIONS');
+      res.setHeader('Access-Control-Allow-Methods', `${allowedMethods.join(',')},OPTIONS`);
       res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
       res.writeHead(204, { 'Cache-Control': 'no-store' });
       return res.end();
     }
 
-    const isApi = pathname === '/health' || pathname.startsWith('/api/');
     if (isApi) {
       res.setHeader('Access-Control-Allow-Origin', '*');
       res.setHeader('Cache-Control', 'no-store');
     }
 
-    if (method !== 'GET' && method !== 'HEAD') {
-      if (isApi) return sendJson(res, 405, { ok: false, error: 'method not allowed', allow: 'GET, HEAD' });
+    if (!allowedMethods.includes(method)) {
+      if (isApi) {
+        res.setHeader('Allow', allowedMethods.join(', '));
+        return sendJson(res, 405, { ok: false, error: 'method not allowed', allow: allowedMethods.join(', ') });
+      }
       return sendText(res, 405, 'livedub: method not allowed\n');
     }
 
@@ -600,6 +907,54 @@ function createRequestHandler(state) {
           health.whisper.server = { running: null, source: 'unknown', error: 'status probe failed' };
         }
         return sendJson(res, 200, health, { head: method === 'HEAD' });
+      }
+
+      if (pathname === '/api/settings') {
+        if (method === 'PUT') {
+          let raw;
+          try {
+            raw = await readRequestBody(req);
+          } catch (err) {
+            const status = err?.code === 'BODY_TOO_LARGE' ? 413 : 400;
+            return sendJson(res, status, {
+              ok: false,
+              error: status === 413 ? 'body_too_large' : 'bad_request',
+              message: err?.message ?? '读取请求体失败',
+            });
+          }
+          let parsed;
+          try {
+            parsed = raw.trim() ? JSON.parse(raw) : null;
+          } catch {
+            return sendJson(res, 400, { ok: false, error: 'invalid_json', message: '请求体不是合法 JSON' });
+          }
+          const sendSettingsError = (error) =>
+            sendJson(res, 400, {
+              ok: false,
+              error: error.code,
+              message: error.message,
+              ...(error.field ? { field: error.field } : {}),
+              ...(error.allowed ? { allowed: error.allowed } : {}),
+            });
+          const normalized = normalizeSettingsInput(parsed);
+          if (!normalized.ok) return sendSettingsError(normalized.error);
+          const validated = validateSettingsPatch(normalized.input);
+          if (!validated.ok) return sendSettingsError(validated.error);
+          try {
+            applyUiSettingsPatch(state, validated.patch);
+          } catch (err) {
+            state.log(`保存 UI 设置失败：${err?.message ?? err}`);
+            return sendJson(res, 500, {
+              ok: false,
+              error: 'persist_failed',
+              message: `保存 UI 设置失败：${err?.message ?? err}`,
+              hint: '检查 data/ 目录写权限后重试',
+            });
+          }
+          state.log(`UI 设置已更新：${JSON.stringify(validated.patch)} -> ${toProjectRelative(state.uiSettingsPath)}（下次会话生效）`);
+          return sendJson(res, 200, { ...buildUiSettingsPayload(state), saved: true, nextSessionOnly: true });
+        }
+        return sendJson(res, 200, buildUiSettingsPayload(state), { head: method === 'HEAD' });
       }
 
       if (pathname === '/api/config') {
@@ -867,6 +1222,14 @@ function handleWebSocketConnection(ws, req, state) {
     log(`新会话 ${conn.sessionId}（source=${normalized.options.source}）开始初始化`);
 
     const options = normalized.options;
+    // 工作台 UI 设置（data/ui-settings.json）注入到会话 overrides：
+    // 只影响之后建立的会话；客户端 hello 里自带的 overrides 优先级更高。
+    const uiOverrides = state.uiSettings?.overrides ?? {};
+    if (uiOverrides && typeof uiOverrides === 'object' && Object.keys(uiOverrides).length > 0) {
+      options.overrides = deepMerge(uiOverrides, options.overrides ?? {});
+    }
+    const effectiveAsr = options.overrides?.asr?.provider ?? config?.asr?.provider ?? 'whisper-local';
+    log(`新会话 ${conn.sessionId} 使用 ASR=${effectiveAsr}${uiOverrides?.asr?.provider ? '（来自 UI 设置）' : ''}`);
     const factoryPromise = Promise.resolve().then(() =>
       state.sessionFactory({ id: conn.sessionId, options, emit: emitToClient, log, config }),
     );
@@ -1247,6 +1610,7 @@ export async function startServer(options = {}) {
   const config = options.config ?? loadConfig({ env, overrides: options.configOverrides ?? {} });
   const studioDir = path.resolve(options.studioDir ?? path.join(PROJECT_ROOT, 'studio'));
   const demoDir = path.resolve(options.demoDir ?? path.join(PROJECT_ROOT, 'demo'));
+  const dataDir = path.resolve(options.dataDir ?? path.join(PROJECT_ROOT, 'data'));
 
   let sessionFactory = options.sessionFactory;
   let mode;
@@ -1282,8 +1646,23 @@ export async function startServer(options = {}) {
     voicesCache: null,
     whisperStatusCache: null,
     closeAsrOnShutdown: options.closeAsrOnShutdown !== false,
+    // v0.3：工作台 UI 设置（data/ui-settings.json），只影响之后建立的会话
+    dataDir,
+    uiSettingsPath: path.resolve(options.settingsPath ?? path.join(dataDir, UI_SETTINGS_FILE)),
+    desktopAppPath: options.desktopAppPath ? path.resolve(options.desktopAppPath) : path.join(PROJECT_ROOT, DESKTOP_APP_RELATIVE_PATH),
+    uiSettings: null,
     env,
   };
+
+  // 读取持久化的 UI 设置（不存在/脏数据回退默认值，不阻塞启动）
+  state.uiSettings = loadUiSettingsFromDisk(state);
+  for (const warning of state.uiSettings.warnings ?? []) log(`UI 设置：${warning}`);
+  if (Object.keys(state.uiSettings.overrides ?? {}).length > 0) {
+    const effective = state.uiSettings.effective;
+    log(
+      `UI 设置已加载（${toProjectRelative(state.uiSettingsPath)}）：ASR=${effective.asr.provider}，voiceMode=${effective.tts.voiceMode}，dub=${effective.dub.enabled ? 'on' : 'off'}（下次会话生效）`,
+    );
+  }
 
   const server = http.createServer(createRequestHandler(state));
   server.on('clientError', (err, socket) => {
@@ -1391,6 +1770,9 @@ export async function startServer(options = {}) {
     url: state.url,
     studioUrl: state.studioUrl,
     maxSessions: state.maxSessions,
+    dataDir: state.dataDir,
+    uiSettingsPath: state.uiSettingsPath,
+    desktopAppPath: state.desktopAppPath,
     sessions: state.sessions,
     close,
   };
@@ -1457,7 +1839,7 @@ function printHelp() {
   -h, --help          显示帮助
 
 工作台：http://127.0.0.1:<port>/studio/    回放：/replay/?session=/demo/session.jsonl
-API：  /health  /api/config  /api/voices      WS：/ws（见 docs/CONTRACTS.md §3）`);
+API：  /health  /api/config  /api/voices  /api/settings（GET/PUT）      WS：/ws（见 docs/CONTRACTS.md §3）`);
 }
 
 async function main(argv = process.argv.slice(2)) {
@@ -1508,7 +1890,14 @@ async function main(argv = process.argv.slice(2)) {
   line('工作台', started.studioUrl);
   line('回放', `${started.url}/replay/`);
   line('会话层', formatMode(started.mode));
-  line('ASR', `${config?.asr?.provider ?? '?'}${whisperModel ? `（模型 ${toProjectRelative(whisperModel)}）` : '（⚠ 未找到 whisper 模型）'}`);
+  const uiEffective = started.state?.uiSettings?.effective ?? null;
+  const asrProvider = uiEffective?.asr?.provider ?? config?.asr?.provider ?? '?';
+  const uiNote = started.state?.uiSettings?.overrides?.asr?.provider ? '（UI 设置，下次会话生效）' : '';
+  const asrNote = asrProvider === 'minimax-cloud' ? '云端识别，音频会上传到 MiniMax' : whisperModel ? `模型 ${toProjectRelative(whisperModel)}` : '⚠ 未找到 whisper 模型';
+  line('ASR', `${asrProvider} · ${asrNote}${uiNote}`);
+  line('设置', `${toProjectRelative(started.uiSettingsPath)}${started.state?.uiSettings?.overrides && Object.keys(started.state.uiSettings.overrides).length ? '（已应用）' : '（默认）'}`);
+  const desktopApp = detectDesktopApp(started.state);
+  line('桌面版', desktopApp.available ? desktopApp.appPath : `未构建 · ${desktopApp.buildCommand}`);
   line('翻译', `${config?.translate?.provider ?? '?'}${Array.isArray(config?.translate?.chain) ? `（链：${config.translate.chain.join(' → ')}）` : ''}`);
   line('配音', `${config?.tts?.provider ?? '?'} · ${config?.tts?.voiceMode ?? 'preset'}`);
   line('并发', `最多 ${started.maxSessions} 个会话（config.server.maxSessions）`);

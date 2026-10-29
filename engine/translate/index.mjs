@@ -21,6 +21,8 @@
  * - 最终文本清洗：去「译文：」前缀、包裹引号、Markdown 粗体/代码围栏、尾部解释性括号。
  * - v0.2 增量子句提取器 createClauseExtractor：翻译还在流式输出时，把已稳定子句提前交给 TTS
  *   （见下方「增量子句提取器」大段契约注释；Lead 在 pipeline 里动态 import 集成）。
+ * - v0.3 ASR 草稿翻译复用工具 normalizeForMatch / draftTranslationReusable / draftTranslationCache：
+ *   用于「ASR partial 先翻译草稿、final 确认后复用」，避免重复翻译、压低云端 ASR 场景 e2e。
  * - 不在库代码里 console.*；日志一律走传入的 log()，且绝不打印 apiKey。
  */
 import { sanitizeGlossary } from '../protocol.mjs';
@@ -139,21 +141,22 @@ export function buildTranslationMessages({ text, context = [], glossary = [], co
   const contextLines = formatContext(context, { contextSegments });
   const srcText = String(text ?? '').trim();
 
+  const targetLang = langName(to, '中文');
   const serviceLine =
     style === 'teaching'
-      ? '你是一名资深的同声传译员，正在为中文观众实时翻译英文教学视频（公开课 / 技术课程）。'
-      : `你是一名资深的同声传译员，正在把${langName(from, '原文语言')}实时翻译成${langName(to, '目标语言')}。`;
+      ? `你是英文技术课的同声传译，把讲师的话译成${targetLang}。`
+      : `你是一名资深的同声传译员，正在把${langName(from, '原文语言')}实时翻译成${targetLang}。`;
 
+  // v0.3 首 token 优化：system prompt 从 ~330 字压到 ~180 字（保留术语/公式/代码约束与口语化要求），
+  // 减少 prefill 输入 token、缩短首字延迟；关键约束词同时被单测锁定。
   const system = [
     serviceLine,
-    '请严格遵守以下要求：',
-    '1. 忠实：只翻译说话人实际说出的内容，不增删、不总结、不解释、不扩写，不添加任何评论、旁白或提示。',
-    '2. 口语化、短句：像老师现场讲中文一样自然，用短句，一句话说清一个意思，句子短到可以直接被 TTS 逐句朗读；多用逗号或句号形成自然停顿，避免书面腔、文言和翻译腔。',
-    '3. 不要使用「首先、其次、然后、最后、综上所述、值得注意的是、总而言之」这类书面连接词；除非原文明确在列举步骤，否则直接用短句顺承。',
-    '4. 保留原文：数学公式、变量名、函数名、代码标识符、命令行、URL、产品名与专有名词必须原样保留——不翻译、不改写、不加音译、不加空格、不改大小写、不拆开。',
-    '5. 术语表是强约束：原文出现术语表中的 src 时，必须逐字使用对应的 dst 译法，不得改写、另译、加字或省略。',
-    '6. 只输出译文本身：不要输出原文、拼音、注释或解释性括号；不要以「译文：」等前缀开头，不要用引号包裹整句，不要重复原文。',
-    `7. 输出简体中文（如果目标语言是${langName(to, '目标语言')}）；中文与英文术语混排时保持自然。`,
+    '要求：',
+    '1. 忠实：不增删、不总结、不解释。',
+    '2. 口语化：用短句，像老师现场讲，可直接 TTS 朗读；不要书面连接词（如「首先/其次」）。',
+    '3. 公式、变量名、函数名、代码标识符、URL 原样保留：不改写、不加空格、不改大小写。',
+    '4. 术语表是强约束：出现 src 必须逐字用 dst。',
+    '5. 只输出译文本身，不要前缀、引号或解释。',
   ].join('\n');
 
   const userSections = [];
@@ -1131,3 +1134,257 @@ export function createTranslator({ config = {}, log = () => {}, fetchImpl = glob
     },
   };
 }
+
+/* ------------------------------------------------------------------ *
+ * v0.3 ASR 草稿翻译复用工具（云端 ASR partial 先翻译、final 确认后复用）
+ *
+ * 场景：云端 ASR 的 partial 文本先送翻译（草稿），final 到达时若 finalSource 与
+ * draftSource 足够一致，就直接复用草稿译文，省掉一次完整翻译（~0.8-1s），把 e2e 压下来。
+ *
+ * 契约（Lead 动态 import 使用，签名固定）：
+ *   normalizeForMatch(text) -> string
+ *     去空白/标点/符号/大小写差异（NFKC 归一全角->半角），保留数字与标识符字母数字；
+ *     仅用于相似度比较——数字/代码标识符的差异由 draftTranslationReusable 内的硬规则保护。
+ *   draftTranslationReusable({ draftSource, finalSource, threshold = 0.82 }) -> boolean
+ *     数字 token 或代码标识符 token 不一致 => 直接 false（绝不复用会译错内容的草稿）；
+ *     草稿只是 final 的纯前缀/纯尾部（增删 > 3 字符）=> false（草稿译文缺内容/多内容）；
+ *     否则：normalized 完全相同 => true；相似度 = 字符级相似度 * (0.8 + 0.2*前缀比例)
+ *     （前缀比例 = 公共前缀 / 较短文本长度），>= threshold => true。
+ *   createDraftTranslationCache({ maxEntries = 32 } = {})
+ *     -> { set(key, { draftSource, text }), get(key), delete(key), stats() }  （LRU，key 由调用方给）
+ *     stats: { size, maxEntries, hits, misses, sets, evictions, deletes, hitRate }
+ *   draftTranslationScore({ draftSource, finalSource }) -> number  // 诊断辅助（Lead 打日志/调阈值用）
+ *
+ * 阈值建议：默认 0.82。偏保守（宁可重译）用 0.85-0.88；追求复用率且能接受偶发小偏差用 0.78-0.80。
+ * ------------------------------------------------------------------ */
+
+/** 用于相似度比较时忽略的字符：标点、符号、空白、零宽字符（数字/字母保留） */
+const MATCH_STRIP_RE = /[\p{P}\p{S}\s\u200b-\u200f\u2028\u2029\ufeff]/gu;
+/** 数字 token：1,000 / 3.14 / 50% / 1.2.3 */
+const NUMBER_TOKEN_RE = /\d+(?:[.,]\d+)*\s*%?/g;
+/** 标识符 token：msToSamples / node.js / api.deepseek.com/v1 / foo_bar / x+y */
+const CODE_TOKEN_RE = /[A-Za-z_$][A-Za-z0-9_$]*(?:[._/:@+][A-Za-z0-9_$]+)*/g;
+/** 纯尾部增删超过这么多字符，就认为草稿译文会缺内容/多内容，不复用 */
+const MAX_TAIL_GAP = 3;
+
+function nfkcText(text) {
+  const s = String(text ?? '');
+  try {
+    return s.normalize('NFKC');
+  } catch {
+    return s;
+  }
+}
+
+function codePointsOf(text) {
+  return Array.from(String(text ?? ''));
+}
+
+function isCodeLikeToken(token) {
+  // 内部连接符（node.js / foo_bar / a/b / x+y）或 camelCase（msToSamples）
+  return /[._/:@+]/.test(token) || /[a-z][A-Z]/.test(token);
+}
+
+/**
+ * 归一化文本用于相似度比较：NFKC + 小写 + 去空白/标点/符号。
+ * 注意：数字与代码标识符的「硬约束」不在本函数里，由 draftTranslationReusable 用原始文本校验。
+ * @param {string} text
+ * @returns {string}
+ */
+export function normalizeForMatch(text) {
+  const source = nfkcText(text);
+  if (!source) return '';
+  return source.toLowerCase().replace(MATCH_STRIP_RE, '');
+}
+
+function extractNumberTokens(text) {
+  const tokens = [];
+  for (const match of nfkcText(text).matchAll(NUMBER_TOKEN_RE)) {
+    tokens.push(match[0].replace(/\s+/g, '').replace(/,/g, '').toLowerCase());
+  }
+  return tokens.sort();
+}
+
+function extractCodeTokens(text) {
+  const tokens = [];
+  for (const match of nfkcText(text).matchAll(CODE_TOKEN_RE)) {
+    const token = match[0];
+    if (isCodeLikeToken(token)) tokens.push(token);
+  }
+  return tokens.sort();
+}
+
+function sameTokenMultiset(left, right) {
+  if (left.length !== right.length) return false;
+  for (let i = 0; i < left.length; i += 1) {
+    if (left[i] !== right[i]) return false;
+  }
+  return true;
+}
+
+function commonPrefixLength(left, right) {
+  const max = Math.min(left.length, right.length);
+  let index = 0;
+  while (index < max && left[index] === right[index]) index += 1;
+  return index;
+}
+
+function levenshteinDistance(left, right) {
+  const a = left;
+  const b = right;
+  if (a.length === 0) return b.length;
+  if (b.length === 0) return a.length;
+  let previous = new Array(b.length + 1);
+  let current = new Array(b.length + 1);
+  for (let j = 0; j <= b.length; j += 1) previous[j] = j;
+  for (let i = 1; i <= a.length; i += 1) {
+    current[0] = i;
+    for (let j = 1; j <= b.length; j += 1) {
+      const substitution = previous[j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1);
+      const insertion = current[j - 1] + 1;
+      const deletion = previous[j] + 1;
+      current[j] = Math.min(substitution, insertion, deletion);
+    }
+    const swap = previous;
+    previous = current;
+    current = swap;
+  }
+  return previous[b.length];
+}
+
+/**
+ * 草稿 ASR 文本与最终 ASR 文本的匹配分（0~1，仅相似度维度，不含数字/代码硬规则）。
+ * 诊断辅助：Lead 可用它打日志、按实际数据调 threshold。
+ * @param {{draftSource?: string, finalSource?: string}} input
+ * @returns {number}
+ */
+export function draftTranslationScore({ draftSource = '', finalSource = '' } = {}) {
+  const draft = normalizeForMatch(draftSource);
+  const final = normalizeForMatch(finalSource);
+  if (!draft || !final) return 0;
+  if (draft === final) return 1;
+  const draftChars = codePointsOf(draft);
+  const finalChars = codePointsOf(final);
+  const maxLen = Math.max(draftChars.length, finalChars.length);
+  const minLen = Math.min(draftChars.length, finalChars.length);
+  if (maxLen === 0) return 0;
+  const distance = levenshteinDistance(draftChars, finalChars);
+  const similarity = Math.max(0, Math.min(1, 1 - distance / maxLen));
+  const prefixRatio = commonPrefixLength(draftChars, finalChars) / Math.max(1, minLen);
+  const score = similarity * (0.8 + 0.2 * prefixRatio);
+  return Math.round(score * 1000) / 1000;
+}
+
+/**
+ * ASR 草稿文本与最终文本是否足够一致、可以复用草稿译文（boolean，保守策略）。
+ *
+ * 判定顺序：
+ * 1. 任一为空/只有标点 => false；
+ * 2. 数字 token 不一致 => false；
+ * 3. 代码标识符/URL token 不一致 => false；
+ * 4. 归一化后完全相同 => true；
+ * 5. 一方是另一方纯前缀且差 > MAX_TAIL_GAP 字符 => false（草稿译文缺/多内容）；
+ * 6. 相似度 >= threshold => true。
+ */
+export function draftTranslationReusable({ draftSource = '', finalSource = '', threshold = 0.82 } = {}) {
+  const draftRaw = String(draftSource ?? '');
+  const finalRaw = String(finalSource ?? '');
+  if (!draftRaw.trim() || !finalRaw.trim()) return false;
+
+  // 硬规则：数字/代码标识符不一致 = 草稿译文不可信（ASR 把 0.001 听成 0.01 之类）
+  if (!sameTokenMultiset(extractNumberTokens(draftRaw), extractNumberTokens(finalRaw))) return false;
+  if (!sameTokenMultiset(extractCodeTokens(draftRaw), extractCodeTokens(finalRaw))) return false;
+
+  const draft = normalizeForMatch(draftRaw);
+  const final = normalizeForMatch(finalRaw);
+  if (!draft || !final) return false;
+  if (draft === final) return true;
+
+  // 纯尾部增删：partial 通常比 final 短，若 final 只是尾巴更长 => 草稿译文缺内容，不复用
+  const draftChars = codePointsOf(draft);
+  const finalChars = codePointsOf(final);
+  if (finalChars.length > draftChars.length && final.startsWith(draft) && finalChars.length - draftChars.length > MAX_TAIL_GAP) {
+    return false;
+  }
+  if (draftChars.length > finalChars.length && draft.startsWith(final) && draftChars.length - finalChars.length > MAX_TAIL_GAP) {
+    return false;
+  }
+
+  const numericThreshold = Number(threshold);
+  const effectiveThreshold = Number.isFinite(numericThreshold) ? Math.max(0, Math.min(1, numericThreshold)) : 0.82;
+  return draftTranslationScore({ draftSource: draftRaw, finalSource: finalRaw }) >= effectiveThreshold;
+}
+
+/**
+ * 草稿翻译缓存（LRU，key 由调用方给）。
+ * - set(key, { draftSource, text })：写入/覆盖并刷新为最近使用；超出 maxEntries 淘汰最久未用；
+ * - get(key)：命中返回 { draftSource, text } 并刷新 LRU；未命中返回 undefined；
+ * - delete(key)：删除，返回是否删除成功；
+ * - stats()：{ size, maxEntries, hits, misses, sets, evictions, deletes, hitRate }。
+ * @param {{maxEntries?: number}} [options]
+ */
+export function createDraftTranslationCache({ maxEntries = 32 } = {}) {
+  const requested = Number(maxEntries);
+  const limit = Number.isFinite(requested) && requested >= 1 ? Math.floor(requested) : 32;
+  const store = new Map();
+  let hits = 0;
+  let misses = 0;
+  let sets = 0;
+  let evictions = 0;
+  let deletes = 0;
+
+  return {
+    set(key, value) {
+      const cacheKey = String(key ?? '');
+      const entry = {
+        draftSource: String(value?.draftSource ?? ''),
+        text: String(value?.text ?? ''),
+      };
+      if (store.has(cacheKey)) store.delete(cacheKey);
+      store.set(cacheKey, entry);
+      sets += 1;
+      while (store.size > limit) {
+        const oldestKey = store.keys().next().value;
+        store.delete(oldestKey);
+        evictions += 1;
+      }
+      return entry;
+    },
+
+    get(key) {
+      const cacheKey = String(key ?? '');
+      if (!store.has(cacheKey)) {
+        misses += 1;
+        return undefined;
+      }
+      const entry = store.get(cacheKey);
+      // 刷新 LRU：删除后重新插入到队尾
+      store.delete(cacheKey);
+      store.set(cacheKey, entry);
+      hits += 1;
+      return entry;
+    },
+
+    delete(key) {
+      const cacheKey = String(key ?? '');
+      const deleted = store.delete(cacheKey);
+      if (deleted) deletes += 1;
+      return deleted;
+    },
+
+    stats() {
+      const total = hits + misses;
+      return {
+        size: store.size,
+        maxEntries: limit,
+        hits,
+        misses,
+        sets,
+        evictions,
+        deletes,
+        hitRate: total > 0 ? hits / total : 0,
+      };
+    },
+  };
+}
+

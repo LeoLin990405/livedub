@@ -2906,3 +2906,356 @@ html[data-theme="light"] .replay-stage {
 html[data-theme="light"] .empty-shortcuts {
   color: #94a0b8;
 }
+
+/* ================================================================
+   v0.3：ASR 引擎选择 / 隐私提示 / 桌面 App 入口
+   ================================================================ */
+
+.privacy-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 30px;
+  padding: 0 11px;
+  border-radius: 999px;
+  border: 1px solid rgba(52, 211, 153, 0.28);
+  background: rgba(52, 211, 153, 0.07);
+  color: #a7f3d0;
+  font-size: 11px;
+  white-space: nowrap;
+  transition: border-color 0.18s ease, background 0.18s ease, color 0.18s ease;
+}
+
+.privacy-chip .icon {
+  width: 13px;
+  height: 13px;
+  flex: 0 0 auto;
+}
+
+.privacy-chip[data-tone="cloud"] {
+  border-color: rgba(251, 191, 36, 0.34);
+  background: rgba(251, 191, 36, 0.08);
+  color: #fde68a;
+}
+
+.privacy-chip[data-tone="cloud"] .icon {
+  color: #fbbf24;
+}
+
+html[data-theme="light"] .privacy-chip {
+  color: #047857;
+  background: rgba(15, 157, 117, 0.08);
+  border-color: rgba(15, 157, 117, 0.28);
+}
+
+html[data-theme="light"] .privacy-chip[data-tone="cloud"] {
+  color: #92400e;
+  background: rgba(180, 83, 9, 0.07);
+  border-color: rgba(180, 83, 9, 0.28);
+}
+
+/* 识别引擎选择卡片 */
+.engine-choices {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+  padding: 2px 14px 4px;
+}
+
+.engine-choice {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 6px;
+  min-height: 76px;
+  padding: 9px 10px;
+  border-radius: 11px;
+  border: 1px solid var(--border);
+  background: rgba(255, 255, 255, 0.028);
+  color: var(--text);
+  font-family: inherit;
+  text-align: left;
+  cursor: pointer;
+  transition: border-color 0.16s ease, background 0.16s ease, box-shadow 0.16s ease;
+}
+
+.engine-choice:hover {
+  border-color: var(--border-strong);
+  background: rgba(255, 255, 255, 0.05);
+}
+
+.engine-choice[aria-checked="true"] {
+  border-color: rgba(94, 234, 212, 0.55);
+  background: linear-gradient(165deg, rgba(94, 234, 212, 0.12), rgba(129, 140, 248, 0.09));
+  box-shadow: 0 0 0 3px rgba(94, 234, 212, 0.08);
+}
+
+.engine-choice:disabled {
+  opacity: 0.5;
+  cursor: progress;
+}
+
+.engine-choice-icon {
+  display: grid;
+  place-items: center;
+  width: 26px;
+  height: 26px;
+  border-radius: 8px;
+  border: 1px solid rgba(94, 234, 212, 0.24);
+  background: rgba(94, 234, 212, 0.08);
+  color: #7bf0dd;
+}
+
+.engine-choice-icon.cloud {
+  border-color: rgba(251, 191, 36, 0.3);
+  background: rgba(251, 191, 36, 0.09);
+  color: #fcd34d;
+}
+
+.engine-choice-text {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  min-width: 0;
+}
+
+.engine-choice-text b {
+  font-size: 12px;
+  font-weight: 650;
+  color: var(--text-strong);
+  line-height: 1.25;
+}
+
+.engine-choice-text small {
+  font-size: 9.5px;
+  color: var(--muted-2);
+  line-height: 1.3;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.engine-choice-check {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  display: grid;
+  place-items: center;
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  border: 1px solid var(--border-strong);
+  background: rgba(7, 9, 14, 0.5);
+  color: transparent;
+}
+
+.engine-choice-check .icon {
+  width: 11px;
+  height: 11px;
+}
+
+.engine-choice[aria-checked="true"] .engine-choice-check {
+  border-color: transparent;
+  background: linear-gradient(130deg, #5eead4, #818cf8);
+  color: #05201d;
+}
+
+/* 隐私说明 */
+.privacy-box {
+  display: flex;
+  align-items: flex-start;
+  gap: 9px;
+  margin: 6px 14px 0;
+  padding: 9px 11px;
+  border-radius: 10px;
+  border: 1px solid rgba(52, 211, 153, 0.2);
+  background: rgba(52, 211, 153, 0.055);
+}
+
+.privacy-box > .icon {
+  width: 15px;
+  height: 15px;
+  margin-top: 1px;
+  color: #34d399;
+  flex: 0 0 auto;
+}
+
+.privacy-box b {
+  display: block;
+  font-size: 11.5px;
+  font-weight: 650;
+  color: #bbf7e6;
+  line-height: 1.35;
+}
+
+.privacy-box p {
+  margin: 2px 0 0;
+  font-size: 10px;
+  line-height: 1.55;
+  color: var(--muted);
+}
+
+.privacy-box[data-tone="cloud"] {
+  border-color: rgba(251, 191, 36, 0.3);
+  background: rgba(251, 191, 36, 0.07);
+}
+
+.privacy-box[data-tone="cloud"] > .icon {
+  color: #fbbf24;
+}
+
+.privacy-box[data-tone="cloud"] b {
+  color: #fde68a;
+}
+
+html[data-theme="light"] .privacy-box {
+  border-color: rgba(15, 157, 117, 0.22);
+  background: rgba(15, 157, 117, 0.06);
+}
+
+html[data-theme="light"] .privacy-box b {
+  color: #047857;
+}
+
+html[data-theme="light"] .privacy-box[data-tone="cloud"] {
+  border-color: rgba(180, 83, 9, 0.24);
+  background: rgba(180, 83, 9, 0.06);
+}
+
+html[data-theme="light"] .privacy-box[data-tone="cloud"] b {
+  color: #92400e;
+}
+
+.engine-hint {
+  margin: 7px 14px 0;
+  padding: 6px 9px;
+  border-radius: 8px;
+  border: 1px solid rgba(251, 191, 36, 0.28);
+  background: rgba(251, 191, 36, 0.08);
+  color: #fcd34d;
+  font-size: 10px;
+  line-height: 1.45;
+}
+
+.engine-hint[hidden] {
+  display: none;
+}
+
+html[data-theme="light"] .engine-hint {
+  color: #92400e;
+  border-color: rgba(180, 83, 9, 0.26);
+  background: rgba(180, 83, 9, 0.07);
+}
+
+.inline-code {
+  padding: 1px 5px;
+  border-radius: 5px;
+  background: rgba(255, 255, 255, 0.06);
+  color: #a7f3e8;
+  font-family: var(--mono);
+  font-size: 9.5px;
+}
+
+html[data-theme="light"] .inline-code {
+  background: rgba(15, 23, 42, 0.06);
+  color: #0f766e;
+}
+
+/* 桌面 App 面板 */
+.panel-desktop .card-head .icon {
+  color: var(--muted-2);
+}
+
+.cmd-row {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 2px 14px 4px;
+}
+
+.cmd-row .cmd {
+  flex: 1;
+  min-width: 0;
+  margin: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  padding: 7px 10px;
+}
+
+.icon-btn-sm {
+  width: 28px;
+  height: 28px;
+  border-radius: 8px;
+  flex: 0 0 auto;
+}
+
+.icon-btn-sm .icon {
+  width: 14px;
+  height: 14px;
+}
+
+.tag.ok {
+  color: #a7f3d8;
+  border-color: rgba(52, 211, 153, 0.3);
+  background: rgba(52, 211, 153, 0.08);
+}
+
+html[data-theme="light"] .tag.ok {
+  color: #047857;
+  border-color: rgba(15, 157, 117, 0.28);
+  background: rgba(15, 157, 117, 0.08);
+}
+
+/* 顶栏空间紧张时的响应式 */
+@media (max-width: 1360px) {
+  .privacy-chip {
+    display: none;
+  }
+}
+
+@media (max-width: 860px) {
+  .engine-choices {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .engine-choice {
+    min-height: 58px;
+    flex-direction: row;
+    align-items: center;
+  }
+  .engine-choice-text small {
+    white-space: normal;
+  }
+}
+
+/* v0.3：云端 ASR 时 footer 隐私提示用警示色 */
+.status-item.privacy.privacy-cloud {
+  color: var(--warn);
+}
+
+html[data-theme="light"] .status-item.privacy.privacy-cloud {
+  color: #92400e;
+}
+
+/* v0.3：云端 ASR 的凭证/回退提示 */
+.engine-note {
+  margin: 7px 14px 0;
+  padding: 6px 9px;
+  border-radius: 8px;
+  border: 1px solid rgba(251, 191, 36, 0.22);
+  background: rgba(251, 191, 36, 0.05);
+  color: var(--muted);
+  font-size: 10px;
+  line-height: 1.5;
+}
+
+.engine-note[hidden] {
+  display: none;
+}
+
+html[data-theme="light"] .engine-note {
+  color: #92400e;
+  border-color: rgba(180, 83, 9, 0.2);
+  background: rgba(180, 83, 9, 0.05);
+}

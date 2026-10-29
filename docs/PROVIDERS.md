@@ -88,7 +88,68 @@ livedub 的 TTS 适配器层已按「克隆 provider 可插拔」设计，接入
 - `voiceMode: "preset"`：完全不尝试克隆（最省额度、最快）；
 - 克隆失败只尝试一次并记住原因，不会每句重试。
 
-## 5. 延迟档位（ASR 模型）
+## 5. 云端 ASR（MiniMax，v0.3 新增）
+
+本地 whisper 是默认（离线、免费）。v0.3 新增 **MiniMax 云端 ASR**，用同一个 `providers.minimax` Key 即可，实测更快：
+
+| 音频长度 | 整段转写耗时（含上传/网络） |
+|---|---|
+| 4s | ~0.79s |
+| 12s | ~1.0–1.2s |
+
+- 接口：`POST https://api.minimaxi.com/v1/speech_to_text`，multipart `model=asr-1.0` + WAV 16k mono；`stream=true` 时 SSE 增量
+- 使用：`npm run start:cloud` / `npm run batch:cloud`（等价 `LIVEDUB_PROFILE=cloud`）
+- 隐私：**云端 ASR 会把音频上传到 MiniMax**；工作台会显示隐私提示。失败自动降级本地 whisper（`asr.fallback`）
+- 不支持音频流式输入：由客户端 VAD 切句后整段上传，因此最终延迟 ≈ VAD 静音判定 + 一次上传/识别
+
+> 想完全离线就保持默认档；想让延迟更低且能接受音频上云就用 cloud 档。
+
+## 6. 火山引擎 TTS + 声音复刻（真正原声克隆，v0.3 新增）
+
+> ⚠️ 需要**豆包语音控制台**的 **UUID 格式 API Key**（「语音技术 → API Key 管理」）。
+> 火山方舟的 `ark-` Key 不能调用语音服务（实测 401 Invalid X-Api-Key）。
+> 当前本机只有方舟 Key，所以该 provider 的协议已实现、真机只能验证 401/降级路径。
+
+配置（`config/livedub.config.json`）：
+
+```json
+{
+  "providers": {
+    "volcengine": { "baseUrl": "https://openspeech.bytedance.com" }
+  },
+  "tts": {
+    "provider": "volcengine",
+    "clone": { "chain": ["volcengine", "minimax"] }
+  }
+}
+```
+
+凭证（任一）：`VOLCENGINE_SPEECH_API_KEY` / `ARK_SPEECH_API_KEY` 环境变量，或 `~/.sayless/config.json` 的 `providers.volcengine.apiKey`。
+
+- **TTS**：`POST /api/v3/tts/unidirectional`，按音色自动推断 `X-Api-Resource-Id`（复刻 `S_`→`seed-icl-2.0`、2.0 `uranus`→`seed-tts-2.0`、1.0 `_bigtts`→`volc.service_type.10029`），PCM 24k 流式返回
+- **声音复刻**：`POST /api/v3/tts/voice_clone`，上传 10s–5min 讲师语音 → `speaker_id`，status=2/4 即可合成（1=训练中，会提示稍后重试）
+- livedub 的 `clone-first` 会按 `tts.clone.chain` 依次尝试（例如 火山 → MiniMax），失败自动降级预设音色并继续同传
+
+开通步骤：
+1. 火山引擎控制台搜索「豆包语音」→ 开通语音合成/声音复刻；
+2. 「语音技术 → API Key 管理」创建 UUID Key；
+3. `export ARK_SPEECH_API_KEY=<uuid>` 或写进 `~/.sayless/config.json` 的 `providers.volcengine.apiKey`；
+4. `npm run doctor` 应显示 volcengine 已配置；`npm start` 后会在会话中自动尝试克隆讲师音色。
+
+## 7. 延迟档位（ASR）
+
+| 档位 | 开启方式 | ASR 后端 | 实测 e2e（本机） | 适用 |
+|---|---|---|---|---|
+| 质量档（默认） | `npm start` | 本地 whisper large | ~3.0s | 离线、术语准确 |
+| 快速档 | `npm run start:fast` | 本地 whisper small | ~2.4s | 离线、低延迟 |
+| 云端档 | `npm run start:cloud` | MiniMax 云端 ASR | 见 docs/MEASUREMENTS.md | 低延迟、可接受音频上云 |
+
+`config/livedub.fast.json` / `config/livedub.cloud.json` 是档位覆盖文件（`LIVEDUB_PROFILE` 叠加）。
+
+> ASR partial（边听边出字幕）默认关闭：每次 partial 也要跑一次识别（本地 whisper 会占用串行队列）。
+> 需要实时字幕感可开 `asr.whisper.partial.enabled`。
+
+## 8. 常见问题
 
 | 档位 | 开启方式 | 模型 | 实测 e2e（本机） | 适用 |
 |---|---|---|---|---|
@@ -105,7 +166,7 @@ curl -L -o models/ggml-small.bin \
 > ASR partial（边听边出字幕）默认关闭：每次 partial 也要跑一次 whisper 推理，会占用串行队列，
 > 实测让 final 延后 ~0.8s。想要实时字幕感可在 config 里开 `asr.whisper.partial.enabled`。
 
-## 6. 常见问题
+## 8. 常见问题
 
 | 现象 | 原因 / 处理 |
 |---|---|
@@ -115,7 +176,7 @@ curl -L -o models/ggml-small.bin \
 | 字幕出来了但没配音 | 看 `error(tts)` 事件与 `npm run doctor --probe`；确认 TTS key 与音色 ID |
 | 页面抓不到声音（扩展） | DRM/受保护页面、或未在点击手势内调用 tabCapture；换普通视频页面试试 |
 
-## 7. 用量与成本参考（请以各家实时价格为准）
+## 9. 用量与成本参考（请以各家实时价格为准）
 
 - 翻译：每句一次短请求（输入 <200 tokens，输出 <120 tokens），60 分钟课程约 300–500 句；
 - TTS：按输出字符计费，中文译文约为原文的 0.6–1.0 倍字符量；

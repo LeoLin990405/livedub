@@ -650,8 +650,12 @@ function sanitizeSettingsPatch(patch) {
     if (normalized) out.engineUrl = normalized;
   }
   if (typeof patch.voiceMode === 'string') out.voiceMode = patch.voiceMode === 'preset' ? 'preset' : 'clone-first';
-  for (const key of ['dubEnabled', 'showOriginal', 'hidden']) {
+  for (const key of ['dubEnabled', 'showOriginal', 'hidden', 'captureReplay', 'globalDuck', 'fullscreenWorkaround']) {
     if (typeof patch[key] === 'boolean') out[key] = patch[key];
+  }
+  if (patch.duckRecoverMs != null) {
+    const recover = Number(patch.duckRecoverMs);
+    if (Number.isFinite(recover)) out.duckRecoverMs = Math.round(Math.min(3000, Math.max(300, recover)));
   }
   if (patch.duckRatio != null) {
     const ratio = Number(patch.duckRatio);
@@ -693,12 +697,21 @@ async function updateSettings(patch) {
 /** 配音开关 / 音色模式变化时，通过 config 消息实时同步给运行中的引擎 */
 async function syncEngineConfig(previous, next) {
   if (!['running', 'starting'].includes(bgState.phase)) return;
+  // 引擎侧配置（dub/voiceMode 走 config 消息）
   const patch = {};
   if (previous.dubEnabled !== next.dubEnabled) patch.dub = { enabled: !!next.dubEnabled };
   if (previous.voiceMode !== next.voiceMode) patch.tts = { voiceMode: next.voiceMode };
-  if (Object.keys(patch).length === 0) return;
+  // v0.3 offscreen 本地音频设置（原声重放 / 全局限定压音 / 恢复延迟）
+  const audioSettings = {};
+  for (const key of ['captureReplay', 'globalDuck', 'duckRatio', 'duckRecoverMs']) {
+    if (previous[key] !== next[key]) audioSettings[key] = next[key];
+  }
+  if (Object.keys(patch).length === 0 && Object.keys(audioSettings).length === 0) return;
+  const message = { type: MSG.OFFSCREEN_CONFIG };
+  if (Object.keys(patch).length > 0) message.patch = patch;
+  if (Object.keys(audioSettings).length > 0) message.settings = audioSettings;
   try {
-    await sendToOffscreen({ type: MSG.OFFSCREEN_CONFIG, patch }, { timeoutMs: 1500 });
+    await sendToOffscreen(message, { timeoutMs: 1500 });
   } catch (err) {
     log('syncEngineConfig failed', err && err.message);
   }

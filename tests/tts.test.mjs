@@ -10,7 +10,11 @@
  *   - voice manager：preset / clone-first 累积一次克隆 / 失败永久降级不重试 / 重采样
  *   - macos-say：不 spawn 的纯逻辑（列表/克隆不支持/空文本）
  *
- * 真机测试（macOS say / MiniMax 真实 API / 真实 2061）仅在 LIVEDUB_INTEGRATION=1 时运行：
+ *   - 火山引擎（豆包语音）TTS v3：NDJSON data 解码、多行/半包、Resource-Id 推断、错误码映射、401
+ *   - 火山声音复刻 v3：WAV 上传、status 2/4 成功、1 训练中、失败/过大、状态查询、凭据 UUID 校验
+ *   - v0.3 voice manager 克隆候选链：minimax → volcengine，全失败才降级 preset、只尝试一轮
+ *
+ * 真机测试（macOS say / MiniMax 真实 API / 真实 2061 / 火山 401）仅在 LIVEDUB_INTEGRATION=1 时运行：
  *   LIVEDUB_INTEGRATION=1 node --test tests/tts.test.mjs
  */
 import test from 'node:test';
@@ -24,6 +28,9 @@ const INTEGRATION = process.env.LIVEDUB_INTEGRATION === '1';
 if (!INTEGRATION) {
   process.env.SAYLESS_DIR = path.join(os.tmpdir(), 'livedub-tts-test-no-sayless');
   delete process.env.LIVEDUB_PROVIDER_MINIMAX_API_KEY;
+  for (const key of ['VOLCENGINE_SPEECH_API_KEY', 'ARS_SPEECH_API_KEY', 'ARK_SPEECH_API_KEY', 'LIVEDUB_PROVIDER_VOLCENGINE_API_KEY']) {
+    delete process.env[key];
+  }
 }
 
 const { createTts, createTtsWithFallback, splitForTts } = await import('../engine/tts/index.mjs');
@@ -120,6 +127,55 @@ function minimaxConfig(overrides = {}) {
 }
 
 const OK_RESP = { base_resp: { status_code: 0, status_msg: 'success' } };
+
+/** 构造火山语音 TTS 的 NDJSON 响应（逐行 JSON；body 按小片切开模拟半包） */
+function ndjsonResponse(lines, { status = 200, splitBytes = 7 } = {}) {
+  const text = `${lines.map((line) => (typeof line === 'string' ? line : JSON.stringify(line))).join('\n')}\n`;
+  return {
+    ok: status >= 200 && status < 300,
+    status,
+    async text() {
+      return text;
+    },
+    async json() {
+      return JSON.parse(text);
+    },
+    body: (async function* body() {
+      const bytes = new TextEncoder().encode(text);
+      for (let i = 0; i < bytes.length; i += splitBytes) yield bytes.subarray(i, i + splitBytes);
+    })(),
+  };
+}
+
+/** 火山语音错误响应（HTTP 200 + code） */
+function volcErrorResponse(code, message = 'error') {
+  return ndjsonResponse([{ code, message }]);
+}
+
+const VOLC_TEST_KEY = '11111111-2222-3333-4444-555555555555';
+const VOLC_TEST_VOICE = 'zh_male_wennuanahu_moon_bigtts';
+
+function volcConfig(overrides = {}) {
+  return {
+    tts: {
+      provider: 'volcengine',
+      sampleRate: 24000,
+      speed: 1,
+      voiceMode: 'preset',
+      presetVoices: {
+        default: VOLC_TEST_VOICE,
+        male: VOLC_TEST_VOICE,
+        female: 'zh_female_shuangkuaisisi_moon_bigtts',
+      },
+      volcengine: { baseUrl: 'https://volc.test', defaultVoice: VOLC_TEST_VOICE },
+      clone: { provider: 'volcengine', minSampleSec: 1, maxSampleSec: 5 },
+      timeoutMs: 500,
+      cache: { enabled: false },
+      ...overrides,
+    },
+    providers: { volcengine: { apiKey: VOLC_TEST_KEY } },
+  };
+}
 
 async function collect(iterable) {
   const out = [];
@@ -1212,6 +1268,544 @@ test('v0.2 降级链: warmup / stats / 缓存 均可用', async () => {
 });
 
 // ---------------------------------------------------------------------------
+// v0.3 火山引擎 TTS v3（NDJSON 流式 / Resource-Id / 错误码）
+// ---------------------------------------------------------------------------
+
+test('volcengine TTS: 请求地址/headers/body 正确，多行 NDJSON data 拼接为 PCM', async () => {
+  const a = makePcm(120, 24000);
+  const b = makePcm(180, 24000);
+  const fetchMock = makeFetchMock(async () =>
+    ndjsonResponse([
+      { code: 0, message: '', data: a.toString('base64') },
+      { code: 0, message: '', data: b.toString('base64') },
+    ])
+  );
+  const tts = await createTts({ config: volcConfig(), log: () => {}, fetchImpl: fetchMock });
+  const res = await tts.synthesize({ text: '同学们好，今天我们学习梯度下降。', voiceId: VOLC_TEST_VOICE });
+
+  assert.equal(fetchMock.calls.length, 1);
+  const { url, init } = fetchMock.calls[0];
+  assert.equal(url, 'https://volc.test/api/v3/tts/unidirectional');
+  assert.equal(init.method, 'POST');
+  assert.equal(init.headers['X-Api-Key'], VOLC_TEST_KEY);
+  assert.equal(init.headers['X-Api-Resource-Id'], 'volc.service_type.10029');
+  assert.match(init.headers['X-Api-Request-Id'], /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i);
+  const body = JSON.parse(init.body);
+  assert.equal(body.req_params.text, '同学们好，今天我们学习梯度下降。');
+  assert.equal(body.req_params.speaker, VOLC_TEST_VOICE);
+  assert.deepEqual(body.req_params.audio_params, { format: 'pcm', sample_rate: 24000 });
+
+  assert.equal(res.pcm.equals(Buffer.concat([a, b])), true);
+  assert.equal(res.sampleRate, 24000);
+  assert.equal(res.format, 's16le');
+  assert.equal(res.durationMs, 300);
+  assert.equal(res.voiceId, VOLC_TEST_VOICE);
+});
+
+test('volcengine TTS: X-Api-Resource-Id 按音色类型推断（S_→seed-icl-2.0 / uranus→seed-tts-2.0 / 其它→10029）', async () => {
+  const cases = [
+    ['S_clone_abc', 'seed-icl-2.0'],
+    ['zh_male_uranus_demo', 'seed-tts-2.0'],
+    ['zh_female_x_moon_bigtts', 'volc.service_type.10029'],
+  ];
+  for (const [voiceId, expected] of cases) {
+    const fetchMock = makeFetchMock(async () => ndjsonResponse([{ code: 0, data: makePcm(40).toString('base64') }]));
+    const tts = await createTts({ config: volcConfig(), log: () => {}, fetchImpl: fetchMock });
+    await tts.synthesize({ text: '资源 id 测试', voiceId });
+    assert.equal(fetchMock.calls[0].init.headers['X-Api-Resource-Id'], expected, `voiceId=${voiceId}`);
+  }
+});
+
+test('volcengine TTS: config.resourceId 可覆盖自动推断（S_ 复刻音色被误配时也以配置为准）', async () => {
+  const cfg = volcConfig({ volcengine: { baseUrl: 'https://volc.test', defaultVoice: VOLC_TEST_VOICE, resourceId: 'seed-icl-2.0' } });
+  const fetchMock = makeFetchMock(async () => ndjsonResponse([{ code: 0, data: makePcm(40).toString('base64') }]));
+  const tts = await createTts({ config: cfg, log: () => {}, fetchImpl: fetchMock });
+  await tts.synthesize({ text: '覆盖资源 id' });
+  assert.equal(fetchMock.calls[0].init.headers['X-Api-Resource-Id'], 'seed-icl-2.0');
+});
+
+test('volcengine TTS: NDJSON 跨 chunk 半包 / CRLF / 容忍 data: 前缀 / SSE 心跳行', async () => {
+  const pcm = makePcm(90, 24000);
+  const raw = `\r\n: heartbeat\r\n\r\ndata: ${JSON.stringify({ code: 0, data: pcm.toString('base64') })}\r\n`;
+  const fetchMock = makeFetchMock(async () => ({
+    ok: true,
+    status: 200,
+    async text() {
+      return raw;
+    },
+    body: (async function* body() {
+      const bytes = new TextEncoder().encode(raw);
+      for (let i = 0; i < bytes.length; i += 5) yield bytes.subarray(i, i + 5);
+    })(),
+  }));
+  const tts = await createTts({ config: volcConfig(), log: () => {}, fetchImpl: fetchMock });
+  const res = await tts.synthesize({ text: '半包解析' , voiceId: VOLC_TEST_VOICE });
+  assert.equal(res.pcm.equals(pcm), true);
+});
+
+test('volcengine TTS: synthesizeStream 边收边 yield（多个 data 行 → 多块）', async () => {
+  const a = makePcm(50, 24000);
+  const b = makePcm(70, 24000);
+  const c = makePcm(30, 24000);
+  const fetchMock = makeFetchMock(async () =>
+    ndjsonResponse(
+      [
+        { code: 0, data: a.toString('base64') },
+        { code: 0, data: b.toString('base64') },
+        { code: 0, data: c.toString('base64') },
+        { code: 0, data: '' },
+      ],
+      { splitBytes: 11 }
+    )
+  );
+  const tts = await createTts({ config: volcConfig(), log: () => {}, fetchImpl: fetchMock });
+  const chunks = await collect(tts.synthesizeStream({ text: '流式火山', voiceId: VOLC_TEST_VOICE }));
+  assert.equal(chunks.length, 3);
+  assert.equal(Buffer.concat(chunks.map((x) => x.pcm)).equals(Buffer.concat([a, b, c])), true);
+  for (const chunk of chunks) assert.equal(chunk.sampleRate, 24000);
+});
+
+test('volcengine TTS: 错误码 45000010 / 55000000 / 45000030 映射为可读错误 + 提示', async () => {
+  const cases = [
+    [45000010, /X-Api-Key|45000010/, /UUID/],
+    [55000000, /speaker|55000000/, /seed-icl-2\.0|Resource-Id/],
+    [45000030, /45000030/, /权限|ark-|UUID Key/],
+  ];
+  for (const [code, messageRe, hintRe] of cases) {
+    const fetchMock = makeFetchMock(async () => volcErrorResponse(code, 'volc says no'));
+    const tts = await createTts({ config: volcConfig(), log: () => {}, fetchImpl: fetchMock });
+    await assert.rejects(
+      () => tts.synthesize({ text: '错误码映射', voiceId: VOLC_TEST_VOICE }),
+      (err) => {
+        assert.equal(err.code, code);
+        assert.match(err.message, messageRe);
+        assert.match(err.message, hintRe);
+        return true;
+      }
+    );
+  }
+});
+
+test('volcengine TTS: 错误码嵌在 header 里也能识别（真实 401 body 形态）', async () => {
+  const fetchMock = makeFetchMock(async () =>
+    ndjsonResponse([{ header: { code: 45000010, message: 'Invalid X-Api-Key' } }])
+  );
+  const tts = await createTts({ config: volcConfig(), log: () => {}, fetchImpl: fetchMock });
+  await assert.rejects(
+    () => tts.synthesize({ text: 'header 错误码', voiceId: VOLC_TEST_VOICE }),
+    (err) => err.code === 45000010 && /Invalid X-Api-Key|UUID/.test(err.message)
+  );
+});
+
+test('volcengine TTS: HTTP 401 鉴权失败给出 UUID Key 开通提示', async () => {
+  const fetchMock = makeFetchMock(async () => ({
+    ok: false,
+    status: 401,
+    async text() {
+      return 'unauthorized';
+    },
+  }));
+  const tts = await createTts({ config: volcConfig(), log: () => {}, fetchImpl: fetchMock });
+  await assert.rejects(
+    () => tts.synthesize({ text: '401 测试', voiceId: VOLC_TEST_VOICE }),
+    (err) => {
+      assert.equal(err.code, 401);
+      assert.match(err.message, /401|鉴权失败/);
+      assert.match(err.message, /UUID Key|豆包语音控制台/);
+      return true;
+    }
+  );
+});
+
+test('volcengine TTS: 空音频 / 缺 speaker / 已 abort 的清晰错误', async () => {
+  const emptyMock = makeFetchMock(async () => ndjsonResponse([{ code: 0, data: '' }]));
+  const tts1 = await createTts({ config: volcConfig(), log: () => {}, fetchImpl: emptyMock });
+  await assert.rejects(() => tts1.synthesize({ text: '空音频', voiceId: VOLC_TEST_VOICE }), /0 字节|空/);
+
+  const cfgNoVoice = volcConfig({ presetVoices: {}, volcengine: { baseUrl: 'https://volc.test' } });
+  const tts2 = await createTts({ config: cfgNoVoice, log: () => {}, fetchImpl: makeFetchMock(async () => ndjsonResponse([])) });
+  await assert.rejects(() => tts2.synthesize({ text: '缺音色' }), /speaker|音色 ID/);
+
+  const ac = new AbortController();
+  ac.abort();
+  const tts3 = await createTts({ config: volcConfig(), log: () => {}, fetchImpl: makeFetchMock(async () => ndjsonResponse([])) });
+  await assert.rejects(() => tts3.synthesize({ text: '取消', signal: ac.signal }), (err) => err.name === 'AbortError');
+});
+
+test('volcengine TTS: warmup 纯本地（不发请求）且返回 ok', async () => {
+  const fetchMock = makeFetchMock(async () => ndjsonResponse([]));
+  const tts = await createTts({ config: volcConfig(), log: () => {}, fetchImpl: fetchMock });
+  const warm = await tts.warmup();
+  assert.equal(warm.ok, true);
+  assert.equal(warm.provider, 'volcengine');
+  assert.equal(fetchMock.calls.length, 0);
+});
+
+test('volcengine TTS: 走 createTts 缓存后重复短语不重复请求', async () => {
+  const pcm = makePcm(80, 24000);
+  const fetchMock = makeFetchMock(async () => ndjsonResponse([{ code: 0, data: pcm.toString('base64') }]));
+  const cfg = volcConfig({ cache: { enabled: true, maxEntries: 8, maxTextChars: 120 } });
+  const tts = await createTts({ config: cfg, log: () => {}, fetchImpl: fetchMock });
+  await tts.synthesize({ text: '重复术语', voiceId: VOLC_TEST_VOICE });
+  const hit = await tts.synthesize({ text: '重复术语', voiceId: VOLC_TEST_VOICE });
+  assert.equal(fetchMock.calls.length, 1);
+  assert.equal(hit.pcm.equals(pcm), true);
+});
+
+// ---------------------------------------------------------------------------
+// v0.3 火山引擎凭据（UUID 校验 / env 别名 / 拒 ark-）
+// ---------------------------------------------------------------------------
+
+test('volcengine 凭据: 缺 Key / ark- Key / 非 UUID 都给出可读开通提示（不发请求）', async () => {
+  const saved = process.env.SAYLESS_DIR;
+  process.env.SAYLESS_DIR = path.join(os.tmpdir(), 'livedub-tts-test-no-sayless');
+  try {
+    await assert.rejects(
+      () => createTts({ config: { tts: { provider: 'volcengine' }, providers: {} }, log: () => {} }),
+      (err) => {
+        assert.equal(err.code, 'missing_api_key');
+        assert.match(err.message, /豆包语音|UUID Key/);
+        assert.match(err.message, /开通|控制台/);
+        return true;
+      }
+    );
+    await assert.rejects(
+      () => createTts({ config: { tts: { provider: 'volcengine' }, providers: { volcengine: { apiKey: 'ark-12345678-abcd' } } }, log: () => {} }),
+      (err) => {
+        assert.equal(err.code, 'ark_key_not_supported');
+        assert.match(err.message, /ark-/);
+        assert.match(err.message, /不能调用|没有语音权限/);
+        return true;
+      }
+    );
+    await assert.rejects(
+      () => createTts({ config: { tts: { provider: 'volcengine' }, providers: { volcengine: { apiKey: 'not-a-uuid-key' } } }, log: () => {} }),
+      (err) => {
+        assert.equal(err.code, 'bad_api_key_format');
+        assert.match(err.message, /UUID/);
+        return true;
+      }
+    );
+  } finally {
+    if (saved === undefined) delete process.env.SAYLESS_DIR;
+    else process.env.SAYLESS_DIR = saved;
+  }
+});
+
+test('volcengine 凭据: env 别名 VOLCENGINE_SPEECH_API_KEY / ARS_SPEECH_API_KEY 可用', async () => {
+  const saved = {
+    VOLCENGINE: process.env.VOLCENGINE_SPEECH_API_KEY,
+    ARS: process.env.ARS_SPEECH_API_KEY,
+    ARK: process.env.ARK_SPEECH_API_KEY,
+  };
+  try {
+    delete process.env.ARS_SPEECH_API_KEY;
+    delete process.env.ARK_SPEECH_API_KEY;
+    process.env.VOLCENGINE_SPEECH_API_KEY = VOLC_TEST_KEY;
+    const tts1 = await createTts({ config: { tts: { provider: 'volcengine' }, providers: {} }, log: () => {} });
+    assert.equal(tts1.name, 'volcengine');
+
+    delete process.env.VOLCENGINE_SPEECH_API_KEY;
+    process.env.ARS_SPEECH_API_KEY = VOLC_TEST_KEY;
+    const tts2 = await createTts({ config: { tts: { provider: 'volcengine' }, providers: {} }, log: () => {} });
+    assert.equal(tts2.name, 'volcengine');
+  } finally {
+    if (saved.VOLCENGINE === undefined) delete process.env.VOLCENGINE_SPEECH_API_KEY;
+    else process.env.VOLCENGINE_SPEECH_API_KEY = saved.VOLCENGINE;
+    if (saved.ARS === undefined) delete process.env.ARS_SPEECH_API_KEY;
+    else process.env.ARS_SPEECH_API_KEY = saved.ARS;
+    if (saved.ARK === undefined) delete process.env.ARK_SPEECH_API_KEY;
+    else process.env.ARK_SPEECH_API_KEY = saved.ARK;
+  }
+});
+
+// ---------------------------------------------------------------------------
+// v0.3 火山声音复刻 v3（voice_clone）
+// ---------------------------------------------------------------------------
+
+function decodeWavFromCloneBody(init) {
+  const body = JSON.parse(init.body);
+  const bytes = Buffer.from(body.audio.data, 'base64');
+  return { body, bytes };
+}
+
+test('volcengine cloneVoice: status=2 成功，上传 base64 WAV（RIFF）+ language/extra_params 正确', async () => {
+  const pcm = makePcm(12000, 16000);
+  const fetchMock = makeFetchMock(async () => jsonResponse({ code: 0, message: '', status: 2, speaker_id: 'S_clone_ready_1' }));
+  const tts = await createTts({ config: volcConfig(), log: () => {}, fetchImpl: fetchMock });
+  const cloned = await tts.cloneVoice({ pcm, sampleRate: 16000, name: 'session-speaker' });
+
+  assert.equal(cloned.mode, 'clone');
+  assert.equal(cloned.provider, 'volcengine');
+  assert.equal(cloned.voiceId, 'S_clone_ready_1');
+  assert.equal(fetchMock.calls.length, 1);
+  const { url, init } = fetchMock.calls[0];
+  assert.equal(url, 'https://volc.test/api/v3/tts/voice_clone');
+  assert.equal(init.headers['X-Api-Key'], VOLC_TEST_KEY);
+  assert.match(init.headers['X-Api-Request-Id'], /^[0-9a-f-]{36}$/i);
+  assert.equal(init.headers['X-Api-Resource-Id'], undefined, '复刻接口只带 X-Api-Key + X-Api-Request-Id');
+  const { body, bytes } = decodeWavFromCloneBody(init);
+  assert.match(body.speaker_id, /^S_[A-Za-z0-9_]+$/);
+  assert.equal(body.audio.format, 'wav');
+  assert.equal(body.language, 1);
+  assert.equal(body.extra_params.enable_audio_denoise, true);
+  assert.equal(bytes.toString('ascii', 0, 4), 'RIFF');
+  assert.equal(bytes.toString('ascii', 8, 12), 'WAVE');
+  assert.equal(bytes.length, pcm.length + 44);
+});
+
+test('volcengine cloneVoice: status=4 也视为可用；显式 voiceId 必须 S_ 前缀', async () => {
+  const fetchMock = makeFetchMock(async () => jsonResponse({ code: 0, status: 4, speaker_id: 'S_custom_voice_9' }));
+  const tts = await createTts({ config: volcConfig(), log: () => {}, fetchImpl: fetchMock });
+  const cloned = await tts.cloneVoice({ pcm: makePcm(12000, 16000), sampleRate: 16000, voiceId: 'S_custom_voice_9' });
+  assert.equal(cloned.voiceId, 'S_custom_voice_9');
+  const body = JSON.parse(fetchMock.calls[0].init.body);
+  assert.equal(body.speaker_id, 'S_custom_voice_9');
+
+  await assert.rejects(
+    () => tts.cloneVoice({ pcm: makePcm(12000, 16000), sampleRate: 16000, voiceId: 'no-prefix' }),
+    (err) => err.code === 'bad_speaker_id' && /S_/.test(err.message)
+  );
+  assert.equal(fetchMock.calls.length, 1, '非法 speaker_id 应在请求前拦截');
+});
+
+test('volcengine cloneVoice: status=1 训练中 -> 明确错误（voice manager 会降级 preset）', async () => {
+  const fetchMock = makeFetchMock(async () => jsonResponse({ code: 0, status: 1, speaker_id: 'S_training_1' }));
+  const tts = await createTts({ config: volcConfig(), log: () => {}, fetchImpl: fetchMock });
+  await assert.rejects(
+    () => tts.cloneVoice({ pcm: makePcm(12000, 16000), sampleRate: 16000 }),
+    (err) => {
+      assert.equal(err.code, 'voice_clone_training');
+      assert.match(err.message, /训练中/);
+      assert.match(err.message, /降级|重试|voiceCloneStatus/);
+      return true;
+    }
+  );
+});
+
+test('volcengine cloneVoice: 业务失败码 / HTTP 401 / 音频超 10MB 都有可读错误', async () => {
+  const codeMock = makeFetchMock(async () => jsonResponse({ code: 45000010, message: 'Invalid X-Api-Key' }));
+  const tts1 = await createTts({ config: volcConfig(), log: () => {}, fetchImpl: codeMock });
+  await assert.rejects(
+    () => tts1.cloneVoice({ pcm: makePcm(12000, 16000), sampleRate: 16000 }),
+    (err) => err.code === 45000010 && /X-Api-Key|45000010/.test(err.message)
+  );
+
+  const httpMock = makeFetchMock(async () => ({ ok: false, status: 401, async text() { return 'unauthorized'; } }));
+  const tts2 = await createTts({ config: volcConfig(), log: () => {}, fetchImpl: httpMock });
+  await assert.rejects(
+    () => tts2.cloneVoice({ pcm: makePcm(12000, 16000), sampleRate: 16000 }),
+    (err) => err.code === 401 && /401|鉴权/.test(err.message)
+  );
+
+  const noFetch = makeFetchMock(async () => jsonResponse({ code: 0, status: 2 }));
+  const tts3 = await createTts({ config: volcConfig(), log: () => {}, fetchImpl: noFetch });
+  const tooLarge = Buffer.alloc(Math.ceil((10 * 1024 * 1024) / 2) * 2); // 10MB PCM -> WAV 超过 10MB
+  await assert.rejects(
+    () => tts3.cloneVoice({ pcm: tooLarge, sampleRate: 16000 }),
+    (err) => err.code === 'audio_too_large' && /10MB/.test(err.message)
+  );
+  assert.equal(noFetch.calls.length, 0);
+});
+
+test('volcengine cloneVoice: 样本 <10s 在请求前拦截（火山 v3 要求 10s-5min）', async () => {
+  const fetchMock = makeFetchMock(async () => jsonResponse({ code: 0, status: 2 }));
+  const tts = await createTts({ config: volcConfig(), log: () => {}, fetchImpl: fetchMock });
+  await assert.rejects(
+    () => tts.cloneVoice({ pcm: makePcm(3000, 16000), sampleRate: 16000 }),
+    (err) => err.code === 'sample_too_short' && /10s/.test(err.message)
+  );
+  assert.equal(fetchMock.calls.length, 0);
+});
+
+test('volcengine voiceCloneStatus: 尽力而为的状态查询（ready / 不可用都不抛）', async () => {
+  const readyMock = makeFetchMock(async (url) => {
+    assert.match(url, /\/api\/v3\/tts\/voice_clone\?speaker_id=S_ready_1$/);
+    return jsonResponse({ code: 0, status: 4, speaker_id: 'S_ready_1' });
+  });
+  const tts1 = await createTts({ config: volcConfig(), log: () => {}, fetchImpl: readyMock });
+  const ready = await tts1.voiceCloneStatus('S_ready_1');
+  assert.equal(ready.ok, true);
+  assert.equal(ready.statusText, 'ready');
+
+  const unavailableMock = makeFetchMock(async () => ({ ok: false, status: 404, async text() { return 'not found'; } }));
+  const tts2 = await createTts({ config: volcConfig(), log: () => {}, fetchImpl: unavailableMock });
+  const unavailable = await tts2.voiceCloneStatus('S_x');
+  assert.equal(unavailable.ok, false);
+  assert.equal(unavailable.supported, false);
+});
+
+test('volcengine listVoices: 配置音色 + S_ 复刻音色 + 静态公版兜底', async () => {
+  const cfg = volcConfig({
+    volcengine: {
+      baseUrl: 'https://volc.test',
+      defaultVoice: VOLC_TEST_VOICE,
+      voices: [{ id: 'zh_custom_voice_1', label: '自定义音色', gender: 'female' }],
+      clonedVoices: ['S_my_clone_1'],
+    },
+  });
+  const tts = await createTts({ config: cfg, log: () => {}, fetchImpl: makeFetchMock(async () => jsonResponse({})) });
+  const voices = await tts.listVoices();
+  assert.ok(voices.find((v) => v.id === 'zh_custom_voice_1' && v.label === '自定义音色'));
+  assert.ok(voices.find((v) => v.id === 'S_my_clone_1' && v.cloned === true));
+  assert.ok(voices.find((v) => v.id === VOLC_TEST_VOICE));
+});
+
+// ---------------------------------------------------------------------------
+// v0.3 voice manager：克隆候选链 minimax -> volcengine
+// ---------------------------------------------------------------------------
+
+function chainVoiceConfig(overrides = {}) {
+  return {
+    tts: {
+      voiceMode: 'clone-first',
+      sampleRate: 24000,
+      presetVoices: { default: 'male-qn-qingse', male: 'male-qn-qingse', female: 'female-shaonv' },
+      clone: { provider: 'minimax', minSampleSec: 1, maxSampleSec: 5, ...overrides },
+    },
+  };
+}
+
+function fakeCloneProvider({ provider, voiceId, fail } = {}) {
+  return {
+    name: provider,
+    cloneCalls: 0,
+    async cloneVoice() {
+      this.cloneCalls += 1;
+      if (fail) throw fail;
+      return { voiceId: voiceId || `S_${provider}_clone`, mode: 'clone', provider };
+    },
+  };
+}
+
+test('voice 克隆链: minimax 失败（2061）后自动尝试 volcengine 并成功', async () => {
+  const primary = {
+    name: 'minimax',
+    async cloneVoice() {
+      const err = new Error('[tts:minimax] voice_clone 失败：plan not support（base_resp.status_code=2061）');
+      err.code = 2061;
+      throw err;
+    },
+  };
+  const volcFake = fakeCloneProvider({ provider: 'volcengine', voiceId: 'S_volc_clone_abc' });
+  const factoryCalls = [];
+  const vm = createVoiceManager({
+    config: chainVoiceConfig(),
+    tts: primary,
+    log: () => {},
+    createTtsImpl: ({ config }) => {
+      factoryCalls.push(config.tts.provider);
+      if (config.tts.provider === 'volcengine') return volcFake;
+      throw new Error(`unexpected provider ${config.tts.provider}`);
+    },
+  });
+  const result = await vm.ensureVoice({ pcm: makePcm(1200, 16000), sampleRate: 16000 });
+  assert.equal(result.mode, 'clone');
+  assert.equal(result.voiceId, 'S_volc_clone_abc');
+  assert.equal(result.degraded, false);
+  const stats = vm.stats();
+  assert.equal(stats.cloneProvider, 'volcengine');
+  assert.deepEqual(stats.cloneProviderChain, ['minimax', 'volcengine']);
+  assert.equal(stats.cloneFailures.length, 1);
+  assert.equal(stats.cloneFailures[0].provider, 'minimax');
+  assert.deepEqual(factoryCalls, ['volcengine']);
+});
+
+test('voice 克隆链: 全失败才降级 preset，只尝试一轮、不重试', async () => {
+  const primary = {
+    name: 'minimax',
+    async cloneVoice() {
+      const err = new Error('plan not support');
+      err.code = 2061;
+      throw err;
+    },
+  };
+  let factoryCalls = 0;
+  const vm = createVoiceManager({
+    config: chainVoiceConfig(),
+    tts: primary,
+    log: () => {},
+    createTtsImpl: () => {
+      factoryCalls += 1;
+      const err = new Error('[tts:volcengine] 缺少火山引擎（豆包语音）API Key');
+      err.code = 'missing_api_key';
+      throw err;
+    },
+  });
+  const first = await vm.ensureVoice({ pcm: makePcm(1200, 16000), sampleRate: 16000 });
+  assert.equal(first.mode, 'preset');
+  assert.equal(first.degraded, true);
+  assert.match(first.reason, /minimax/);
+  assert.match(first.reason, /volcengine/);
+  assert.match(first.reason, /2061/);
+  assert.match(first.reason, /missing_api_key|API Key/);
+  assert.equal(vm.stats().cloneAttempts, 1);
+  assert.equal(factoryCalls, 1, 'volcengine 客户端只创建/尝试一次');
+
+  // 再来 3 句：绝不重试
+  for (let i = 0; i < 3; i++) {
+    const r = await vm.ensureVoice({ pcm: makePcm(300, 16000), sampleRate: 16000 });
+    assert.equal(r.degraded, true);
+  }
+  assert.equal(vm.stats().cloneAttempts, 1);
+  assert.equal(factoryCalls, 1);
+});
+
+test('voice 克隆链: 配置 tts.clone.chain=["volcengine"] 时优先走火山', async () => {
+  const primary = { name: 'minimax', async cloneVoice() { throw new Error('should not be used'); } };
+  const volcFake = fakeCloneProvider({ provider: 'volcengine', voiceId: 'S_volc_only' });
+  const factoryCalls = [];
+  const vm = createVoiceManager({
+    config: chainVoiceConfig({ chain: ['volcengine'] }),
+    tts: primary,
+    log: () => {},
+    createTtsImpl: ({ config }) => {
+      factoryCalls.push(config.tts.provider);
+      return volcFake;
+    },
+  });
+  const result = await vm.ensureVoice({ pcm: makePcm(1200, 16000), sampleRate: 16000 });
+  assert.equal(result.mode, 'clone');
+  assert.equal(result.voiceId, 'S_volc_only');
+  assert.equal(volcFake.cloneCalls, 1);
+  assert.equal(factoryCalls[0], 'volcengine');
+  assert.deepEqual(vm.stats().cloneProviderChain, ['volcengine']);
+});
+
+test('voice 克隆链: 主 provider 就在链里时直接复用，不重复创建实例', async () => {
+  const primary = fakeCloneProvider({ provider: 'volcengine', voiceId: 'S_primary_ok' });
+  let factoryCalls = 0;
+  const vm = createVoiceManager({
+    config: chainVoiceConfig({ provider: 'volcengine', chain: ['volcengine', 'minimax'] }),
+    tts: primary,
+    log: () => {},
+    createTtsImpl: () => {
+      factoryCalls += 1;
+      throw new Error('不应创建');
+    },
+  });
+  const result = await vm.ensureVoice({ pcm: makePcm(1200, 16000), sampleRate: 16000 });
+  assert.equal(result.mode, 'clone');
+  assert.equal(primary.cloneCalls, 1);
+  assert.equal(factoryCalls, 0);
+});
+
+test('voice 克隆链: 真实 volcengine provider 训练中(1) -> voice manager 降级 preset 且 reason 可读', async () => {
+  const fetchMock = makeFetchMock(async () => jsonResponse({ code: 0, status: 1, speaker_id: 'S_training_9' }));
+  const volcTts = await createTts({ config: volcConfig(), log: () => {}, fetchImpl: fetchMock });
+  const vm = createVoiceManager({
+    config: chainVoiceConfig({ provider: 'volcengine', chain: ['volcengine'], maxSampleSec: 30 }),
+    tts: volcTts,
+    log: () => {},
+  });
+  const result = await vm.ensureVoice({ pcm: makePcm(12000, 16000), sampleRate: 16000 });
+  assert.equal(result.mode, 'preset');
+  assert.equal(result.degraded, true);
+  assert.match(result.reason, /训练中|voice_clone_training/);
+  assert.equal(vm.state.voiceId, 'male-qn-qingse');
+});
+
+// ---------------------------------------------------------------------------
 // 真机测试（默认跳过）：LIVEDUB_INTEGRATION=1 node --test tests/tts.test.mjs
 // ---------------------------------------------------------------------------
 
@@ -1309,6 +1903,70 @@ test('integration: v0.2 warmup + 流式首包 + 缓存 miss/hit（2 次 TTS + 1 
   console.log(
     `[integration-v0.2] warmup=${warmMs}ms ok=${warm.ok} voices=${warm.voices} | stream first=${streamSamples.map((x) => x.firstMs).join('/')}ms total=${streamSamples.map((x) => x.totalMs).join('/')}ms | cache miss=${missMs}ms hit=${hitMs}ms pcm=${miss.pcm.length}B@${miss.sampleRate}Hz duration=${miss.durationMs}ms | cache=${JSON.stringify({ hits: cacheStats.hits, misses: cacheStats.misses, hitRate: cacheStats.hitRate, entries: cacheStats.entries })}`
   );
+});
+
+test('integration: 火山语音 401 可读错误（本机无 UUID Key）', { skip: !INTEGRATION }, async () => {
+  const saved = process.env.VOLCENGINE_SPEECH_API_KEY;
+  // 用「格式合法但不存在」的 UUID key，让真实 openspeech 返回 401/45000010（<=2 次真机请求预算）
+  process.env.VOLCENGINE_SPEECH_API_KEY = '00000000-0000-4000-8000-000000000000';
+  try {
+    const { loadConfig } = await import('../engine/config.mjs');
+    const config = loadConfig({
+      overrides: { tts: { provider: 'volcengine', voiceMode: 'preset', cache: { enabled: false } } },
+    });
+    const tts = await createTts({ config, log: () => {} });
+    await assert.rejects(
+      () => tts.synthesize({ text: '今天我们学习梯度下降。', voiceId: 'zh_male_wennuanahu_moon_bigtts' }),
+      (err) => {
+        assert.ok(
+          err.code === 401 || err.code === 45000010 || String(err.code || '').startsWith('http_'),
+          `预期 401/45000010/http_xxx，实际 code=${err.code}`
+        );
+        assert.match(err.message, /401|45000010|鉴权失败|X-Api-Key/);
+        assert.match(err.message, /UUID Key|豆包语音控制台|控制台/);
+        console.log(`[integration-volc] 401 evidence: ${JSON.stringify({ code: err.code, message: err.message.slice(0, 240) })}`);
+        return true;
+      }
+    );
+  } finally {
+    if (saved === undefined) delete process.env.VOLCENGINE_SPEECH_API_KEY;
+    else process.env.VOLCENGINE_SPEECH_API_KEY = saved;
+  }
+});
+
+test('integration: 火山 401 自动降级 macos-say（原声克隆不可用时的兜底）', { skip: !INTEGRATION }, async () => {
+  const saved = process.env.VOLCENGINE_SPEECH_API_KEY;
+  process.env.VOLCENGINE_SPEECH_API_KEY = '00000000-0000-4000-8000-000000000000';
+  const logs = [];
+  try {
+    const { loadConfig } = await import('../engine/config.mjs');
+    const config = loadConfig({
+      overrides: {
+        tts: {
+          provider: 'volcengine',
+          voiceMode: 'preset',
+          sampleRate: 24000,
+          cache: { enabled: false },
+          fallbacks: [{ provider: 'macos-say', voice: 'Tingting' }],
+        },
+      },
+    });
+    const tts = await createTtsWithFallback({ config, log: (m) => logs.push(String(m)) });
+    assert.deepEqual(tts.providers, ['volcengine', 'macos-say']);
+    const res = await tts.synthesize({ text: '今天我们学习梯度下降。', voiceId: 'zh_male_wennuanahu_moon_bigtts' });
+    assert.ok(res.pcm.length > 0, '降级后应拿到 macos-say 音频');
+    assert.equal(res.sampleRate, 24000);
+    assert.ok(
+      logs.some((m) => /volcengine.*失败|尝试下一个|fallback/i.test(m)),
+      `应看到 volcengine 失败并切 fallback 的日志，实际：${logs.slice(-5).join(' | ')}`
+    );
+    console.log(
+      `[integration-volc] fallback evidence: providers=${tts.providers.join('->')} pcm=${res.pcm.length}B@${res.sampleRate}Hz duration=${res.durationMs}ms logs=${logs.filter((m) => /volcengine|fallback/i.test(m)).slice(-2).join(' | ')}`
+    );
+  } finally {
+    if (saved === undefined) delete process.env.VOLCENGINE_SPEECH_API_KEY;
+    else process.env.VOLCENGINE_SPEECH_API_KEY = saved;
+  }
 });
 
 test('integration: MiniMax 真实 clone 返回 2061 并带 code', { skip: !INTEGRATION }, async () => {

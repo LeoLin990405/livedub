@@ -19,6 +19,7 @@ import { fileURLToPath } from 'node:url';
 import { float32ToS16le, pcmDurationMs, pcmFromWav } from '../engine/audio.mjs';
 import { createSegmenter } from '../engine/segmenter.mjs';
 import { cleanAsrText, closeSharedServer, createAsr, listSharedServers } from '../engine/asr/index.mjs';
+import { createMinimaxCloudAsr } from '../engine/asr/minimax-cloud.mjs';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const RATE = 16000;
@@ -1089,6 +1090,331 @@ test('asr/whisper-local: 尾部静音/推测期间跳过 partial（不抢推理�
   } finally {
     await closeSharedServer();
   }
+});
+
+
+// ---------------------------------------------------------------- minimax-cloud（fake fetch）
+
+function cloudJsonResponse(body, status = 200) {
+  return new Response(JSON.stringify(body), { status, headers: { 'content-type': 'application/json' } });
+}
+
+function cloudSseResponse(events, status = 200) {
+  const body = events.map((e) => `data: ${JSON.stringify(e)}\n\n`).join('');
+  return new Response(body, { status, headers: { 'content-type': 'text/event-stream' } });
+}
+
+/** fake 云端 fetch：记录每次调用的 URL/init */
+function makeCloudFetch(handler) {
+  const calls = [];
+  const fetchImpl = async (url, init = {}) => {
+    calls.push({ url: String(url), init });
+    return handler({ url: String(url), init, call: calls.length });
+  };
+  return { fetchImpl, calls };
+}
+
+/** minimax-cloud 测试配置：默认 fallback=mock（假本地 provider），apiKey 为测试值 */
+function cloudConfig({ cloud = {}, fallback = 'mock', vad = {}, mock = null, apiKey = 'test-minimax-key' } = {}) {
+  return {
+    session: { sampleRate: RATE, langFrom: 'en' },
+    providers: { minimax: { apiKey, baseUrl: 'https://api.minimaxi.com/v1' } },
+    asr: {
+      provider: 'minimax-cloud',
+      ...(fallback === null ? {} : { fallback }),
+      minimaxCloud: {
+        baseUrl: 'https://api.minimaxi.com/v1',
+        model: 'asr-1.0',
+        timeoutMs: 5000,
+        languageHeader: true,
+        circuitBreakerFailures: 3,
+        partial: { enabled: false, mode: 'final-only', intervalMs: 0, minChars: 2 },
+        ...cloud,
+      },
+      whisper: { ...vadConfig(vad), language: 'en', models: [fakeModelPath] },
+    },
+    mock: mock ?? { asrScript: [{ text: 'fallback text from local provider', durMs: 60000 }] },
+  };
+}
+
+/** 喂一个标准句：前静音 300 + 语音 speechMs + 尾静音 600；返回下一句基准时间 */
+async function feedUtterance(asr, { base = 0, speechMs = 800 } = {}) {
+  await feedAsr(asr, silencePcm(300), { tMs: base });
+  await feedAsr(asr, tonePcm(speechMs), { tMs: base + 300 });
+  await feedAsr(asr, silencePcm(600), { tMs: base + 300 + speechMs });
+  return base + 300 + speechMs + 600;
+}
+
+/** 从 fake 请求里取 form 字段 */
+function formOf(init) {
+  return init?.body;
+}
+
+test('asr/minimax-cloud: JSON 成功 —— 请求格式/header/时间轴/provider 名', async () => {
+  const fake = makeCloudFetch(() => cloudJsonResponse({ text: 'gradient descent from the cloud', duration: 1.2, trace_id: 'trace-1' }));
+  const events = [];
+  const logs = [];
+  const asr = await createAsr({
+    config: cloudConfig({ fallback: null }),
+    log: (m) => logs.push(m),
+    onEvent: (ev) => events.push(ev),
+    fetchImpl: fake.fetchImpl,
+  });
+  assert.equal(asr.name, 'minimax-cloud');
+  await asr.warmup();
+  await feedUtterance(asr);
+  await asr.flush();
+
+  const finals = finalsOf(events);
+  assert.equal(finals.length, 1);
+  assert.equal(finals[0].text, 'gradient descent from the cloud');
+  assert.ok(Math.abs(finals[0].t0Ms - 100) <= 20, `t0=${finals[0].t0Ms} 应≈100（音频时间轴）`);
+  assert.ok(Math.abs(finals[0].t1Ms - 1260) <= 20, `t1=${finals[0].t1Ms} 应≈1260（tailPad）`);
+  assert.equal(events.filter((e) => e.type === 'partial').length, 0, '默认 final-only 不应有 partial');
+
+  assert.equal(fake.calls.length, 1, '一句只应请求一次云端');
+  const { url, init } = fake.calls[0];
+  assert.equal(url, 'https://api.minimaxi.com/v1/speech_to_text');
+  assert.equal(init.method, 'POST');
+  const headers = init.headers ?? {};
+  assert.equal(headers.Authorization, 'Bearer test-minimax-key');
+  assert.equal(headers.language, 'en', 'languageHeader=true 应带 language header');
+  const form = formOf(init);
+  assert.equal(form.get('model'), 'asr-1.0');
+  assert.equal(form.get('stream'), null, 'final-only 不应带 stream=true');
+  const file = form.get('file');
+  assert.ok(file, '应上传 file');
+  const wav = pcmFromWav(Buffer.from(await file.arrayBuffer()));
+  assert.equal(wav.sampleRate, RATE, '上传 WAV 必须是 16k');
+  assert.equal(wav.channels, 1, '上传 WAV 必须是单声道');
+  assert.ok(wav.pcm.length > 0);
+
+  const stats = asr.stats();
+  assert.equal(stats.cloudRequests, 1);
+  assert.equal(stats.cloudFinals, 1);
+  assert.equal(stats.cloudFailures, 0);
+  assert.equal(stats.fallbackFinals, 0);
+  assert.equal(stats.config.model, 'asr-1.0');
+  assert.equal(stats.config.hasApiKey, true);
+  assert.ok(!JSON.stringify(stats).includes('test-minimax-key'), 'stats 不得泄漏 apiKey');
+  assert.ok(!logs.join(' ').includes('test-minimax-key'), '日志不得打印 apiKey');
+  await asr.close();
+});
+
+test('asr/minimax-cloud: SSE stream —— delta 触发 partial，finish 不再额外请求', async () => {
+  const fake = makeCloudFetch(() =>
+    cloudSseResponse([
+      { index: 0, delta: 'gradient', finish: false },
+      { index: 1, delta: ' descent is', finish: false },
+      { index: 2, delta: ' an optimization', finish: false },
+      { index: 3, delta: ' algorithm', finish: false },
+      { index: 4, delta: '', finish: true, duration: 1.2 },
+    ]),
+  );
+  const events = [];
+  const asr = await createAsr({
+    config: cloudConfig({
+      fallback: null,
+      cloud: { partial: { enabled: true, mode: 'stream', intervalMs: 0, minChars: 1 } },
+    }),
+    log: () => {},
+    onEvent: (ev) => events.push(ev),
+    fetchImpl: fake.fetchImpl,
+  });
+  await asr.warmup();
+  await feedUtterance(asr);
+  await asr.flush();
+
+  const partials = events.filter((e) => e.type === 'partial');
+  const finals = finalsOf(events);
+  assert.ok(partials.length >= 2, `SSE 应产生多个 partial，实际 ${partials.length}`);
+  assert.equal(partials[partials.length - 1].text, 'gradient descent is an optimization algorithm');
+  assert.ok(finals.length === 1);
+  assert.equal(finals[0].text, 'gradient descent is an optimization algorithm', 'finish 后应直接得到完整文本');
+  // partial 早于 final 事件
+  assert.ok(events.indexOf(partials[0]) < events.indexOf(finals[0]));
+  assert.equal(fake.calls.length, 1, 'finish 不再额外请求');
+  assert.equal(formOf(fake.calls[0].init).get('stream'), 'true');
+  const stats = asr.stats();
+  assert.equal(stats.cloudRequests, 1);
+  assert.ok(stats.lastFirstDeltaMs != null);
+  assert.ok(stats.lastStreamMs != null);
+  await asr.close();
+});
+
+test('asr/minimax-cloud: HTTP 401 -> 本段降级本地 provider（时间轴仍用云端段）', async () => {
+  const fake = makeCloudFetch(() => cloudJsonResponse({ type: 'error', error: { type: 'authorized_error' } }, 401));
+  const events = [];
+  const asr = await createAsr({
+    config: cloudConfig(), // fallback=mock
+    log: () => {},
+    onEvent: (ev) => events.push(ev),
+    fetchImpl: fake.fetchImpl,
+  });
+  await asr.warmup();
+  await feedUtterance(asr);
+  await asr.flush();
+
+  const finals = finalsOf(events);
+  assert.equal(finals.length, 1, '云端失败后 final 仍必须产生（本地兜底）');
+  assert.match(finals[0].text, /fallback text from local provider/);
+  assert.ok(Math.abs(finals[0].t0Ms - 100) <= 20, `时间轴应用云端段 t0=${finals[0].t0Ms}`);
+  assert.ok(Math.abs(finals[0].t1Ms - 1260) <= 20, `时间轴应用云端段 t1=${finals[0].t1Ms}`);
+  const stats = asr.stats();
+  assert.equal(stats.cloudFailures, 1);
+  assert.equal(stats.fallbackFinals, 1);
+  assert.equal(stats.circuitOpen, false, '单次失败不应立即熔断');
+  assert.equal(fake.calls.length, 1);
+  await asr.close();
+});
+
+test('asr/minimax-cloud: 超时 -> 降级本地 provider', async () => {
+  const fake = makeCloudFetch(
+    ({ init }) =>
+      new Promise((_, reject) => {
+        const signal = init?.signal;
+        if (signal?.aborted) return reject(Object.assign(new Error('The operation was aborted'), { name: 'AbortError' }));
+        signal?.addEventListener?.(
+          'abort',
+          () => reject(Object.assign(new Error('The operation was aborted'), { name: 'AbortError' })),
+          { once: true },
+        );
+      }),
+  );
+  const events = [];
+  const asr = await createAsr({
+    config: cloudConfig({ cloud: { timeoutMs: 120 } }),
+    log: () => {},
+    onEvent: (ev) => events.push(ev),
+    fetchImpl: fake.fetchImpl,
+  });
+  await asr.warmup();
+  await feedUtterance(asr);
+  await asr.flush();
+
+  const finals = finalsOf(events);
+  assert.equal(finals.length, 1, '超时后 final 仍必须产生（本地兜底）');
+  assert.match(finals[0].text, /fallback text/);
+  const stats = asr.stats();
+  assert.ok(stats.cloudTimeouts >= 1, `应记录超时，实际 ${stats.cloudTimeouts}`);
+  assert.equal(stats.fallbackFinals, 1);
+  await asr.close();
+});
+
+test('asr/minimax-cloud: 空文本 -> 降级本地 provider', async () => {
+  const fake = makeCloudFetch(() => cloudJsonResponse({ text: '   [BLANK_AUDIO] ', duration: 1.0 }));
+  const events = [];
+  const asr = await createAsr({
+    config: cloudConfig(),
+    log: () => {},
+    onEvent: (ev) => events.push(ev),
+    fetchImpl: fake.fetchImpl,
+  });
+  await asr.warmup();
+  await feedUtterance(asr);
+  await asr.flush();
+
+  const finals = finalsOf(events);
+  assert.equal(finals.length, 1);
+  assert.match(finals[0].text, /fallback text/);
+  assert.equal(asr.stats().emptyTexts, 1);
+  assert.equal(asr.stats().fallbackFinals, 1);
+  await asr.close();
+});
+
+test('asr/minimax-cloud: fallback 到注入的假本地 provider（时间轴覆盖/无重复 final）', async () => {
+  const fake = makeCloudFetch(() => cloudJsonResponse({ type: 'error' }, 500));
+  const events = [];
+  const localPushes = [];
+  const localFlushes = [];
+  let localOnEvent = null;
+  const session = await createMinimaxCloudAsr({
+    config: cloudConfig({ fallback: 'whisper-local' }),
+    log: () => {},
+    onEvent: (ev) => events.push(ev),
+    fetchImpl: fake.fetchImpl,
+    fallbackFactory: async ({ onEvent }) => {
+      localOnEvent = onEvent;
+      return {
+        name: 'fake-local',
+        async push(pcm, tMs) {
+          localPushes.push({ bytes: pcm.length, tMs });
+        },
+        async flush() {
+          localFlushes.push(Date.now());
+          localOnEvent?.({
+            type: 'final',
+            text: 'fake local transcript',
+            t0Ms: 0, // 故意用错误时间轴，验证会以云端段覆盖
+            t1Ms: 10,
+            lang: 'en',
+          });
+        },
+        async close() {
+          /* noop */
+        },
+      };
+    },
+  });
+  await session.flush(); // 空队列
+  let nextBase = await feedUtterance(session, { base: 0 });
+  nextBase = await feedUtterance(session, { base: nextBase });
+  await session.flush();
+
+  const finals = finalsOf(events);
+  assert.equal(finals.length, 2, '两段应各产生且仅产生一个 final');
+  assert.deepEqual(
+    finals.map((f) => f.text),
+    ['fake local transcript', 'fake local transcript'],
+  );
+  assert.ok(Math.abs(finals[0].t0Ms - 100) <= 20);
+  assert.ok(Math.abs(finals[0].t1Ms - 1260) <= 20);
+  assert.ok(Math.abs(finals[1].t0Ms - 1800) <= 20, `第二句 t0=${finals[1].t0Ms} 应≈1800`);
+  assert.ok(finals[1].t0Ms >= finals[0].t1Ms, 'final 不允许重叠');
+  assert.equal(localPushes.length, 2);
+  assert.equal(localPushes[0].tMs, 100, '应把云端段的 t0 传给本地 provider');
+  assert.equal(localFlushes.length, 2);
+  await session.close();
+});
+
+test('asr/minimax-cloud: 连续失败熔断后本会话切本地（不再打云端）', async () => {
+  const fake = makeCloudFetch(() => cloudJsonResponse({ type: 'error' }, 401));
+  const events = [];
+  const mock = {
+    asrScript: [
+      { text: 'fb one', durMs: 60000 },
+      { text: 'fb two', durMs: 60000 },
+      { text: 'fb three', durMs: 60000 },
+    ],
+  };
+  const asr = await createAsr({
+    config: cloudConfig({ cloud: { circuitBreakerFailures: 2 }, mock }),
+    log: () => {},
+    onEvent: (ev) => events.push(ev),
+    fetchImpl: fake.fetchImpl,
+  });
+  await asr.warmup();
+  let base = 0;
+  for (let i = 0; i < 3; i += 1) base = await feedUtterance(asr, { base });
+  await asr.flush();
+
+  const finals = finalsOf(events);
+  assert.equal(finals.length, 3, `三段都应产生 final，实际 ${finals.length}`);
+  assert.deepEqual(
+    finals.map((f) => f.text),
+    ['fb one', 'fb two', 'fb three'],
+  );
+  for (let i = 0; i < finals.length; i += 1) {
+    assert.ok(Math.abs(finals[i].t0Ms - (100 + i * 1700)) <= 20);
+    assert.ok(Math.abs(finals[i].t1Ms - (1260 + i * 1700)) <= 20);
+    if (i > 0) assert.ok(finals[i].t0Ms >= finals[i - 1].t1Ms, 'final 不允许重叠');
+  }
+  const stats = asr.stats();
+  assert.equal(fake.calls.length, 2, '熔断后第三段不应再请求云端');
+  assert.equal(stats.circuitOpen, true);
+  assert.ok(stats.skippedByCircuit >= 1);
+  assert.equal(stats.fallbackFinals, 3);
+  await asr.close();
 });
 
 // ================================================================ 真机（门控）

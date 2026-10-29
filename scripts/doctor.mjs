@@ -133,6 +133,26 @@ async function checkConfig() {
     add('error', 'tts', err.message);
   }
 
+  // 云端 ASR / 火山语音（可选能力）
+  const asrProvider = config.asr?.provider ?? 'whisper-local';
+  add('ok', 'asr.provider', asrProvider + (asrProvider === 'minimax-cloud' ? '（音频会上传到 MiniMax）' : '（本地识别）'));
+  if (asrProvider === 'minimax-cloud') {
+    try {
+      const mm = resolveProvider(config, 'minimax');
+      add(mm.apiKey ? 'ok' : 'error', 'cloud ASR (minimax)', `${config.asr?.minimaxCloud?.model ?? 'asr-1.0'} @ ${mm.baseUrl}${mm.apiKey ? '' : ' — 缺 apiKey'}`);
+    } catch (err) {
+      add('error', 'cloud ASR (minimax)', err.message);
+    }
+  }
+  const volcKey = process.env.VOLCENGINE_SPEECH_API_KEY || process.env.ARK_SPEECH_API_KEY || '';
+  try {
+    const vp = resolveProvider(config, 'volcengine');
+    const key = volcKey || vp.apiKey || '';
+    const isUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(key);
+    add(isUuid ? 'ok' : 'warn', 'volcengine speech', isUuid ? '已配置 UUID Key（可启用真实声音克隆）' : '未配置豆包语音 UUID Key（火山 TTS/复刻不可用，克隆会降级 preset）');
+  } catch (err) {
+    add('warn', 'volcengine speech', err.message);
+  }
   for (const port of [Number(config.server?.port ?? 8787), Number(config.asr?.whisper?.port ?? 18765)]) {
     const free = await portFree(port);
     add(free ? 'ok' : 'warn', `port ${port}`, free ? '空闲' : '已被占用（可能是已在运行的 livedub）');
@@ -152,6 +172,9 @@ async function checkFiles() {
     'studio/index.html',
     'studio/replay.html',
     'extension/manifest.json',
+    'config/livedub.fast.json',
+    'config/livedub.cloud.json',
+    'scripts/build-macos.sh',
   ];
   for (const rel of required) {
     const ok = fs.existsSync(path.join(PROJECT_ROOT, rel));
@@ -220,6 +243,34 @@ async function probeProviders(config) {
     }
   } catch (err) {
     add('error', `probe tts/${ttsProvider}`, err.message);
+  }
+
+  // 云端 ASR 冒烟（MINIMAX，极小样本）：4s 英文
+  if ((config.asr?.provider ?? '') === 'minimax-cloud') {
+    try {
+      const mm = resolveProvider(config, 'minimax');
+      const aiff = path.join(os.tmpdir(), `livedub-doctor-cloud-${Date.now()}.aiff`);
+      const wav = aiff.replace('.aiff', '.wav');
+      await run('say', ['-v', 'Samantha', '-o', aiff, 'Glossary terms matter for accurate translation.']);
+      await run('ffmpeg', ['-hide_banner', '-loglevel', 'error', '-y', '-i', aiff, '-ar', '16000', '-ac', '1', '-c:a', 'pcm_s16le', wav]);
+      const t0 = performance.now();
+      const form = new FormData();
+      form.append('model', 'asr-1.0');
+      form.append('file', new Blob([fs.readFileSync(wav)], { type: 'audio/wav' }), 'probe.wav');
+      const res = await fetch(`${mm.baseUrl.replace(/\/$/, '')}/speech_to_text`, {
+        method: 'POST',
+        headers: { authorization: `Bearer ${mm.apiKey}`, language: 'en' },
+        body: form,
+      });
+      const data = await res.json().catch(() => ({}));
+      if (res.ok && data.text) add('ok', 'probe cloud ASR', `${Math.round(performance.now() - t0)}ms · ${String(data.text).slice(0, 60)}`);
+      else add('error', 'probe cloud ASR', `HTTP ${res.status}：${JSON.stringify(data).slice(0, 160)}`);
+      for (const f of [aiff, wav]) {
+        try { fs.unlinkSync(f); } catch { /* ignore */ }
+      }
+    } catch (err) {
+      add('error', 'probe cloud ASR', err.message);
+    }
   }
 
   // whisper-server 冒烟：用系统 say 生成 2s 英文，识别一次

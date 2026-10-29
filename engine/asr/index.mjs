@@ -12,6 +12,8 @@
  *       - final / partial 的 t0Ms/t1Ms 全部来自音频时间轴（不是墙钟）
  *       - final 严格按时间顺序、不重叠；识别失败重试一次（必要时重启 server）
  *       - 会话 close() 只释放自己，不杀共享 server；测试/引擎收尾用 closeSharedServer()
+ *   - 'minimax-cloud'：MiniMax 云端 ASR（asr-1.0，HTTP 上传 WAV；失败自动降级 asr.fallback 本地 provider，
+ *       连续失败熔断；见 ./minimax-cloud.mjs）
  *   - 'mock'：复用 engine/mock.mjs 的 createMockAsr（契约完全一致）
  *   - 其它名称：抛 `unknown provider: ...`（不静默回退）
  *
@@ -22,9 +24,11 @@ import { pcmDurationMs } from '../audio.mjs';
 import { resolveWhisperModel } from '../config.mjs';
 import { createMockAsr } from '../mock.mjs';
 import { createSegmenter } from '../segmenter.mjs';
+import { createMinimaxCloudAsr } from './minimax-cloud.mjs';
+import { cleanAsrText, truncate } from './text.mjs';
 import { closeSharedServer, getSharedWhisperServer, listSharedServers } from './whisper-server.mjs';
 
-export { closeSharedServer, listSharedServers };
+export { cleanAsrText, closeSharedServer, listSharedServers };
 
 const DEFAULT_SAMPLE_RATE = 16000;
 const PARTIAL_TIMEOUT_MS = 20000;
@@ -41,11 +45,6 @@ function isAbortError(err) {
   return err?.name === 'AbortError';
 }
 
-function truncate(text, max = 80) {
-  const s = String(text ?? '');
-  return s.length <= max ? s : `${s.slice(0, max)}…`;
-}
-
 /**
  * 估算 speculative final 省下的时间（相对「静音确认后才开始推理」的基线）。
  * 实际 final 时间 = max(静音确认时刻, 推测推理完成时刻)；基线 = 静音确认时刻 + 推理耗时。
@@ -56,39 +55,6 @@ function estimateSpeculationSavedMs(spec, confirmWall) {
   const actual = Math.max(confirmWall, spec.finishedWall);
   const baseline = confirmWall + infer;
   return Math.max(0, Math.round(baseline - actual));
-}
-
-// `[00:00:00.000 --> 00:00:02.500]` 这类时间戳（whisper 某些输出格式会带）
-const TIMESTAMP_MARKER =
-  /\[\s*\d{1,2}:\d{2}(?::\d{2})?(?:[.,]\d+)?\s*-->\s*\d{1,2}:\d{2}(?::\d{2})?(?:[.,]\d+)?\s*\]/g;
-// 非语音标记：可整块删除（whisper 对静音/噪声常输出这类 token）
-const NON_SPEECH_BRACKET =
-  /\[\s*(?:blank_?audio|silence|music|applause|laughter|inaudible|noise|sound|background\s+music|breathing|sighs?|coughs?|music\s+playing)\s*\]/gi;
-const NON_SPEECH_PAREN =
-  /\(\s*(?:music|silence|applause|laughter|inaudible|noise|sound|background\s+music|music\s+playing)\s*\)/gi;
-const NON_SPEECH_CJK = /[\[（(【]\s*(?:音乐|掌声|笑声|静音|背景音乐)\s*[\]）)】]/g;
-const MUSIC_NOTES = /[♪♫♬♩]+/g;
-const PUNCT_ONLY = /^[\s\p{P}\p{S}]+$/u;
-
-/**
- * 清洗 whisper 输出：去非语音标记/时间戳、折叠空白、纯标点视为空串。
- * @param {unknown} text
- * @returns {string}
- */
-export function cleanAsrText(text) {
-  let s = String(text ?? '');
-  if (!s) return '';
-  s = s
-    .replace(TIMESTAMP_MARKER, ' ')
-    .replace(NON_SPEECH_BRACKET, ' ')
-    .replace(NON_SPEECH_PAREN, ' ')
-    .replace(NON_SPEECH_CJK, ' ')
-    .replace(MUSIC_NOTES, ' ')
-    .replace(/[\u200b-\u200f\u2028\u2029\ufeff]/g, '')
-    .replace(/\s+/g, ' ')
-    .trim();
-  if (!s || PUNCT_ONLY.test(s)) return '';
-  return s;
 }
 
 // ---------------------------------------------------------------- mock
@@ -669,6 +635,26 @@ function createWhisperAsrSession({ config = {}, log = () => {}, onEvent = () => 
   };
 }
 
+// ---------------------------------------------------------------- fallback
+
+/**
+ * minimax-cloud 的本地兜底工厂：按 `asr.fallback` 懒创建本地 provider
+ * （默认 whisper-local；测试里可用 `mock`）。避免 minimax-cloud → minimax-cloud 递归。
+ */
+function makeCloudFallbackFactory({ config, log, fetchImpl, spawnImpl, onError }) {
+  return async ({ onEvent }) => {
+    const fallbackProvider = config?.asr?.fallback;
+    if (!fallbackProvider || fallbackProvider === 'minimax-cloud') {
+      throw new Error(`minimax-cloud: asr.fallback 配置无效（${fallbackProvider ?? '空'}，不能是 minimax-cloud）`);
+    }
+    const fallbackConfig = {
+      ...config,
+      asr: { ...(config?.asr ?? {}), provider: fallbackProvider },
+    };
+    return createAsr({ config: fallbackConfig, log, onEvent, fetchImpl, spawnImpl, onError });
+  };
+}
+
 // ---------------------------------------------------------------- 工厂
 
 /**
@@ -689,5 +675,18 @@ export async function createAsr({ config = {}, log = () => {}, onEvent = () => {
   if (provider === 'whisper-local') {
     return createWhisperAsrSession({ config, log, onEvent, fetchImpl, spawnImpl, onError });
   }
-  throw new Error(`unknown provider: ${provider}（asr 支持 whisper-local | mock；请检查 config.asr.provider）`);
+  if (provider === 'minimax-cloud') {
+    return createMinimaxCloudAsr({
+      config,
+      log,
+      onEvent,
+      onError,
+      fetchImpl,
+      spawnImpl,
+      fallbackFactory: makeCloudFallbackFactory({ config, log, fetchImpl, spawnImpl, onError }),
+    });
+  }
+  throw new Error(
+    `unknown provider: ${provider}（asr 支持 whisper-local | minimax-cloud | mock；请检查 config.asr.provider）`,
+  );
 }

@@ -45,3 +45,13 @@ jobs:
           set -e
           ! git grep -nE 'sk-[A-Za-z0-9]{20,}|X-Api-Key:[[:space:]]*[A-Za-z0-9-]{20,}|/Users/leo/' -- . \
             ':!*.md' ':!*.srt' ':!*.jsonl' ':!demo/**' ':!models/**' ':!tests/**' ':!.github/**'
+
+  macos-app:
+    name: build macOS app (Swift)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build & self-test (no third-party deps)
+        if: ${{ hashFiles('scripts/build-macos.sh') != '' }}
+        run: bash scripts/build-macos.sh --check
+        timeout-minutes: 10

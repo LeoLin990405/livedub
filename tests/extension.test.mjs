@@ -60,12 +60,18 @@ import {
   normalizeEngineUrl,
 } from '../extension/lib/constants.js';
 import {
+  DUCK_RAMP_MS,
+  DUCK_RECOVER_MS_MAX,
+  DUCK_RECOVER_MS_MIN,
   NON_HOSTABLE_FULLSCREEN_TAGS,
   OFFSET_Y_MAX,
   OFFSET_Y_MIN,
   SUBS_BACKGROUNDS,
   SUBS_DOCKS,
+  buildFullscreenWrapperStyle,
+  buildWrappedVideoStyle,
   clampDuckRatio,
+  clampDuckRecoverMs,
   clampFontSize,
   clampOffsetX,
   clampOffsetY,
@@ -75,7 +81,10 @@ import {
   normalizeDisplaySettings,
   normalizeSubsBackground,
   normalizeSubsDock,
+  planFullscreenRequest,
+  planFullscreenRestore,
   planHostMigration,
+  resolveReplayGain,
   selectOverlayHost,
   subsBackgroundSpec,
 } from '../extension/lib/ui.js';
@@ -124,6 +133,7 @@ const source = {
   offscreen: readSource('offscreen.js'),
   offscreenHtml: readSource('offscreen.html'),
   content: readSource('content.js'),
+  pageHook: readSource('page-hook.js'),
   popup: readSource('popup.js'),
   popupHtml: readSource('popup.html'),
   pcm: readSource('lib/pcm.js'),
@@ -146,6 +156,7 @@ test('manifest：合法的 MV3 清单，background 为 module service worker + a
   assert.equal(typeof manifest.name, 'string');
   assert.ok(manifest.name.length > 0);
   assert.match(manifest.version, /^\d+\.\d+\.\d+$/);
+  assert.match(manifest.version, /^0\.3\./, 'v0.3 迭代应把扩展版本提升到 0.3.x');
   assert.equal(manifest.background.service_worker, 'background.js');
   assert.equal(manifest.background.type, 'module', 'service worker 必须是 type: module，background.js 里用了 ESM import');
   assert.equal(manifest.action.default_popup, 'popup.html');
@@ -166,14 +177,23 @@ test('manifest：权限与任务要求完全一致（tabCapture/offscreen/storag
   assert.ok(Number(manifest.minimum_chrome_version) >= 116, '需要 Chrome 116+（runtime.getContexts / offscreen）');
 });
 
-test('manifest：content_scripts 匹配 <all_urls>、all_frames=false、注入 content.js', () => {
-  assert.ok(Array.isArray(manifest.content_scripts) && manifest.content_scripts.length >= 1);
-  const entry = manifest.content_scripts[0];
-  assert.deepEqual(entry.matches, ['<all_urls>']);
-  assert.equal(entry.all_frames, false, '只抓顶层 frame 的媒体元素，避免 iframe 重复注入');
-  assert.ok(entry.js.includes('content.js'));
-  assert.equal(entry.run_at, 'document_idle');
-  assert.ok(existsSync(join(EXT, 'content.js')));
+test('manifest：content_scripts 两条（ISOLATED 浮层 + MAIN world 全屏 hook）', () => {
+  assert.ok(Array.isArray(manifest.content_scripts) && manifest.content_scripts.length === 2);
+  const overlayEntry = manifest.content_scripts.find((entry) => entry.js.includes('content.js'));
+  const hookEntry = manifest.content_scripts.find((entry) => entry.js.includes('page-hook.js'));
+  assert.ok(overlayEntry, '缺少 content.js 的 content_scripts 条目');
+  assert.ok(hookEntry, '缺少 page-hook.js（裸 video 全屏兼容）的 content_scripts 条目');
+  for (const entry of [overlayEntry, hookEntry]) {
+    assert.deepEqual(entry.matches, ['<all_urls>']);
+    assert.equal(entry.all_frames, false, '只处理顶层 frame，避免 iframe 重复注入');
+    for (const file of entry.js) assert.ok(existsSync(join(EXT, file)), `content script 文件不存在: ${file}`);
+  }
+  assert.equal(overlayEntry.run_at, 'document_idle');
+  assert.equal(overlayEntry.world, undefined, '浮层保持默认 ISOLATED world');
+  // page-hook 必须在页面主世界、document_start 尽早猴补 requestFullscreen
+  assert.equal(hookEntry.run_at, 'document_start');
+  assert.equal(hookEntry.world, 'MAIN');
+  assert.ok(existsSync(join(EXT, 'page-hook.js')));
 });
 
 test('manifest：引用的文件都存在，且没有声明不存在的图标', () => {
@@ -227,6 +247,7 @@ test('扩展文件齐全（background/offscreen/content/popup/lib/worklet/README
     'lib/constants.js',
     'lib/ui.js',
     'lib/srt.js',
+    'page-hook.js',
     'worklet/pcm-worklet.js',
     'README.md',
   ];
@@ -234,7 +255,7 @@ test('扩展文件齐全（background/offscreen/content/popup/lib/worklet/README
 });
 
 test('所有扩展 JS 通过 node --check 语法检查', () => {
-  assert.ok(JS_FILES.length >= 9, `期望至少 9 个 JS 文件，实际 ${JS_FILES.length}`);
+  assert.ok(JS_FILES.length >= 10, `期望至少 10 个 JS 文件，实际 ${JS_FILES.length}`);
   for (const rel of JS_FILES) {
     const result = spawnSync(process.execPath, ['--check', join(EXT, rel)], { encoding: 'utf8' });
     assert.equal(result.status, 0, `node --check 失败: extension/${rel}\n${result.stderr || ''}`);
@@ -261,9 +282,11 @@ test('扩展代码没有远程脚本/样式/eval（MV3 禁止远程代码）', (
   }
 });
 
-test('content.js 是 classic script（不能有 ESM import/export）', () => {
-  assert.ok(!/^\s*import\s/m.test(source.content), 'content script 不能使用静态 import');
-  assert.ok(!/^\s*export\s/m.test(source.content), 'content script 不能使用 export');
+test('classic scripts（content.js / page-hook.js）不能有 ESM import/export', () => {
+  for (const [name, code] of [['content.js', source.content], ['page-hook.js', source.pageHook]]) {
+    assert.ok(!/^\s*import\s/m.test(code), `${name} 不能使用静态 import`);
+    assert.ok(!/^\s*export\s/m.test(code), `${name} 不能使用 export`);
+  }
   // 其余扩展页面/模块可以用 ESM
   assert.match(source.background, /^import\s/m);
   assert.match(source.popup, /^import\s/m);
@@ -498,6 +521,11 @@ test('README 覆盖安装/权限/排障/手动测试清单', () => {
     '避让',
     '未连接',
     'SRT',
+    'iframe',
+    'WebAudio',
+    '双声',
+    '全屏兼容',
+    '原声重放',
   ]) {
     assert.ok(source.readme.includes(keyword), `README 缺少内容: ${keyword}`);
   }
@@ -867,6 +895,11 @@ test('constants：默认设置符合契约（16k 引擎 / 配音开 / 压音 0.1
   assert.equal(DEFAULT_SETTINGS.subsBg, 'dark');
   assert.equal(DEFAULT_SETTINGS.panelCollapsed, false);
   assert.equal(DEFAULT_SETTINGS.panelPos, null);
+  // v0.3：原声重放 / 全局限定压音 / 恢复延迟 / 全屏兼容
+  assert.equal(DEFAULT_SETTINGS.captureReplay, true);
+  assert.equal(DEFAULT_SETTINGS.globalDuck, true);
+  assert.equal(DEFAULT_SETTINGS.duckRecoverMs, 800);
+  assert.equal(DEFAULT_SETTINGS.fullscreenWorkaround, true);
   assert.equal(STORAGE_KEYS.settings, 'livedub:settings');
   assert.equal(STORAGE_KEYS.bgState, 'livedub:bg-state');
   assert.equal(STORAGE_KEYS.captions, 'livedub:captions');
@@ -1024,6 +1057,145 @@ test('ui：subsBackgroundSpec 深/浅/无背景与透明度', () => {
   assert.equal(none.alpha, 0);
   assert.equal(none.className, 'bg-none');
 });
+
+// ===========================================================================
+// 8b. v0.3：全局限定压音 + 裸 video 全屏包裹（纯函数 & 静态断言）
+// ===========================================================================
+
+test('ui v0.3：resolveReplayGain 原声总线目标增益', () => {
+  // 默认：重放开、未 duck -> 1
+  assert.equal(resolveReplayGain({}), 1);
+  // 关闭原声重放 -> 0（标签页已被静音 = 只听配音）
+  assert.equal(resolveReplayGain({ captureReplay: false, ducking: true }), 0);
+  // 全局限定压音 + ducking -> duckRatio
+  assert.equal(resolveReplayGain({ globalDuck: true, ducking: true, duckRatio: 0.18 }), 0.18);
+  assert.equal(resolveReplayGain({ globalDuck: true, ducking: true, duckRatio: 0.4 }), 0.4);
+  // 关闭全局限定压音 -> 不压（交给 content 兜底）
+  assert.equal(resolveReplayGain({ globalDuck: false, ducking: true, duckRatio: 0.18 }), 1);
+  // 非法比例钳制
+  assert.equal(resolveReplayGain({ globalDuck: true, ducking: true, duckRatio: 0 }), 0.02);
+  assert.equal(resolveReplayGain({ globalDuck: true, ducking: true, duckRatio: 9 }), 1);
+});
+
+test('ui v0.3：duck 恢复延迟钳制与渐变时长', () => {
+  assert.equal(DUCK_RAMP_MS, 160, 'duck/恢复渐变应为 160ms（契约 120-200ms）');
+  assert.ok(DUCK_RAMP_MS >= 120 && DUCK_RAMP_MS <= 200);
+  assert.equal(clampDuckRecoverMs(800), 800);
+  assert.equal(clampDuckRecoverMs(50), DUCK_RECOVER_MS_MIN);
+  assert.equal(clampDuckRecoverMs(99999), DUCK_RECOVER_MS_MAX);
+  assert.equal(clampDuckRecoverMs(Number.NaN), 800);
+  assert.equal(DUCK_RECOVER_MS_MIN, 300);
+  assert.equal(DUCK_RECOVER_MS_MAX, 3000);
+});
+
+test('ui v0.3：planFullscreenRequest 裸 video 才包裹，容器/已全屏/关闭走原生', () => {
+  // 裸 video -> wrapper
+  assert.deepEqual(planFullscreenRequest({ requestedTagName: 'VIDEO', workaroundEnabled: true }), {
+    mode: 'wrapper',
+    reason: 'non-hostable-element',
+  });
+  // 容器型元素保持原生（content 迁移已够用）
+  assert.deepEqual(planFullscreenRequest({ requestedTagName: 'DIV', workaroundEnabled: true }), {
+    mode: 'native',
+    reason: 'hostable-element',
+  });
+  // 关闭开关
+  assert.deepEqual(planFullscreenRequest({ requestedTagName: 'VIDEO', workaroundEnabled: false }), {
+    mode: 'native',
+    reason: 'disabled',
+  });
+  // 已经有全屏元素
+  assert.deepEqual(
+    planFullscreenRequest({ requestedTagName: 'VIDEO', workaroundEnabled: true, currentFullscreenTagName: 'DIV' }),
+    { mode: 'native', reason: 'already-fullscreen' },
+  );
+  // canvas/iframe 等替换元素同样包裹
+  for (const tag of ['CANVAS', 'IFRAME', 'IMG', 'AUDIO']) {
+    assert.equal(planFullscreenRequest({ requestedTagName: tag, workaroundEnabled: true }).mode, 'wrapper');
+  }
+  assert.equal(planFullscreenRequest({ requestedTagName: '', workaroundEnabled: true }).mode, 'native');
+});
+
+test('ui v0.3：planFullscreenRestore DOM 恢复决策', () => {
+  assert.deepEqual(planFullscreenRestore({ wrapperActive: false }), { action: 'none' });
+  assert.deepEqual(planFullscreenRestore({ wrapperActive: true, wrapperConnected: false }), { action: 'forget' });
+  assert.deepEqual(planFullscreenRestore({ wrapperActive: true, wrapperConnected: true, videoConnected: false }), {
+    action: 'drop-wrapper',
+  });
+  assert.deepEqual(planFullscreenRestore({ wrapperActive: true, wrapperConnected: true, videoConnected: true }), {
+    action: 'unwrap',
+    moveVideoBack: true,
+  });
+});
+
+test('ui v0.3：包裹容器/video 样式模板', () => {
+  const wrapperStyle = buildFullscreenWrapperStyle();
+  assert.match(wrapperStyle, /position: fixed/);
+  assert.match(wrapperStyle, /inset: 0/);
+  assert.match(wrapperStyle, /display: flex/);
+  const videoStyle = buildWrappedVideoStyle();
+  assert.match(videoStyle, /width: 100%/);
+  assert.match(videoStyle, /object-fit: contain/);
+});
+
+test('offscreen.js v0.3：原声总线 GainNode 平滑 duck / 恢复', () => {
+  assert.match(source.offscreen, /import \{ DUCK_RAMP_MS, clampDuckRecoverMs, resolveReplayGain \} from '\.\/lib\/ui\.js'/);
+  assert.match(source.offscreen, /function applyReplayGainTarget\(/);
+  assert.match(source.offscreen, /linearRampToValueAtTime\(/);
+  assert.match(source.offscreen, /function syncReplayGain\(/);
+  assert.match(source.offscreen, /function duckStart\(/);
+  assert.match(source.offscreen, /function duckActivity\(/);
+  assert.match(source.offscreen, /function duckIdle\(/);
+  assert.match(source.offscreen, /function duckTick\(/);
+  assert.match(source.offscreen, /function startDuckTicker\(/);
+  assert.match(source.offscreen, /setInterval\(duckTick, DUCK_TICK_MS\)/);
+  assert.match(source.offscreen, /status\?|case 'status':/);
+  assert.match(source.offscreen, /case 'dub':\n      duckActivity\(\);/);
+  assert.match(source.offscreen, /function pickReplaySettings\(/);
+  assert.match(source.offscreen, /message\.settings/);
+  assert.match(source.offscreen, /captureReplay/);
+  assert.match(source.offscreen, /globalDuck/);
+});
+
+test('background.js v0.3：本地音频设置透传给 offscreen', () => {
+  assert.match(source.background, /captureReplay/);
+  assert.match(source.background, /globalDuck/);
+  assert.match(source.background, /duckRecoverMs/);
+  assert.match(source.background, /audioSettings/);
+  assert.match(source.background, /message\.settings = audioSettings/);
+  assert.match(source.background, /fullscreenWorkaround/);
+});
+
+test('page-hook.js v0.3：猴补 requestFullscreen 包裹裸 video 并恢复', () => {
+  assert.match(source.pageHook, /window\.__livedubPageHookLoaded/);
+  assert.match(source.pageHook, /Element\.prototype/);
+  assert.match(source.pageHook, /originalRequestFullscreen = elementProto\.requestFullscreen/);
+  assert.match(source.pageHook, /elementProto\.requestFullscreen = patched/);
+  assert.match(source.pageHook, /NON_HOSTABLE_TAGS/);
+  assert.match(source.pageHook, /data-livedub-fullscreen-wrapper/);
+  assert.match(source.pageHook, /function ensureWrapper\(/);
+  assert.match(source.pageHook, /function restore\(/);
+  assert.match(source.pageHook, /addEventListener\(\s*'fullscreenchange'/);
+  assert.match(source.pageHook, /livedub-content/);
+  assert.match(source.pageHook, /livedub-page-hook/);
+  assert.match(source.pageHook, /originalRequestFullscreen\.apply\(element, args\)/, '包裹失败应回退原生全屏');
+});
+
+test('content.js v0.3：全局限定压音让位 + page-hook 协作 + 新增设置项', () => {
+  assert.match(source.content, /PAGE_HOOK_SOURCE = 'livedub-page-hook'/);
+  assert.match(source.content, /CONTENT_MESSAGE_SOURCE = 'livedub-content'/);
+  assert.match(source.content, /function postPageHookConfig\(/);
+  assert.match(source.content, /window\.postMessage\(/);
+  assert.match(source.content, /function onPageHookMessage\(/);
+  assert.match(source.content, /data-set="captureReplay"/);
+  assert.match(source.content, /data-set="globalDuck"/);
+  assert.match(source.content, /data-set="duckRecoverMs"/);
+  assert.match(source.content, /data-set="fullscreenWorkaround"/);
+  // 全局限定压音开启时 content 不改页面音量，避免双重压音
+  assert.match(source.content, /if \(runtime\.settings\.globalDuck !== false\) \{\n      restoreVolumes\(\);/);
+  assert.match(source.content, /原声重放/);
+});
+
 
 // ===========================================================================
 // 9. extension/lib/srt.js 纯函数（v0.2：导出本次 SRT）

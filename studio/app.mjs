@@ -25,8 +25,13 @@ import {
   SUBS_SIZES,
   SUBS_SIZE_LABELS,
   SUBS_SIZE_SCALE,
+  asrEngineLabel,
+  asrPrivacyCopy,
   buildSparkline,
+  desktopAppInstructions,
   isEditableTarget,
+  mergeSettingsSnapshot,
+  normalizeAsrEngine,
   normalizeSubsStyle,
   normalizeTheme,
   resolveShortcut,
@@ -47,6 +52,8 @@ const els = {
   btnStart: $('btnStart'),
   btnStop: $('btnStop'),
   btnTheme: $('btnTheme'),
+  privacyChip: $('privacyChip'),
+  privacyChipText: $('privacyChipText'),
 
   stage: $('stage'),
   stageEmpty: $('stageEmpty'),
@@ -99,6 +106,18 @@ const els = {
   sparkMt: $('sparkMt'),
   sparkTts: $('sparkTts'),
   sparkE2e: $('sparkE2e'),
+  asrSettingsTag: $('asrSettingsTag'),
+  asrPrivacy: $('asrPrivacy'),
+  asrPrivacyTitle: $('asrPrivacyTitle'),
+  asrPrivacyDetail: $('asrPrivacyDetail'),
+  asrPendingHint: $('asrPendingHint'),
+  engineCloudNote: $('engineCloudNote'),
+  asrSessionValue: $('asrSessionValue'),
+  desktopBadge: $('desktopBadge'),
+  desktopHint: $('desktopHint'),
+  desktopCommand: $('desktopCommand'),
+  btnCopyDesktopCmd: $('btnCopyDesktopCmd'),
+  footerPrivacy: $('footerPrivacy'),
 
   sessionModeTag: $('sessionModeTag'),
   sessionState: $('sessionState'),
@@ -182,6 +201,11 @@ const state = {
   engineInfo: null,
   engineOnline: null,
   providers: null,
+  sessionProviders: null,
+  uiSettings: null,
+  uiSettingsSaving: false,
+  serverReachable: null,
+  desktopApp: null,
   engineEvents: [],
   metricsHistory: [],
   panelsHidden: false,
@@ -218,6 +242,7 @@ const state = {
     duckEnabled: savedSettings.duckEnabled ?? true,
     volume: Number.isFinite(Number(savedSettings.volume)) ? clamp(Number(savedSettings.volume), 0, 1) : 1,
     voiceMode: savedSettings.voiceMode ?? '',
+    asrProvider: savedSettings.asrProvider ?? '',
     glossaryText: savedSettings.glossaryText ?? '',
     subsPos: savedSettings.subsPos ?? null,
   },
@@ -346,6 +371,8 @@ async function loadEngineInfo() {
         tts: { provider: health.providers?.tts, model: health.providers?.ttsModel, voiceMode: health.providers?.voiceMode },
       });
       state.engineOnline = true;
+      state.desktopApp = health.desktopApp ?? state.desktopApp;
+      renderDesktopApp();
       showConnHelp(false);
       logEvent(
         'engine',
@@ -372,8 +399,11 @@ async function loadEngineInfo() {
     }
   } catch (err) {
     state.engineOnline = false;
+    state.serverReachable = false;
     logEvent('engine', `无法读取引擎信息：${err.message}`, 'err');
     els.engineVersion.textContent = '引擎未启动';
+    renderAsrEngine();
+    renderDesktopApp();
     showConnHelp(true);
     toast('无法连接本地引擎服务，请确认已运行 node engine/server.mjs', 'err', 7000);
   }
@@ -592,6 +622,8 @@ function handleEngineEvent(event) {
 function onReady(event) {
   state.sessionReady = true;
   state.providers = event.providers ?? null;
+  state.sessionProviders = event.providers ?? null;
+  renderAsrEngine();
   if (state.providers) renderProviders(state.providers);
   if (event.voice) applyVoice(event.voice);
   els.sessionId.textContent = shorten(String(event.sessionId ?? '—'), 18);
@@ -683,7 +715,9 @@ function onBye(event) {
   state.sessionReady = false;
   state.sending = false;
   state.sessionActive = false;
+  state.sessionProviders = null;
   updateSessionButtons();
+  renderAsrEngine();
   setBadge('idle', '会话结束');
   setSessionState('会话结束');
   els.captureChip.dataset.on = 'false';
@@ -782,6 +816,8 @@ function stopSession({ silent = false } = {}) {
   updateSessionButtons();
   setBadge('idle', '已停止');
   setSessionState('已停止');
+  state.sessionProviders = null;
+  renderAsrEngine();
   hideSubtitle();
   if (!silent) toast('已停止同传会话', 'info');
   logEvent('session', '停止同传', 'warn');
@@ -1228,7 +1264,7 @@ function enterSubsOnly() {
   appRoot.classList.add('subs-only');
   els.btnSubsOnlyExit.hidden = false;
   els.btnPanelsShow.hidden = true;
-  setDubEnabled(false, { persist: false });
+  setDubEnabled(false, { persist: false, persistToServer: false });
   state.settings.subsStyle = normalizeSubsStyle({ ...state.settings.subsStyle, size: 'xl' });
   applySubsStyle();
   setSubsVisible(true);
@@ -1242,7 +1278,7 @@ function exitSubsOnly() {
   state.subsOnly.active = false;
   appRoot.classList.remove('subs-only');
   els.btnSubsOnlyExit.hidden = true;
-  setDubEnabled(state.subsOnly.previousDub, { persist: false });
+  setDubEnabled(state.subsOnly.previousDub, { persist: false, persistToServer: false });
   state.settings.subsStyle = normalizeSubsStyle(state.subsOnly.previousStyle ?? state.settings.subsStyle);
   applySubsStyle();
   saveSettings();
@@ -1338,7 +1374,8 @@ function showConnHelp(show) {
   els.connHelp.hidden = !show;
 }
 
-function setDubEnabled(enabled, { announce = false, persist = true } = {}) {
+function setDubEnabled(enabled, { announce = false, persist = true, persistToServer = true } = {}) {
+  const changed = state.settings.dubEnabled !== Boolean(enabled);
   state.settings.dubEnabled = Boolean(enabled);
   els.toggleDub.checked = state.settings.dubEnabled;
   els.toggleDub.setAttribute('aria-checked', String(state.settings.dubEnabled));
@@ -1354,7 +1391,192 @@ function setDubEnabled(enabled, { announce = false, persist = true } = {}) {
     duckOriginal(false);
   }
   if (persist) saveSettings();
+  if (changed && persistToServer) void saveUiSettingsPatch({ dub: { enabled: state.settings.dubEnabled } }, { label: '配音开关' });
   if (announce) toast(`配音${state.settings.dubEnabled ? '已开启' : '已关闭'}`, 'info', 1800);
+}
+
+// ------------------------------------------------ v0.3 ASR 引擎 / 隐私 / 桌面 App
+
+/** 把 /api/settings 快照应用到工作台状态（不触发二次保存） */
+function applyUiSettingsSnapshot(snapshot) {
+  if (!snapshot) return;
+  state.uiSettings = snapshot;
+  state.settings.asrProvider = normalizeAsrEngine(snapshot.asrProvider);
+  state.settings.voiceMode = snapshot.ttsVoiceMode;
+  setVoiceModeButtons(snapshot.ttsVoiceMode);
+  state.settings.dubEnabled = Boolean(snapshot.dubEnabled);
+  els.toggleDub.checked = state.settings.dubEnabled;
+  els.toggleDub.setAttribute('aria-checked', String(state.settings.dubEnabled));
+  if (!state.settings.dubEnabled) duckOriginal(false);
+  renderAsrEngine();
+  renderPrivacyChrome();
+}
+
+/** GET /api/settings：读取持久化的 UI 设置（失败则保留本地默认并提示） */
+async function loadUiSettings() {
+  try {
+    const response = await fetch('/api/settings', { cache: 'no-store' });
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    const body = await response.json();
+    state.serverReachable = true;
+    const merged = mergeSettingsSnapshot(body, state.config?.asr?.provider ?? 'whisper-local');
+    applyUiSettingsSnapshot(merged);
+    if (body.desktopApp) {
+      state.desktopApp = body.desktopApp;
+      renderDesktopApp();
+    }
+    if (Array.isArray(body.warnings) && body.warnings.length > 0) {
+      logEvent('settings', `UI 设置 warning：${body.warnings.join('；')}`, 'warn');
+    }
+    logEvent(
+      'settings',
+      `UI 设置：ASR=${asrEngineLabel(merged.asrProvider)}${merged.fileExists ? '（data/ui-settings.json）' : '（默认，未保存）'}`,
+      'mt',
+    );
+    return true;
+  } catch (err) {
+    state.serverReachable = false;
+    logEvent('settings', `读取 /api/settings 失败：${err.message}（使用默认设置）`, 'warn');
+    renderAsrEngine();
+    renderPrivacyChrome();
+    renderDesktopApp();
+    return false;
+  }
+}
+
+/** PUT /api/settings：只提交白名单字段；成功返回 true */
+async function saveUiSettingsPatch(patch, { label = '设置' } = {}) {
+  if (!patch || Object.keys(patch).length === 0) return false;
+  if (state.uiSettingsSaving) return false;
+  state.uiSettingsSaving = true;
+  renderAsrEngine();
+  try {
+    const response = await fetch('/api/settings', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ settings: patch }),
+    });
+    const body = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(body.message ?? body.error ?? `HTTP ${response.status}`);
+    state.serverReachable = true;
+    const merged = mergeSettingsSnapshot(body, state.settings.asrProvider);
+    applyUiSettingsSnapshot(merged);
+    if (body.desktopApp) {
+      state.desktopApp = body.desktopApp;
+      renderDesktopApp();
+    }
+    logEvent('settings', `${label}已保存 → data/ui-settings.json（下次会话生效）`, 'ok');
+    return true;
+  } catch (err) {
+    logEvent('settings', `保存 ${label} 失败：${err.message}`, 'err');
+    toast(`保存设置失败：${err.message}`, 'err', 5200);
+    return false;
+  } finally {
+    state.uiSettingsSaving = false;
+    renderAsrEngine();
+  }
+}
+
+/** 切换 ASR 引擎：乐观更新 UI，失败回滚；明确提示「当前会话不变」 */
+async function selectAsrEngine(provider) {
+  const next = normalizeAsrEngine(provider);
+  if (next === normalizeAsrEngine(state.settings.asrProvider) || state.uiSettingsSaving) return;
+  const previous = state.settings.asrProvider;
+  state.settings.asrProvider = next;
+  renderAsrEngine({ pending: true });
+  const ok = await saveUiSettingsPatch({ asr: { provider: next } }, { label: `ASR 引擎（${asrEngineLabel(next)}）` });
+  if (!ok) {
+    state.settings.asrProvider = previous;
+    renderAsrEngine();
+    return;
+  }
+  const privacy = asrPrivacyCopy(next);
+  toast(
+    `ASR 引擎已保存：${asrEngineLabel(next)}。当前会话不变，重连 / 新建会话后生效。`,
+    privacy.cloud ? 'warn' : 'ok',
+    5600,
+  );
+  renderAsrEngine({ pending: true });
+}
+
+/** 渲染识别引擎面板：按钮选中态、隐私文案、当前会话、待生效提示 */
+function renderAsrEngine({ pending = false } = {}) {
+  const provider = normalizeAsrEngine(state.settings.asrProvider);
+  const privacy = asrPrivacyCopy(provider);
+  for (const button of document.querySelectorAll('.engine-choice[data-asr-provider]')) {
+    const checked = button.dataset.asrProvider === provider;
+    button.setAttribute('aria-checked', String(checked));
+    button.disabled = state.uiSettingsSaving;
+  }
+  els.asrPrivacy.dataset.tone = privacy.tone;
+  els.asrPrivacyTitle.textContent = privacy.title;
+  els.asrPrivacyDetail.textContent = privacy.detail;
+  const privacyUse = els.asrPrivacy.querySelector('use');
+  if (privacyUse) privacyUse.setAttribute('href', privacy.cloud ? '#i-cloud' : '#i-lock');
+
+  const snapshot = state.uiSettings;
+  if (state.uiSettingsSaving) els.asrSettingsTag.textContent = '保存中…';
+  else if (!snapshot) els.asrSettingsTag.textContent = '引擎离线';
+  else if (snapshot.fileExists) els.asrSettingsTag.textContent = '已保存 · data/ui-settings.json';
+  else els.asrSettingsTag.textContent = '默认（未保存）';
+  els.asrSettingsTag.classList.toggle('warn', !snapshot || state.uiSettingsSaving);
+
+  const sessionProvider = state.sessionActive || state.sim.active ? state.sessionProviders?.asr ?? null : null;
+  els.asrSessionValue.textContent = sessionProvider
+    ? `${state.sim.active && !state.sessionActive ? '录制时 · ' : ''}${asrEngineLabel(sessionProvider)}`
+    : '未开始';
+
+  const mismatch = Boolean(sessionProvider) && sessionProvider !== provider;
+  const savedButPrestart = Boolean(snapshot?.overrides?.asr?.provider) && !state.sessionReady;
+  els.engineCloudNote.hidden = !privacy.cloud;
+  els.asrPendingHint.hidden = !(pending || mismatch || savedButPrestart);
+  els.asrPendingHint.textContent = mismatch
+    ? `已选择 ${asrEngineLabel(provider)}：当前会话仍是 ${asrEngineLabel(sessionProvider)}，重连 / 新建会话后生效`
+    : '已保存 · 当前会话不变，重连 / 新建会话后生效';
+  renderPrivacyChrome(provider);
+}
+
+/** 顶栏隐私胶囊 + footer 隐私文案（云端 ASR 用警示色） */
+function renderPrivacyChrome(provider = state.settings.asrProvider) {
+  const privacy = asrPrivacyCopy(provider);
+  const chipUse = els.privacyChip.querySelector('use');
+  els.privacyChip.dataset.tone = privacy.tone;
+  els.privacyChipText.textContent = privacy.title;
+  els.privacyChip.title = privacy.detail;
+  if (chipUse) chipUse.setAttribute('href', privacy.cloud ? '#i-cloud' : '#i-lock');
+  els.footerPrivacy.textContent = privacy.cloud
+    ? '云端 ASR：音频会上传到 MiniMax · 字幕不写入磁盘'
+    : '音频不离开本机 · 字幕不写入磁盘';
+  els.footerPrivacy.classList.toggle('privacy-cloud', privacy.cloud);
+}
+
+/** 渲染桌面 App 面板（apps/macos/build/livedub.app 检测结果来自 /health 或 /api/settings） */
+function renderDesktopApp() {
+  const instructions = desktopAppInstructions(state.desktopApp ?? { available: false });
+  els.desktopBadge.textContent = instructions.badge;
+  els.desktopBadge.className = `tag ${instructions.tone === 'ok' ? 'ok' : 'warn'}`;
+  const appPath = state.desktopApp?.appPath ? ` 路径：${state.desktopApp.appPath}` : '';
+  els.desktopHint.textContent = `${instructions.hint}${instructions.available ? appPath : ''}`;
+  els.desktopCommand.textContent = instructions.command;
+  els.desktopCommand.title = instructions.command;
+  els.btnCopyDesktopCmd.title = `复制${instructions.commandLabel}`;
+}
+
+async function copyText(text, successMessage = '已复制') {
+  const value = String(text ?? '');
+  if (!value) return;
+  try {
+    await navigator.clipboard.writeText(value);
+    toast(successMessage, 'ok', 1800);
+  } catch {
+    const textarea = document.createElement('textarea');
+    textarea.value = value;
+    document.body.appendChild(textarea);
+    textarea.select();
+    document.execCommand?.('copy');
+    textarea.remove();
+    toast(successMessage, 'ok', 1800);
+  }
 }
 
 function setupSubtitleDrag() {
@@ -1573,6 +1795,10 @@ function setVoiceMode(mode) {
   state.settings.voiceMode = next;
   saveSettings();
   setVoiceModeButtons(next);
+  // 三处设置（asr/tts/dub）统一持久化到 data/ui-settings.json，下次会话由服务端注入
+  if (state.serverReachable !== false && state.uiSettings?.ttsVoiceMode !== next) {
+    void saveUiSettingsPatch({ tts: { voiceMode: next } }, { label: '音色模式' });
+  }
   els.voiceNote.textContent = next === 'clone-first' ? '克隆优先：会先尝试克隆讲师音色，失败自动降级并记住原因' : '预设音色：使用配置里的系统音色';
   if (state.wsReady) {
     sendJson({ type: 'config', patch: { tts: { voiceMode: next } } });
@@ -1649,6 +1875,9 @@ function syncSettingsUi() {
   if (!state.settings.subsVisible) hideSubtitle();
   renderSparklines();
   els.btnExportEvents.disabled = state.engineEvents.length === 0;
+  renderAsrEngine();
+  renderPrivacyChrome();
+  renderDesktopApp();
 }
 
 // -------------------------------------------------------------- 演示回放模式
@@ -1751,6 +1980,8 @@ function applyParsedSession(parsed) {
   els.transcriptCount.textContent = '0 句';
   state.engineEvents = parsed.events;
   els.btnExportEvents.disabled = parsed.events.length === 0;
+  state.sessionProviders = parsed.ready?.providers ?? null;
+  renderAsrEngine();
 }
 
 function applySimAt(tMs) {
@@ -1876,6 +2107,10 @@ function bindEvents() {
   els.btnStop.addEventListener('click', () => stopSession());
   els.btnReconnect.addEventListener('click', reconnect);
   els.btnTheme.addEventListener('click', toggleTheme);
+  for (const button of document.querySelectorAll('.engine-choice[data-asr-provider]')) {
+    button.addEventListener('click', () => void selectAsrEngine(button.dataset.asrProvider));
+  }
+  els.btnCopyDesktopCmd.addEventListener('click', () => copyText(els.desktopCommand.textContent, '已复制桌面 App 命令'));
   els.btnConnRetry.addEventListener('click', async () => {
     toast('正在重试连接本地引擎…', 'info', 2000);
     await loadEngineInfo();
@@ -2106,10 +2341,21 @@ async function bootstrap() {
 
   const simMode = await setupSimMode(params);
   // 调试入口（本地工作台，无敏感信息；便于自动化截图/排查）
-  globalThis.__livedubStudio = { state, applySimAt, renderSparklines, version: '0.2.0' };
+  globalThis.__livedubStudio = {
+    state,
+    applySimAt,
+    renderSparklines,
+    renderAsrEngine,
+    renderDesktopApp,
+    selectAsrEngine,
+    version: '0.3.0',
+  };
   if (!simMode) {
     await loadEngineInfo();
+    await loadUiSettings();
     syncSettingsUi();
+    renderAsrEngine();
+    renderDesktopApp();
     const videoParam = params.get('video');
     if (videoParam) loadVideoUrl(videoParam);
     const autoPlay = params.get('autoplay') === '1';
@@ -2117,7 +2363,10 @@ async function bootstrap() {
       void startSession();
     }
   } else {
+    await loadUiSettings();
     syncSettingsUi();
+    renderAsrEngine();
+    renderDesktopApp();
   }
 }
 

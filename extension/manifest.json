@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "livedub 实时同传",
-  "version": "0.1.0",
+  "version": "0.3.0",
   "description": "看教学视频时的本地实时同传：抓取标签页声音 -> 本地引擎识别/翻译 -> 双语字幕浮层 + 中文配音（优先克隆讲师音色）。",
   "minimum_chrome_version": "116",
   "permissions": ["tabCapture", "offscreen", "storage", "activeTab", "scripting"],
@@ -15,6 +15,13 @@
     "default_popup": "popup.html"
   },
   "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["page-hook.js"],
+      "run_at": "document_start",
+      "all_frames": false,
+      "world": "MAIN"
+    },
     {
       "matches": ["<all_urls>"],
       "js": ["content.js"],

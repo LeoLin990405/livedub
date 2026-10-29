@@ -13,8 +13,14 @@
  *     <- 引擎事件：partial / segment / translation / dub / status / metrics / voice / error
  *
  * 注意：tabCapture 抓走声音后标签页本身会被静音，所以这里同时用默认采样率的
- * AudioContext 把原声重放给用户（音质比 16k 好）；content script 通过压低
- * video/audio.volume 实现的「压音」作用在这个被重放的信号上。
+ * AudioContext 把原声重放给用户（音质比 16k 好）。
+ *
+ * v0.3 全局限定压音：原声重放链路 monitorSource -> monitorGain -> destination 中的
+ * monitorGain 就是「原声总线」。引擎 status=speaking / 收到 dub 时把该 GainNode 用
+ * 160ms 线性渐变 duck 到 settings.duckRatio，说话结束 duckRecoverMs 后渐变恢复。
+ * 因为压的是「抓到的标签页音频」本身，所以 iframe 播放器 / WebAudio 站点也能压原声，
+ * 不再依赖 content script 修改 <video>.volume（content 侧仍保留兜底）。
+ * settings.captureReplay=false 时原声总线增益为 0（标签页已被静音 = 只听配音）。
  */
 
 import {
@@ -25,6 +31,7 @@ import {
   OFFSCREEN_REASONS,
 } from './lib/constants.js';
 import { encodeAudioFrame, buildHelloMessage, base64ToFloat32, computeDubPlayhead } from './lib/pcm.js';
+import { DUCK_RAMP_MS, clampDuckRecoverMs, resolveReplayGain } from './lib/ui.js';
 
 const LOG_PREFIX = '[livedub:offscreen]';
 const log = (...args) => console.debug(LOG_PREFIX, ...args);
@@ -42,6 +49,11 @@ const STOP_CONTROL_WAIT_MS = 80;
 const RECONNECT_DELAYS_MS = [500, 1000, 2000, 4000, 8000, 10000];
 /** 单位：16k 采样，1 秒 = 16000 个 */
 const MS_PER_SECOND = 1000;
+/** v0.3 全局限定压音：duck 渐变时长（与 lib/ui.js DUCK_RAMP_MS 一致）与兜底恢复延迟 */
+const REPLAY_DUCK_RAMP_MS = DUCK_RAMP_MS;
+const REPLAY_DUCK_RECOVER_FALLBACK_MS = 800;
+/** duck 状态机 tick 间隔 */
+const DUCK_TICK_MS = 100;
 
 const runtime = {
   running: false,
@@ -66,6 +78,12 @@ const runtime = {
   reconnectTimer: null,
   reconnectAttempts: 0,
   dubSources: new Set(),
+  /**
+   * v0.3 全局限定压音状态：
+   * active=正在压原声；speaking=引擎最近一次 status 是 speaking；
+   * idleSince=非 speaking 起点；lastActivity=dub/status 活动时间（用于恢复延迟）。
+   */
+  duck: { active: false, speaking: false, idleSince: null, lastActivity: 0, timer: null },
 };
 
 chrome.runtime.sendMessage({ type: MSG.OFFSCREEN_HELLO, url: location.href }).catch(() => {});
@@ -81,7 +99,7 @@ async function handleOffscreenMessage(message) {
     case MSG.OFFSCREEN_STOP:
       return handleStop(message);
     case MSG.OFFSCREEN_CONFIG:
-      return handleConfigPatch(message.patch);
+      return handleConfigPatch(message);
     case MSG.OFFSCREEN_RECONNECT:
       return reconnectNow();
     case MSG.OFFSCREEN_PING:
@@ -196,6 +214,8 @@ async function stopInternal(reason = 'user', { notifyBackground = false } = {}) 
 
 /** 释放所有音频/连接资源；可重复调用 */
 async function teardown() {
+  stopDuckTicker();
+  resetDuckState();
   if (runtime.reconnectTimer) {
     clearTimeout(runtime.reconnectTimer);
     runtime.reconnectTimer = null;
@@ -315,9 +335,17 @@ async function startAudioPipeline(streamId) {
   runtime.monitorCtx = new AudioContext();
   runtime.monitorSource = runtime.monitorCtx.createMediaStreamSource(runtime.stream);
   runtime.monitorGain = runtime.monitorCtx.createGain();
-  runtime.monitorGain.gain.value = 1;
+  // 原声总线初始增益：captureReplay=false -> 0；其余 1（duck 由状态机按需渐变）
+  runtime.monitorGain.gain.value = resolveReplayGain({
+    captureReplay: runtime.settings.captureReplay !== false,
+    globalDuck: runtime.settings.globalDuck !== false,
+    ducking: false,
+    duckRatio: runtime.settings.duckRatio,
+  });
   runtime.monitorSource.connect(runtime.monitorGain).connect(runtime.monitorCtx.destination);
   await runtime.monitorCtx.resume().catch(() => {});
+  resetDuckState();
+  startDuckTicker();
 
   // 3) 采集：优先请求 16000Hz 的 AudioContext（浏览器会做内部重采样）；
   //    个别环境不支持指定采样率时退回默认采样率，由 worklet 负责重采样到 16k。
@@ -579,6 +607,123 @@ function sendEngineJson(message) {
 }
 
 // ---------------------------------------------------------------------------
+// v0.3 全局限定压音：原声总线 GainNode 平滑 duck / 恢复
+// ---------------------------------------------------------------------------
+
+/** 当前会话的恢复延迟（ms） */
+function duckRecoverMs() {
+  const value = runtime.settings.duckRecoverMs;
+  return Number.isFinite(Number(value)) ? clampDuckRecoverMs(value) : REPLAY_DUCK_RECOVER_FALLBACK_MS;
+}
+
+/**
+ * 把原声总线增益平滑改到目标值（默认 160ms 线性渐变；浏览器不支持 schedule 时直接赋值）。
+ * @param {number} target 0~1
+ * @param {number} [rampMs]
+ */
+function applyReplayGainTarget(target, rampMs = REPLAY_DUCK_RAMP_MS) {
+  const context = runtime.monitorCtx;
+  const gain = runtime.monitorGain;
+  if (!context || !gain) return;
+  const next = Math.min(1, Math.max(0, Number.isFinite(target) ? target : 1));
+  const now = context.currentTime;
+  const ramp = Math.max(0.01, (Number.isFinite(rampMs) ? rampMs : REPLAY_DUCK_RAMP_MS) / MS_PER_SECOND);
+  try {
+    gain.gain.cancelScheduledValues(now);
+    gain.gain.setValueAtTime(gain.gain.value, now);
+    gain.gain.linearRampToValueAtTime(next, now + ramp);
+  } catch (err) {
+    log('replay gain ramp failed, fallback to direct set', err && err.message);
+    gain.gain.value = next;
+  }
+}
+
+/** 按当前 duck 状态 + 设置计算并应用原声总线目标增益 */
+function syncReplayGain({ rampMs = REPLAY_DUCK_RAMP_MS } = {}) {
+  const settings = pickReplaySettings(runtime.settings);
+  const target = resolveReplayGain({
+    captureReplay: settings.captureReplay,
+    globalDuck: settings.globalDuck,
+    ducking: runtime.duck.active,
+    duckRatio: settings.duckRatio,
+  });
+  applyReplayGainTarget(target, rampMs);
+}
+
+function resetDuckState() {
+  runtime.duck.active = false;
+  runtime.duck.speaking = false;
+  runtime.duck.idleSince = null;
+  runtime.duck.lastActivity = 0;
+}
+
+/** 引擎开始/继续说话：立即平滑压原声 */
+function duckStart() {
+  runtime.duck.speaking = true;
+  runtime.duck.idleSince = null;
+  runtime.duck.lastActivity = performance.now();
+  if (!runtime.duck.active) {
+    runtime.duck.active = true;
+    syncReplayGain();
+  }
+}
+
+/** dub 音频块到达：续命（避免句间空隙提前恢复原声） */
+function duckActivity() {
+  runtime.duck.lastActivity = performance.now();
+  if (!runtime.duck.active && runtime.settings.globalDuck !== false && runtime.settings.captureReplay !== false) {
+    runtime.duck.active = true;
+    syncReplayGain();
+  }
+}
+
+/** 引擎状态离开 speaking：开始计算恢复延迟（恢复动作在 ticker 里做，保证 120-200ms 渐变） */
+function duckIdle() {
+  runtime.duck.speaking = false;
+  if (!runtime.duck.active) return;
+  if (runtime.duck.idleSince == null) runtime.duck.idleSince = performance.now();
+}
+
+function duckTick() {
+  const duck = runtime.duck;
+  if (!duck.active) return;
+  const settings = pickReplaySettings(runtime.settings);
+  if (settings.globalDuck === false || settings.captureReplay === false) {
+    duck.active = false;
+    duck.idleSince = null;
+    syncReplayGain();
+    return;
+  }
+  const now = performance.now();
+  const recoverMs = duckRecoverMs();
+  if (!duck.speaking) {
+    const idleFor = duck.idleSince != null ? now - duck.idleSince : now - duck.lastActivity;
+    if (idleFor >= recoverMs) {
+      duck.active = false;
+      duck.idleSince = null;
+      syncReplayGain();
+    }
+  } else if (now - duck.lastActivity >= Math.max(3000, recoverMs)) {
+    // 兜底：引擎一直报 speaking 但再也没有 dub 事件，避免原声一直压着
+    duck.active = false;
+    duck.idleSince = null;
+    syncReplayGain();
+  }
+}
+
+function startDuckTicker() {
+  stopDuckTicker();
+  runtime.duck.timer = setInterval(duckTick, DUCK_TICK_MS);
+}
+
+function stopDuckTicker() {
+  if (runtime.duck.timer) {
+    clearInterval(runtime.duck.timer);
+    runtime.duck.timer = null;
+  }
+}
+
+// ---------------------------------------------------------------------------
 // 引擎事件
 // ---------------------------------------------------------------------------
 
@@ -594,7 +739,14 @@ function handleEngineMessage(message, epoch) {
       break;
     case 'pong':
       return;
+    case 'status':
+      // v0.3：全局限定压音由 offscreen 的原声总线 GainNode 完成
+      if (message.state === 'speaking') duckStart();
+      else duckIdle();
+      forwardEvent(message);
+      break;
     case 'dub':
+      duckActivity();
       if (runtime.settings.dubEnabled !== false) scheduleDub(message);
       forwardEvent({
         type: 'dub',
@@ -613,7 +765,6 @@ function handleEngineMessage(message, epoch) {
     case 'partial':
     case 'segment':
     case 'translation':
-    case 'status':
     case 'metrics':
     case 'voice':
     case 'error':
@@ -687,16 +838,49 @@ function computeDubStartTime(context, startMs) {
   return computeDubPlayhead({ startMs, sessionNowMs, currentTime: context.currentTime });
 }
 
-function handleConfigPatch(patch) {
-  if (!patch || typeof patch !== 'object') return { ok: false, error: 'invalid config patch' };
-  if (patch.dub && typeof patch.dub.enabled === 'boolean') {
-    runtime.settings = { ...runtime.settings, dubEnabled: patch.dub.enabled };
+/**
+ * 配置更新：engine config patch（dub/voiceMode，转发给引擎）+ v0.3 本地音频设置
+ * （captureReplay / globalDuck / duckRatio / duckRecoverMs，直接作用于原声总线）。
+ * @param {{patch?:object, settings?:object}} message
+ */
+function handleConfigPatch(message) {
+  if (!message || typeof message !== 'object') return { ok: false, error: 'invalid config message' };
+  const updates = {};
+  if (message.settings && typeof message.settings === 'object') {
+    const incoming = message.settings;
+    if (typeof incoming.captureReplay === 'boolean') updates.captureReplay = incoming.captureReplay;
+    if (typeof incoming.globalDuck === 'boolean') updates.globalDuck = incoming.globalDuck;
+    if (incoming.duckRatio != null && Number.isFinite(Number(incoming.duckRatio))) {
+      updates.duckRatio = Math.min(1, Math.max(0.02, Number(incoming.duckRatio)));
+    }
+    if (incoming.duckRecoverMs != null) updates.duckRecoverMs = clampDuckRecoverMs(incoming.duckRecoverMs);
   }
-  if (patch.tts && typeof patch.tts.voiceMode === 'string') {
-    runtime.settings = { ...runtime.settings, voiceMode: patch.tts.voiceMode };
+  if (Object.keys(updates).length > 0) {
+    runtime.settings = { ...runtime.settings, ...updates };
+    // 设置变了立即按新比例渐变（例如原声重放开关切换、duck 比例调整）
+    syncReplayGain({ rampMs: REPLAY_DUCK_RAMP_MS });
   }
-  const sent = sendEngineJson({ type: 'config', patch });
-  return { ok: true, forwarded: sent };
+  const patch = message.patch && typeof message.patch === 'object' ? message.patch : null;
+  if (patch) {
+    if (patch.dub && typeof patch.dub.enabled === 'boolean') {
+      runtime.settings = { ...runtime.settings, dubEnabled: patch.dub.enabled };
+    }
+    if (patch.tts && typeof patch.tts.voiceMode === 'string') {
+      runtime.settings = { ...runtime.settings, voiceMode: patch.tts.voiceMode };
+    }
+  }
+  const sent = patch ? sendEngineJson({ type: 'config', patch }) : false;
+  return { ok: true, forwarded: sent, settings: pickReplaySettings(runtime.settings) };
+}
+
+/** 只取 offscreen 本地音频相关设置（回传 background/debug 用） */
+function pickReplaySettings(settings) {
+  return {
+    captureReplay: settings.captureReplay !== false,
+    globalDuck: settings.globalDuck !== false,
+    duckRatio: Number.isFinite(Number(settings.duckRatio)) ? Number(settings.duckRatio) : 0.18,
+    duckRecoverMs: clampDuckRecoverMs(settings.duckRecoverMs),
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -744,6 +928,9 @@ Object.defineProperty(globalThis, '__livedubOffscreen', {
         pendingChunks: runtime.epoch ? runtime.epoch.pending.length : 0,
         framesSent: runtime.epoch ? runtime.epoch.framesSent : 0,
         reconnectAttempts: runtime.reconnectAttempts,
+        replayGain: runtime.monitorGain ? runtime.monitorGain.gain.value : null,
+        ducking: runtime.duck.active,
+        duckSettings: pickReplaySettings(runtime.settings),
         reasons: [...OFFSCREEN_REASONS],
         justification: OFFSCREEN_JUSTIFICATION,
       };

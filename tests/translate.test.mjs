@@ -15,6 +15,10 @@ import {
   buildTranslationMessages,
   cleanTranslation,
   createClauseExtractor,
+  normalizeForMatch,
+  draftTranslationReusable,
+  draftTranslationScore,
+  createDraftTranslationCache,
 } from '../engine/translate/index.mjs';
 import {
   formatSrt,
@@ -300,6 +304,14 @@ test('prompt 包含术语表强约束、最近双语上下文与教学同传要�
   assert.match(system.content, /原样保留/);
   assert.match(system.content, /不改大小写/);
   assert.match(system.content, /逐字/);
+  // v0.3 首 token 优化：system prompt 必须更短（长度上限），但关键约束仍在
+  const systemChars = Array.from(system.content).length;
+  assert.ok(systemChars <= 210, `system prompt 过长（${systemChars} 字），会拖慢首 token 延迟`);
+  assert.ok(systemChars >= 60, `system prompt 过短可能丢约束（${systemChars} 字）`);
+  assert.match(system.content, /公式/);
+  assert.match(system.content, /变量名/);
+  assert.match(system.content, /URL/);
+  assert.match(system.content, /口语化/);
 
   assert.equal(user.role, 'user');
   assert.match(user.content, /gradient descent = 梯度下降/);
@@ -562,6 +574,209 @@ test('空 onPartial / 缺失字段不崩溃', async () => {
     model: '',
     provider: 'deepseek',
   });
+});
+
+/* ------------------------------------------------------------------ *
+ * v0.3 草稿翻译复用（ASR partial 先翻译、final 确认后复用）
+ * ------------------------------------------------------------------ */
+
+test('normalizeForMatch：去空白/标点/大小写，数字与标识符字母数字保留', () => {
+  assert.equal(normalizeForMatch('  Hello, World!  '), 'helloworld');
+  assert.equal(normalizeForMatch('Node.js'), 'nodejs');
+  assert.equal(normalizeForMatch('We use gradient_descent, v2.0 (50%)!'), 'weusegradientdescentv2050');
+  assert.equal(normalizeForMatch('ＧＰＴ３'), 'gpt3'); // NFKC 全角 -> 半角
+  assert.equal(normalizeForMatch(''), '');
+  assert.equal(normalizeForMatch(null), '');
+  assert.equal(normalizeForMatch(undefined), '');
+  assert.equal(normalizeForMatch(123.45), '12345');
+});
+
+test('draftTranslationReusable：完全相同 / 标点·空白·大小写差异可复用', () => {
+  const source = 'Gradient descent updates each parameter in the opposite direction of the gradient.';
+  assert.equal(draftTranslationReusable({ draftSource: source, finalSource: source }), true);
+  assert.equal(draftTranslationReusable({ draftSource: source, finalSource: `  ${source}\n` }), true);
+  assert.equal(draftTranslationReusable({ draftSource: source, finalSource: source.replace(/\.$/, '!') }), true);
+  assert.equal(draftTranslationReusable({ draftSource: source, finalSource: source.toUpperCase() }), true);
+});
+
+test('draftTranslationReusable：词尾小改动 / 单处 ASR 修正可复用', () => {
+  assert.equal(
+    draftTranslationReusable({
+      draftSource: 'The algorithm converge to a local minimum.',
+      finalSource: 'The algorithm converges to a local minimum.',
+    }),
+    true,
+  );
+  const typoPair = {
+    draftSource: 'We use gradient decsent for training.',
+    finalSource: 'We use gradient descent for training.',
+  };
+  assert.equal(draftTranslationReusable(typoPair), true);
+  assert.ok(draftTranslationScore(typoPair) >= 0.82, '单处拼写修正的匹配分应 >= 默认阈值');
+});
+
+test('draftTranslationReusable：大改写 / 语义词替换不可复用', () => {
+  assert.equal(
+    draftTranslationReusable({
+      draftSource: 'Gradient descent is a first order optimization algorithm.',
+      finalSource: 'Neural networks learn hierarchical feature representations.',
+    }),
+    false,
+  );
+  assert.equal(
+    draftTranslationReusable({
+      draftSource: 'We use batch gradient descent for training.',
+      finalSource: 'We use stochastic gradient descent for training.',
+    }),
+    false,
+  );
+  assert.equal(
+    draftTranslationReusable({
+      draftSource: 'This will increase the learning rate.',
+      finalSource: 'This will decrease the learning rate.',
+    }),
+    false,
+  );
+});
+
+test('draftTranslationReusable：数字不一致直接不可复用', () => {
+  assert.equal(
+    draftTranslationReusable({
+      draftSource: 'Set the learning rate to 0.001.',
+      finalSource: 'Set the learning rate to 0.01.',
+    }),
+    false,
+  );
+  assert.equal(
+    draftTranslationReusable({
+      draftSource: 'We trained for 10 epochs.',
+      finalSource: 'We trained for 12 epochs.',
+    }),
+    false,
+  );
+  // 千分位等纯格式差异视为同一个数字（源文本语义一致，可复用）
+  assert.equal(
+    draftTranslationReusable({
+      draftSource: 'We sampled 1,000 points.',
+      finalSource: 'We sampled 1000 points.',
+    }),
+    true,
+  );
+});
+
+test('draftTranslationReusable：代码标识符 / URL 不一致直接不可复用', () => {
+  assert.equal(
+    draftTranslationReusable({
+      draftSource: 'Call msToSamples to convert the samples.',
+      finalSource: 'Call msToSample to convert the samples.',
+    }),
+    false,
+  );
+  assert.equal(
+    draftTranslationReusable({ draftSource: 'Read the node.js docs first.', finalSource: 'Read the nodejs docs first.' }),
+    false,
+  );
+  assert.equal(
+    draftTranslationReusable({
+      draftSource: 'See https://example.com/a for details.',
+      finalSource: 'See https://example.com/b for details.',
+    }),
+    false,
+  );
+  // 标识符不变时的小改动仍可复用
+  assert.equal(
+    draftTranslationReusable({
+      draftSource: 'Call msToSamples to convert the samples.',
+      finalSource: 'Call msToSamples to convert samples.',
+    }),
+    true,
+  );
+});
+
+test('draftTranslationReusable：空值 / 只有标点不可复用', () => {
+  const cases = [
+    { draftSource: '', finalSource: 'hello' },
+    { draftSource: 'hello', finalSource: '' },
+    { draftSource: '   ', finalSource: '   ' },
+    { draftSource: null, finalSource: 'hello' },
+    { draftSource: 'hello', finalSource: undefined },
+    { draftSource: '！？。', finalSource: '。！' },
+  ];
+  for (const pair of cases) assert.equal(draftTranslationReusable(pair), false, JSON.stringify(pair));
+  assert.equal(draftTranslationReusable(), false);
+});
+
+test('draftTranslationReusable：草稿只是 final 的前缀（尾部追加）不可复用', () => {
+  assert.equal(
+    draftTranslationReusable({
+      draftSource: 'We use gradient descent.',
+      finalSource: 'We use gradient descent to train the model.',
+    }),
+    false,
+  );
+  // 尾部只差 1 个字符（如复数）仍可复用
+  const pair = { draftSource: 'The algorithm converge.', finalSource: 'The algorithm converges.' };
+  assert.equal(draftTranslationReusable(pair), true);
+  assert.ok(draftTranslationScore(pair) > 0.9);
+});
+
+test('draftTranslationReusable：阈值边界（score 命中/不命中、阈值钳制）', () => {
+  const pair = {
+    draftSource: 'The gradient descent algorithm is stable.',
+    finalSource: 'The gradient descent algorithms are stable.',
+  };
+  const score = draftTranslationScore(pair);
+  assert.ok(score > 0.82 && score < 1, `阈值测试样例 score 应在 (0.82, 1)：${score}`);
+  assert.equal(draftTranslationReusable({ ...pair, threshold: score }), true);
+  assert.equal(draftTranslationReusable({ ...pair, threshold: Math.min(1, score + 0.01) }), false);
+  assert.equal(draftTranslationReusable(pair), true);
+
+  // 非法/越界阈值：NaN -> 默认 0.82；>1 钳到 1；<0 钳到 0
+  const identical = { draftSource: 'Gradient descent works.', finalSource: 'Gradient descent works.' };
+  assert.equal(draftTranslationReusable({ ...identical, threshold: Number.NaN }), true);
+  assert.equal(draftTranslationReusable({ ...identical, threshold: 2 }), true);
+  assert.equal(draftTranslationReusable({ draftSource: 'abcd', finalSource: 'abce', threshold: -1 }), true);
+});
+
+test('createDraftTranslationCache：set/get/delete/LRU/stats', () => {
+  const cache = createDraftTranslationCache({ maxEntries: 2 });
+  assert.equal(cache.get('missing'), undefined);
+  cache.set('a', { draftSource: 'A source', text: '甲译文' });
+  cache.set('b', { draftSource: 'B source', text: '乙译文' });
+  assert.deepEqual(cache.get('a'), { draftSource: 'A source', text: '甲译文' }); // 命中并刷新 LRU
+  cache.set('c', { draftSource: 'C source', text: '丙译文' }); // 淘汰最久未用的 b
+  assert.equal(cache.get('b'), undefined);
+  assert.deepEqual(cache.get('a'), { draftSource: 'A source', text: '甲译文' });
+  assert.deepEqual(cache.get('c'), { draftSource: 'C source', text: '丙译文' });
+  assert.equal(cache.delete('a'), true);
+  assert.equal(cache.delete('a'), false);
+
+  const stats = cache.stats();
+  assert.equal(stats.size, 1);
+  assert.equal(stats.maxEntries, 2);
+  assert.equal(stats.sets, 3);
+  assert.equal(stats.evictions, 1);
+  assert.equal(stats.deletes, 1);
+  assert.equal(stats.hits, 3);
+  assert.equal(stats.misses, 2);
+  assert.ok(stats.hitRate > 0 && stats.hitRate <= 1);
+});
+
+test('createDraftTranslationCache：覆盖写刷新 LRU、maxEntries=1、默认 32、key 归一化', () => {
+  const cache = createDraftTranslationCache({ maxEntries: 1 });
+  cache.set('a', { draftSource: 'A', text: '甲' });
+  cache.set('b', { draftSource: 'B', text: '乙' });
+  assert.equal(cache.get('a'), undefined, 'maxEntries=1 时旧条目被淘汰');
+  cache.set('b', { draftSource: 'B2', text: '乙2' }); // 覆盖写
+  assert.deepEqual(cache.get('b'), { draftSource: 'B2', text: '乙2' });
+  assert.equal(cache.stats().size, 1);
+
+  const defaultCache = createDraftTranslationCache();
+  assert.equal(defaultCache.stats().maxEntries, 32);
+  assert.equal(defaultCache.stats().hitRate, 0);
+  defaultCache.set(7, { draftSource: '7', text: '七' }); // 数字 key 归一化为字符串
+  assert.deepEqual(defaultCache.get('7'), { draftSource: '7', text: '七' });
+  assert.equal(defaultCache.get(7), defaultCache.get('7'));
 });
 
 /* ------------------------------------------------------------------ *

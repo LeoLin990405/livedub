@@ -17,6 +17,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import http from 'node:http';
 import net from 'node:net';
+import os from 'node:os';
 import path from 'node:path';
 import { test } from 'node:test';
 import { fileURLToPath } from 'node:url';
@@ -27,8 +28,15 @@ import { PROJECT_ROOT, deepMerge, loadConfig } from '../engine/config.mjs';
 import { createMockDeps } from '../engine/mock.mjs';
 import { buildEventJsonl, parseSessionJsonl } from '../studio/session-parse.mjs';
 import {
+  ASR_ENGINE_OPTIONS,
+  asrEngineLabel,
+  asrPrivacyCopy,
+  buildSettingsPatch,
   buildSparkline,
+  desktopAppInstructions,
   isEditableTarget,
+  mergeSettingsSnapshot,
+  normalizeAsrEngine,
   normalizeSubsStyle,
   normalizeTheme,
   resolveShortcut,
@@ -44,6 +52,26 @@ function testConfig(overrides = {}) {
     tts: { provider: 'mock', voiceMode: 'preset' },
     dub: { enabled: true },
     ...overrides,
+  });
+}
+
+/** 每个测试独立的临时目录（UI 设置 / 桌面 App 检测互不污染） */
+function makeTempDir(prefix = 'livedub-test-') {
+  return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
+}
+
+/**
+ * 测试专用 startServer：
+ * - dataDir 指向临时目录，避免读写仓库 data/ui-settings.json；
+ * - desktopAppPath 默认指向不存在的临时路径，避免本机 build 产物影响断言。
+ */
+function startTestServer(options = {}) {
+  const dataDir = options.dataDir ?? makeTempDir('livedub-test-data-');
+  return startServer({
+    log: () => {},
+    dataDir,
+    desktopAppPath: options.desktopAppPath ?? path.join(dataDir, 'no-desktop-app'),
+    ...options,
   });
 }
 
@@ -214,7 +242,7 @@ function pcmFrame(tMs, { samples = 1600 } = {}) {
 // =================================================================== HTTP API
 
 test('HTTP /health：ok、版本、provider、whisper 是否找到、sayless 路径', async () => {
-  const srv = await startServer({ port: 0, config: testConfig(), log: () => {} });
+  const srv = await startTestServer({ port: 0, config: testConfig(), log: () => {} });
   try {
     const res = await fetch(`${srv.url}/health`);
     assert.equal(res.status, 200);
@@ -246,7 +274,7 @@ test('HTTP /api/config：publicConfig 脱敏，任何 apiKey 都不出现', asyn
   const config = testConfig({
     providers: { deepseek: { apiKey: 'sk-FILE-SECRET-should-not-leak', baseUrl: 'https://api.deepseek.com' } },
   });
-  const srv = await startServer({ port: 0, config, log: () => {} });
+  const srv = await startTestServer({ port: 0, config, log: () => {} });
   try {
     const res = await fetch(`${srv.url}/api/config`);
     assert.equal(res.status, 200);
@@ -268,7 +296,7 @@ test('HTTP /api/config：publicConfig 脱敏，任何 apiKey 都不出现', asyn
 });
 
 test('HTTP /api/voices：真实 provider 失败时回退 config 预设，不返回 500', async () => {
-  const srv = await startServer({
+  const srv = await startTestServer({
     port: 0,
     config: testConfig(),
     log: () => {},
@@ -298,7 +326,7 @@ test('HTTP /api/voices：真实 provider 失败时回退 config 预设，不返�
 });
 
 test('HTTP /api/voices：注入的 provider 成功时 source=provider', async () => {
-  const srv = await startServer({
+  const srv = await startTestServer({
     port: 0,
     config: testConfig(),
     log: () => {},
@@ -320,7 +348,7 @@ test('HTTP /api/voices：注入的 provider 成功时 source=provider', async ()
 });
 
 test('HTTP 静态服务：/ -> /studio/、/studio/ 与 /replay/ 200、缺失 404', async () => {
-  const srv = await startServer({ port: 0, config: testConfig(), log: () => {} });
+  const srv = await startTestServer({ port: 0, config: testConfig(), log: () => {} });
   try {
     const root = await httpRequest(srv.port, '/');
     assert.equal(root.status, 302);
@@ -331,6 +359,13 @@ test('HTTP 静态服务：/ -> /studio/、/studio/ 与 /replay/ 200、缺失 404
     assert.match(String(studio.headers['content-type']), /text\/html/);
     assert.ok(studio.body.includes('本地实时同传工作台'));
     assert.ok(studio.body.includes('开始同传'));
+    // v0.3：ASR 引擎选择 / 隐私提示 / 桌面 App 入口
+    assert.ok(studio.body.includes('识别引擎'));
+    assert.ok(studio.body.includes('本地 whisper'));
+    assert.ok(studio.body.includes('云端 MiniMax'));
+    assert.ok(studio.body.includes('音频不离开本机'));
+    assert.ok(studio.body.includes('桌面 App'));
+    assert.ok(studio.body.includes('data/ui-settings.json'));
 
     const app = await httpRequest(srv.port, '/studio/app.mjs');
     assert.equal(app.status, 200);
@@ -375,7 +410,7 @@ test('HTTP 静态服务：/ -> /studio/、/studio/ 与 /replay/ 200、缺失 404
 });
 
 test('HTTP 静态服务：目录穿越 403、Range 206、非白名单前缀 404', async () => {
-  const srv = await startServer({ port: 0, config: testConfig(), log: () => {} });
+  const srv = await startTestServer({ port: 0, config: testConfig(), log: () => {} });
   try {
     const attempts = [
       '/studio/%2e%2e%2fengine%2fconfig.mjs',
@@ -409,7 +444,7 @@ test('HTTP 静态服务：目录穿越 403、Range 206、非白名单前缀 404'
 
 test('WS：hello -> ready -> 二进制音频帧 -> segment/translation/dub，并转发 control/config/glossary/ping', async () => {
   const record = [];
-  const srv = await startServer({ port: 0, config: testConfig(), log: () => {}, sessionFactory: createFakeSessionFactory(record) });
+  const srv = await startTestServer({ port: 0, config: testConfig(), log: () => {}, sessionFactory: createFakeSessionFactory(record) });
   let client = null;
   try {
     client = await openWs(`${srv.url.replace('http://', 'ws://')}/ws`);
@@ -501,7 +536,7 @@ test('WS：hello -> ready -> 二进制音频帧 -> segment/translation/dub，并
 
 test('WS：非法音频帧/未 hello 送音频只回 error 事件，不崩溃', async () => {
   const record = [];
-  const srv = await startServer({ port: 0, config: testConfig(), log: () => {}, sessionFactory: createFakeSessionFactory(record) });
+  const srv = await startTestServer({ port: 0, config: testConfig(), log: () => {}, sessionFactory: createFakeSessionFactory(record) });
   let client = null;
   try {
     client = await openWs(`${srv.url.replace('http://', 'ws://')}/ws`);
@@ -536,7 +571,7 @@ test('WS：非法音频帧/未 hello 送音频只回 error 事件，不崩溃', 
 });
 
 test('WS Origin 白名单：本机/扩展放行，外部 Origin 403', async () => {
-  const srv = await startServer({ port: 0, config: testConfig(), log: () => {}, sessionFactory: createFakeSessionFactory([]) });
+  const srv = await startTestServer({ port: 0, config: testConfig(), log: () => {}, sessionFactory: createFakeSessionFactory([]) });
   try {
     const local = await rawUpgrade(srv.port, { origin: `http://127.0.0.1:${srv.port}` });
     assert.match(local, /101 Switching Protocols/);
@@ -571,7 +606,7 @@ test('isAllowedOrigin / buildPresetVoices 纯函数', () => {
 });
 
 test('--demo 模式：/health 报告 demo，WS 可建立演示会话', async () => {
-  const srv = await startServer({ port: 0, config: testConfig(), demo: true, log: () => {} });
+  const srv = await startTestServer({ port: 0, config: testConfig(), demo: true, log: () => {} });
   let client = null;
   try {
     const health = await (await fetch(`${srv.url}/health`)).json();
@@ -602,7 +637,7 @@ test('真实 engine/pipeline.mjs + mock deps：hello -> ready -> 音频 -> segme
   const pipeline = await import('../engine/pipeline.mjs');
   const config = testConfig();
   const deps = { config, ...createMockDeps() };
-  const srv = await startServer({
+  const srv = await startTestServer({
     port: 0,
     config,
     log: () => {},
@@ -653,7 +688,7 @@ test('真实 engine/pipeline.mjs + mock deps：hello -> ready -> 音频 -> segme
 
 test('server.maxSessions：超过并发上限时拒绝新会话（error+1013）并报告 activeSessions', async () => {
   const record = [];
-  const srv = await startServer({
+  const srv = await startTestServer({
     port: 0,
     config: testConfig(),
     log: () => {},
@@ -704,7 +739,7 @@ test('server.maxSessions：超过并发上限时拒绝新会话（error+1013）�
 });
 
 test('server.maxSessions：从 config.server.maxSessions 读取并出现在 /health 与 /api/config', async () => {
-  const srv = await startServer({
+  const srv = await startTestServer({
     port: 0,
     config: testConfig({ server: { maxSessions: 2 } }),
     log: () => {},
@@ -722,7 +757,7 @@ test('server.maxSessions：从 config.server.maxSessions 读取并出现在 /hea
 });
 
 test('/health：whisper-server 运行状态（尽力而为）与优雅关闭幂等', async () => {
-  const srv = await startServer({
+  const srv = await startTestServer({
     port: 0,
     config: testConfig(),
     log: () => {},
@@ -825,4 +860,269 @@ test('UI 纯函数：主题/字幕样式/快捷键/sparkline', () => {
   assert.deepEqual(empty, { points: '', min: 0, max: 0, last: null, count: 0 });
   assert.equal(buildSparkline([100, Number.NaN, -5, 'x', 200]).count, 2);
   assert.equal(buildSparkline([42]).count, 1);
+});
+
+// ================================================ v0.3 UI 设置 / 桌面 App
+
+test('GET/PUT /api/settings：默认值、白名单校验 400、持久化、/api/config 合并与 /health asrEngine', async () => {
+  const dataDir = makeTempDir('livedub-settings-');
+  const srv = await startTestServer({ config: testConfig(), dataDir });
+  try {
+    // GET 默认值（来自 config，未持久化）
+    let res = await fetch(`${srv.url}/api/settings`);
+    assert.equal(res.status, 200);
+    let body = await res.json();
+    assert.equal(body.ok, true);
+    assert.equal(body.fileExists, false);
+    assert.deepEqual(body.overrides, {});
+    assert.equal(body.settings.asr.provider, 'mock');
+    assert.equal(body.settings.tts.voiceMode, 'preset');
+    assert.equal(body.settings.dub.enabled, true);
+    assert.equal(typeof body.path, 'string');
+    assert.equal(body.asrEngine.cloud, false);
+
+    // PUT 白名单字段
+    res = await fetch(`${srv.url}/api/settings`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        settings: { asr: { provider: 'minimax-cloud' }, tts: { voiceMode: 'clone-first' }, dub: { enabled: false } },
+      }),
+    });
+    assert.equal(res.status, 200);
+    body = await res.json();
+    assert.equal(body.saved, true);
+    assert.equal(body.nextSessionOnly, true);
+    assert.equal(body.fileExists, true);
+    assert.equal(typeof body.updatedAt, 'string');
+    assert.equal(body.settings.asr.provider, 'minimax-cloud');
+    assert.equal(body.overrides.tts.voiceMode, 'clone-first');
+    assert.equal(body.asrEngine.provider, 'minimax-cloud');
+    assert.equal(body.asrEngine.cloud, true);
+    assert.equal(body.asrEngine.privacy, 'cloud');
+
+    // 落盘文件只含白名单字段，不含任何密钥
+    const settingsFile = path.join(dataDir, 'ui-settings.json');
+    assert.ok(fs.existsSync(settingsFile), '应持久化到 data/ui-settings.json');
+    const raw = fs.readFileSync(settingsFile, 'utf8');
+    assert.ok(!raw.includes('apiKey'));
+    assert.ok(!raw.includes('secret'));
+    const saved = JSON.parse(raw);
+    assert.equal(saved.version, 1);
+    assert.equal(saved.settings.asr.provider, 'minimax-cloud');
+    assert.equal(saved.settings.dub.enabled, false);
+
+    // /api/config 合并 UI 设置（脱敏后）
+    const configBody = await (await fetch(`${srv.url}/api/config`)).json();
+    assert.equal(configBody.config.asr.provider, 'minimax-cloud');
+    assert.equal(configBody.config.tts.voiceMode, 'clone-first');
+    assert.equal(configBody.config.dub.enabled, false);
+    assert.equal(configBody.config.runtime.uiSettings.overrides.asr.provider, 'minimax-cloud');
+    assert.equal(configBody.config.runtime.uiSettings.effective.dub.enabled, false);
+    assert.equal(typeof configBody.config.runtime.asrEngine, 'object');
+    assert.equal(typeof configBody.config.runtime.desktopApp, 'object');
+    assert.ok(!JSON.stringify(configBody).includes('apiKey'));
+
+    // /health：生效 ASR 引擎 + 隐私信息
+    const health = await (await fetch(`${srv.url}/health`)).json();
+    assert.equal(health.providers.asr, 'minimax-cloud');
+    assert.equal(health.asrEngine.provider, 'minimax-cloud');
+    assert.equal(health.asrEngine.cloud, true);
+    assert.match(health.asrEngine.privacyTitle, /MiniMax/);
+    assert.equal(health.uiSettings.overridden, true);
+    assert.equal(health.features.dubEnabled, false);
+
+    // 非法值 / 非白名单字段 -> 400
+    const invalidPayloads = [
+      { asr: { provider: 'cloud-magic' } },
+      { tts: { voiceMode: 'clone' } },
+      { dub: { enabled: 'yes' } },
+      { asr: { provider: 'whisper-local', extra: 1 } },
+      { secret: 'should-not-persist' },
+      { settings: { asr: { provider: 'nope' } } },
+      { settings: {} },
+    ];
+    for (const payload of invalidPayloads) {
+      const response = await fetch(`${srv.url}/api/settings`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+      assert.equal(response.status, 400, `payload ${JSON.stringify(payload)} 应返回 400`);
+      const error = await response.json();
+      assert.equal(error.ok, false);
+      assert.equal(typeof error.error, 'string');
+      assert.equal(typeof error.message, 'string');
+    }
+    // 非法 JSON -> 400
+    const badJson = await fetch(`${srv.url}/api/settings`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: '{oops' });
+    assert.equal(badJson.status, 400);
+    // 非 PUT 之外的方法 -> 405 + Allow
+    const post = await fetch(`${srv.url}/api/settings`, { method: 'POST', body: '{}' });
+    assert.equal(post.status, 405);
+    assert.match(String(post.headers.get('allow')), /PUT/);
+  } finally {
+    await srv.close();
+    fs.rmSync(dataDir, { recursive: true, force: true });
+  }
+});
+
+test('/api/settings：重启后读取持久化设置；脏文件回退默认并给 warning', async () => {
+  const dataDir = makeTempDir('livedub-settings-persist-');
+  let srv = await startTestServer({ config: testConfig(), dataDir });
+  try {
+    await fetch(`${srv.url}/api/settings`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ asr: { provider: 'minimax-cloud' } }),
+    });
+    await srv.close();
+
+    srv = await startTestServer({ config: testConfig(), dataDir });
+    const body = await (await fetch(`${srv.url}/api/settings`)).json();
+    assert.equal(body.overrides.asr.provider, 'minimax-cloud');
+    assert.equal(body.settings.asr.provider, 'minimax-cloud');
+    assert.equal(body.fileExists, true);
+    const health = await (await fetch(`${srv.url}/health`)).json();
+    assert.equal(health.asrEngine.provider, 'minimax-cloud');
+    assert.equal(health.asrEngine.overridden, true);
+    await srv.close();
+
+    // 脏 JSON：服务仍能启动，回退 config 默认值并返回 warning
+    fs.writeFileSync(path.join(dataDir, 'ui-settings.json'), '{ this is not json');
+    srv = await startTestServer({ config: testConfig(), dataDir });
+    const fallback = await (await fetch(`${srv.url}/api/settings`)).json();
+    assert.equal(fallback.fileExists, true);
+    assert.deepEqual(fallback.overrides, {});
+    assert.equal(fallback.settings.asr.provider, 'mock', '脏文件应回退 config 默认值');
+    assert.ok(Array.isArray(fallback.warnings) && fallback.warnings.length > 0);
+  } finally {
+    await srv.close();
+    fs.rmSync(dataDir, { recursive: true, force: true });
+  }
+});
+
+test('/health 与 /api/config：desktopApp 检测（不存在 -> 构建命令；存在 -> 启动命令）', async () => {
+  const dataDir = makeTempDir('livedub-desktop-');
+  const appPath = path.join(dataDir, 'build', 'livedub.app');
+  const srv = await startTestServer({ config: testConfig(), dataDir, desktopAppPath: appPath });
+  try {
+    let health = await (await fetch(`${srv.url}/health`)).json();
+    assert.equal(health.desktopApp.available, false);
+    assert.equal(health.desktopApp.buildCommand, 'bash scripts/build-macos.sh');
+    assert.equal(typeof health.desktopApp.buildScriptFound, 'boolean');
+    assert.equal(typeof health.desktopApp.openCommand, 'string');
+    assert.equal(typeof health.desktopApp.hint, 'string');
+    assert.equal(health.desktopApp.platform, process.platform);
+
+    // 构建产物出现后，无需重启服务即可检测到
+    fs.mkdirSync(appPath, { recursive: true });
+    health = await (await fetch(`${srv.url}/health`)).json();
+    assert.equal(health.desktopApp.available, true);
+    assert.match(health.desktopApp.openCommand, /^open /);
+
+    const configBody = await (await fetch(`${srv.url}/api/config`)).json();
+    assert.equal(configBody.config.runtime.desktopApp.available, true);
+  } finally {
+    await srv.close();
+    fs.rmSync(dataDir, { recursive: true, force: true });
+  }
+});
+
+test('UI 设置注入下一次会话 overrides：asr/tts/dub 生效，客户端 hello.overrides 优先', async () => {
+  const dataDir = makeTempDir('livedub-settings-session-');
+  const record = [];
+  const srv = await startTestServer({ config: testConfig(), dataDir, sessionFactory: createFakeSessionFactory(record) });
+  try {
+    const put = await fetch(`${srv.url}/api/settings`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ asr: { provider: 'minimax-cloud' }, tts: { voiceMode: 'preset' }, dub: { enabled: false } }),
+    });
+    assert.equal(put.status, 200);
+
+    const first = await openWs(`${srv.url.replace('http://', 'ws://')}/ws`);
+    first.socket.send(JSON.stringify({ type: 'hello', protocol: 1, session: { source: 'test' } }));
+    await waitForEvent(first.events, (event) => event.type === 'ready', 4000, 'ready');
+    await waitFor(() => record.length >= 1, 4000, '会话创建');
+    const overrides = record[0].options.overrides ?? {};
+    assert.equal(overrides.asr?.provider, 'minimax-cloud');
+    assert.equal(overrides.tts?.voiceMode, 'preset');
+    assert.equal(overrides.dub?.enabled, false);
+    first.socket.close();
+
+    // 客户端 hello.overrides 优先级更高（例如临时切克隆音色）
+    const second = await openWs(`${srv.url.replace('http://', 'ws://')}/ws`);
+    second.socket.send(
+      JSON.stringify({ type: 'hello', protocol: 1, session: { source: 'test', overrides: { tts: { voiceMode: 'clone-first' } } } }),
+    );
+    await waitForEvent(second.events, (event) => event.type === 'ready', 4000, 'ready2');
+    await waitFor(() => record.length >= 2, 4000, '第二个会话');
+    const secondOverrides = record[1].options.overrides ?? {};
+    assert.equal(secondOverrides.asr?.provider, 'minimax-cloud', 'UI 设置的 asr 仍生效');
+    assert.equal(secondOverrides.tts?.voiceMode, 'clone-first', '客户端 hello.overrides 应覆盖 UI 设置');
+    second.socket.close();
+  } finally {
+    await srv.close();
+    fs.rmSync(dataDir, { recursive: true, force: true });
+  }
+});
+
+test('UI 纯函数（v0.3）：ASR 标签/隐私文案/桌面 App 引导/设置补丁', () => {
+  assert.equal(ASR_ENGINE_OPTIONS.length, 2);
+  assert.deepEqual(
+    ASR_ENGINE_OPTIONS.map((engine) => engine.id),
+    ['whisper-local', 'minimax-cloud'],
+  );
+
+  assert.equal(normalizeAsrEngine('minimax-cloud'), 'minimax-cloud');
+  assert.equal(normalizeAsrEngine('weird-provider'), 'whisper-local');
+  assert.equal(normalizeAsrEngine(null), 'whisper-local');
+  assert.equal(normalizeAsrEngine(undefined, 'minimax-cloud'), 'minimax-cloud');
+
+  assert.equal(asrEngineLabel('whisper-local'), '本地 whisper');
+  assert.equal(asrEngineLabel('minimax-cloud'), '云端 MiniMax');
+  assert.equal(asrEngineLabel('mock'), 'Mock（开发用）');
+  assert.equal(asrEngineLabel('unknown-x'), 'unknown-x');
+
+  const local = asrPrivacyCopy('whisper-local');
+  assert.equal(local.cloud, false);
+  assert.equal(local.tone, 'local');
+  assert.match(local.title, /不离开本机/);
+  const cloud = asrPrivacyCopy('minimax-cloud');
+  assert.equal(cloud.cloud, true);
+  assert.equal(cloud.tone, 'cloud');
+  assert.match(cloud.title, /MiniMax/);
+  assert.match(cloud.detail, /上传/);
+
+  const missing = desktopAppInstructions({ available: false });
+  assert.equal(missing.available, false);
+  assert.equal(missing.badge, '未构建');
+  assert.equal(missing.command, 'bash scripts/build-macos.sh');
+  const ready = desktopAppInstructions({ available: true, appPath: 'apps/macos/build/livedub.app' });
+  assert.equal(ready.available, true);
+  assert.equal(ready.badge, '已构建');
+  assert.match(ready.command, /^open /);
+  assert.match(ready.command, /livedub\.app/);
+
+  assert.deepEqual(buildSettingsPatch({ asrProvider: 'minimax-cloud' }), { asr: { provider: 'minimax-cloud' } });
+  assert.deepEqual(buildSettingsPatch({ ttsVoiceMode: 'preset', dubEnabled: false }), {
+    tts: { voiceMode: 'preset' },
+    dub: { enabled: false },
+  });
+  assert.deepEqual(buildSettingsPatch({ asrProvider: 'bad-value' }), {});
+
+  const merged = mergeSettingsSnapshot({
+    settings: { asr: { provider: 'minimax-cloud' }, tts: { voiceMode: 'preset' }, dub: { enabled: false } },
+    overrides: { asr: { provider: 'minimax-cloud' } },
+    updatedAt: '2026-01-01T00:00:00.000Z',
+    fileExists: true,
+  });
+  assert.equal(merged.asrProvider, 'minimax-cloud');
+  assert.equal(merged.ttsVoiceMode, 'preset');
+  assert.equal(merged.dubEnabled, false);
+  assert.equal(merged.fileExists, true);
+  const fallback = mergeSettingsSnapshot({}, 'minimax-cloud');
+  assert.equal(fallback.asrProvider, 'minimax-cloud');
+  assert.equal(fallback.dubEnabled, true);
 });

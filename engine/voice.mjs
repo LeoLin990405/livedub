@@ -11,10 +11,13 @@
  * 语义（关键，别写错）：
  *   - tts.voiceMode='preset'：从不累积样本、从不尝试克隆；
  *   - tts.voiceMode='clone-first'：每句把讲师原声 PCM 累积起来（VAD 已切过，都是语音），
- *     攒够 tts.clone.minSampleSec 秒后**只尝试一次** tts.cloneVoice()；
+ *     攒够 tts.clone.minSampleSec 秒后**只尝试一轮克隆**；
  *     成功 -> 切克隆音色；失败 -> 记住 reason，此后永久用 preset 音色，**不得每句重试**。
- *   - 当前 MiniMax Token Plan 返回 2061（voice_clone 不支持），所以真实会话里基本都会走到降级分支，
- *     这条路径不能抛错，只能返回 degraded 状态。
+ *   - 克隆候选链（v0.3）：按 tts.clone.chain（缺省 [clone.provider, 'minimax', 'volcengine'] 去重）逐个尝试；
+ *     某 provider 不可用/失败只记一次原因并继续下一个（例如 MiniMax 2061 → 火山声音复刻 v3）；
+ *     全部失败才永久降级 preset，voice 事件 reason 里保留每个 provider 的失败原因。
+ *   - 非主 provider 的克隆客户端按需 lazy import ./tts/index.mjs 并用 config override 创建，
+ *     创建失败（如缺 UUID Key）也只是一个可读的失败原因，不影响主链路。
  *
  * 样本统一重采样到 16kHz 单声道 s16le 后再克隆（ASR 输入本来就是 16k）。
  */
@@ -45,7 +48,14 @@ function snapshotOf(state, { includeReason = true } = {}) {
   return out;
 }
 
-export function createVoiceManager({ config = {}, tts, log = () => {} } = {}) {
+/**
+ * @param {object} opts
+ * @param {object} opts.config
+ * @param {object} opts.tts 主 TTS 实例（pipeline 注入）
+ * @param {Function} [opts.log]
+ * @param {Function} [opts.createTtsImpl] 测试注入钩子：用 fake 克隆 provider 覆盖 lazy import 的 createTts
+ */
+export function createVoiceManager({ config = {}, tts, log = () => {}, createTtsImpl = null } = {}) {
   const ttsCfg = config?.tts ?? {};
   const presetVoices = ttsCfg.presetVoices ?? {};
   const voiceMode = String(ttsCfg.voiceMode ?? 'preset');
@@ -55,6 +65,20 @@ export function createVoiceManager({ config = {}, tts, log = () => {} } = {}) {
   const maxSampleSec = Math.max(minSampleSec, positiveNumber(cloneCfg.maxSampleSec, 45));
   const maxBytes = Math.min(MAX_SAMPLE_BYTES_HARD_CAP, Math.round(maxSampleSec * SAMPLE_RATE * 2));
   const needMs = minSampleSec * 1000;
+
+  // 克隆候选链：tts.clone.chain > [tts.clone.provider, 'minimax', 'volcengine']，去重去空
+  const cloneProviderChain = (() => {
+    const configured = Array.isArray(cloneCfg.chain) && cloneCfg.chain.length > 0 ? cloneCfg.chain : null;
+    const raw = configured ?? [cloneCfg.provider || tts?.name || 'minimax', 'minimax', 'volcengine'];
+    const out = [];
+    for (const item of raw) {
+      const name = typeof item === 'string' ? item : item?.provider;
+      const trimmed = typeof name === 'string' ? name.trim() : '';
+      if (!trimmed || out.includes(trimmed)) continue;
+      out.push(trimmed);
+    }
+    return out;
+  })();
 
   /** 返回 presetVoices 里按 gender 选中的音色 id */
   function pickPreset(gender) {
@@ -103,18 +127,66 @@ export function createVoiceManager({ config = {}, tts, log = () => {} } = {}) {
     bufferedMs = pcmDurationMs(buffer, SAMPLE_RATE);
   }
 
+  const cloneClients = new Map(); // provider -> Promise<tts 实例>
+  let cloneProvider = null; // 克隆成功时实际使用的 provider
+  let cloneFailures = []; // [{provider, code, message}] 每个候选一次
+
+  function createCloneClientFor(providerName) {
+    const factory = createTtsImpl;
+    const overrideConfig = { ...config, tts: { ...ttsCfg, provider: providerName } };
+    if (typeof factory === 'function') return Promise.resolve(factory({ config: overrideConfig, log }));
+    // 生产路径：lazy import（与 registry 用同一套 createTts，含缓存/校验包装）
+    return import('./tts/index.mjs').then((mod) => mod.createTts({ config: overrideConfig, log }));
+  }
+
+  function cloneClientFor(providerName) {
+    // 主 TTS 实例就是该 provider 时直接复用，避免重复创建/重复认证
+    if (tts && tts.name === providerName) {
+      if (typeof tts.cloneVoice === 'function') return Promise.resolve(tts);
+      return Promise.reject(new Error(`${providerName} 不支持音色克隆（cloneVoice 未实现）`));
+    }
+    if (!cloneClients.has(providerName)) {
+      const promise = createCloneClientFor(providerName).then((inst) => {
+        if (!inst || typeof inst.cloneVoice !== 'function') {
+          throw new Error(`${providerName} 不支持音色克隆（cloneVoice 未实现）`);
+        }
+        return inst;
+      });
+      cloneClients.set(providerName, promise);
+    }
+    return cloneClients.get(providerName);
+  }
+
   async function attemptClone() {
     lastSampleMs = Math.round(bufferedMs);
+    const pcm = Buffer.from(buffer);
+    const failures = [];
     try {
-      const cloned = await tts.cloneVoice({ pcm: Buffer.from(buffer), sampleRate: SAMPLE_RATE, name: 'session-speaker' });
-      if (!cloned?.voiceId) throw new Error('cloneVoice 返回缺少 voiceId');
-      state.mode = 'clone';
-      state.voiceId = String(cloned.voiceId);
-      state.reason = null;
-      log(`[voice] 克隆音色就绪：${state.voiceId}（样本 ${(lastSampleMs / 1000).toFixed(1)}s）`);
-    } catch (err) {
-      const code = err?.code != null && !String(err?.message ?? '').includes('base_resp') ? `（code=${err.code}）` : '';
-      degrade(`克隆失败，永久降级预设音色：${err?.message ?? err}${code}`);
+      for (const providerName of cloneProviderChain) {
+        try {
+          const client = await cloneClientFor(providerName);
+          const cloned = await client.cloneVoice({ pcm, sampleRate: SAMPLE_RATE, name: 'session-speaker' });
+          if (!cloned?.voiceId) throw new Error('cloneVoice 返回缺少 voiceId');
+          state.mode = 'clone';
+          state.voiceId = String(cloned.voiceId);
+          state.reason = null;
+          cloneProvider = String(cloned.provider || providerName);
+          cloneFailures = failures;
+          log(
+            `[voice] 克隆音色就绪：${state.voiceId}（provider=${cloneProvider}，样本 ${(lastSampleMs / 1000).toFixed(1)}s）`
+          );
+          return;
+        } catch (err) {
+          failures.push({ provider: providerName, code: err?.code ?? null, message: clampReason(err?.message ?? err) });
+          log(`[voice] ${providerName} 克隆失败，尝试下一个候选：${err?.message ?? err}`);
+        }
+      }
+      cloneProvider = null;
+      cloneFailures = failures;
+      const summary = failures.length
+        ? failures.map((f) => `${f.provider}: ${f.message}${f.code != null ? `（code=${f.code}）` : ''}`).join('；')
+        : '没有可用的克隆 provider';
+      degrade(`克隆失败，永久降级预设音色：${summary}`);
       log(`[voice] ${state.reason}`);
     } finally {
       // 失败后样本已无用，释放内存；成功也不需要再累积。
@@ -139,8 +211,8 @@ export function createVoiceManager({ config = {}, tts, log = () => {} } = {}) {
         return snapshotOf(state);
       }
       if (attempted) return snapshotOf(state); // 失败过 -> 永久 preset，绝不重试
-      if (typeof tts?.cloneVoice !== 'function') {
-        degrade('当前 TTS provider 不支持音色克隆（cloneVoice 未实现）');
+      if (cloneProviderChain.length === 0) {
+        degrade('没有配置任何克隆 provider（tts.clone.chain / tts.clone.provider 为空）');
         return snapshotOf(state);
       }
 
@@ -177,6 +249,9 @@ export function createVoiceManager({ config = {}, tts, log = () => {} } = {}) {
       maxSampleSec,
       cloneAttempts,
       cloneAttempted: attempted,
+      cloneProvider,
+      cloneProviderChain,
+      cloneFailures,
       updates,
       cloneInFlight: Boolean(clonePromise),
     };
