@@ -1,0 +1,10 @@
+node_modules/
+models/*.bin
+models/*.part
+data/*
+!data/.gitkeep
+*.log
+.DS_Store
+demo/tmp/
+demo/*.wav
+demo/*.aiff

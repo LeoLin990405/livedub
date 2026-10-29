@@ -1,0 +1,188 @@
+# livedub 接口契约（v1）—— 所有模块必须遵守
+
+> 这份文档是并行开发的唯一事实来源。**接口不够用/想改协议：先发消息给 Lead，不要自己改其它人的文件。**
+> 代码目录：`livedub/`（工作区根目录下）。ESM、Node 22+、零 npm 依赖。
+
+## 0. 一句话架构
+
+```
+浏览器扩展/工作台 --WS(16k PCM)--> 本地引擎(Session)
+   Session: VAD 切分 -> 本地 whisper-server 流式识别 -> deepseek 增量翻译
+            -> MiniMax 流式 TTS(克隆优先/自动降级) -> 调度&压音 -> 事件回传
+   <--WS(partials / segments / translations / dub audio / metrics)--
+```
+
+真实能力已在 2026-10-29 实测（不要再盲目重测、不要浪费额度）：
+
+- 本地 `whisper-server` + `models/ggml-large-v3-turbo-q5_0.bin` 可用；热推理 RTF≈0.05（29.4s 音频 ≈1.4s）。
+  沙箱内首次启动约 20-25s（Metal shader 缓存被 EPERM，正常机器会快很多）。
+- 翻译：`deepseek-flash` 首字 ≈1.0s（最快）；`minimax/MiniMax-M3` ≈2.4s；`mimo-plan` ≈2.8s；`ark-plan` 24s（不要用）。
+- TTS：MiniMax `speech-2.8-hd` 可用，`false` 非流式 1.1-1.5s；SSE 流式可用（`stream:true`，`data:` 行里 `data.audio` 是 hex）。
+  系统音色如 `male-qn-qingse` 可用。**声音克隆在你当前 Token Plan 不可用**（voice_clone 返回
+  `base_resp.status_code=2061 your current token plan not support model`）——必须优雅降级，不能阻塞主链路。
+- ARK plan Key 没有 openspeech 语音权限（401 / 45000030）：**不要**在实现里依赖 ARK 语音。
+
+## 1. 文件所有权（write scope）
+
+| 角色 | 拥有文件（只改这些） |
+|---|---|
+| Lead | `engine/protocol.mjs` `engine/config.mjs` `engine/audio.mjs` `engine/ws.mjs` `engine/mock.mjs` `engine/metrics.mjs` `engine/pipeline.mjs` `engine/registry.mjs` `scripts/*` `config/*` `docs/*` `README*` `package.json` `tests/core.test.mjs` `tests/pipeline.test.mjs` `tests/ws.test.mjs` |
+| T1 audio-asr | `engine/asr/**` `engine/segmenter.mjs` `tests/asr.test.mjs` |
+| T2 translate | `engine/translate/**` `engine/subtitles.mjs` `tests/translate.test.mjs` |
+| T3 voice-dub | `engine/tts/**` `engine/dub/**` `engine/voice.mjs` `tests/tts.test.mjs` |
+| T4 studio-server | `engine/server.mjs` `studio/**` `tests/studio.test.mjs` |
+| T5 extension | `extension/**` `tests/extension.test.mjs` |
+
+- 只读依赖：`engine/protocol.mjs`、`config.mjs`、`audio.mjs`、`ws.mjs`、`mock.mjs`、`config/livedub.config.json`。
+- 需要新增 shared helper？发 Lead，不要自己加。
+- 所有路径都相对项目根 `livedub/`。不要写 `~/.sayless`、不要写项目外文件（沙箱禁止）。临时文件放 `/tmp`；运行期数据放 `data/`（已 gitignore）。
+- 不要 `npm install`（本项目零依赖）；不要建 `.ts` 文件；不要改 `package.json`；不要 git commit。
+
+## 2. 运行环境 & 安全
+
+- 机器：macOS 14，Node 26（兼容 Node ≥22），ffmpeg/ffprobe 在 PATH，Chrome 在 `/Applications/Google Chrome.app`。
+- 沙箱：只允许写 workspace 内 + `/tmp`；读 `~/.sayless/config.json` 允许（读密钥只能在运行时读，**禁止打印/落盘**）。
+- 网络：可用（DeepSeek/MiniMax 直连正常）。真实 API 调用仅限小样本冒烟：
+  - 单测里默认 mock；真实调用测试必须 `process.env.LIVEDUB_INTEGRATION === '1'` 才跑。
+  - 每个 teammate 手动验证真实 API 总计 ≤ 20 次公开调用、文本 ≤ 2k tokens、TTS ≤ 5 次短句。
+- 端口：引擎 8787，whisper-server 18765（测试请用 18770+ 随机端口，避免互踩）。
+- 不要打印任何 apiKey（日志里脱敏）。不要 `console.log` 到库代码，用传入的 `log(msg)`。
+
+## 3. 线协议（浏览器 <-> 引擎，WebSocket `/ws`）
+
+时间轴：`tMs` = 会话时间轴毫秒（客户端第一段音频为 0）。引擎所有事件的 `t0Ms/t1Ms/startMs` 都在这个轴上。
+音频：统一 **s16le little-endian, mono, 16kHz**。
+
+### 3.1 客户端 -> 引擎
+
+文本帧 JSON：
+
+- `hello`（必须第一条）
+  ```json
+  { "type": "hello", "protocol": 1,
+    "session": { "source": "extension|studio|batch|test", "title": "", "url": "",
+                 "langFrom": "en", "langTo": "zh", "tMsBase": null, "overrides": {} },
+    "glossary": [{"src":"gradient descent","dst":"梯度下降"}] }
+  ```
+- `audio`（JSON 兜底，扩展/工作台正常走二进制帧）
+  `{ "type":"audio", "tMs":1234, "pcm":"<base64 s16le 16k>" }`
+- `control` `{ "type":"control", "action":"pause|resume|stop|seek|flush", "tMs": 1234 }`
+- `config` `{ "type":"config", "patch": { ... } }`（如 `{dub:{enabled:false}}`、`{tts:{voiceMode:"preset"}}`）
+- `glossary` `{ "type":"glossary", "terms":[{"src":"...","dst":"..."}] }`（全量替换）
+- `ping` `{ "type":"ping", "t": 123 }`
+
+二进制帧（音频，推荐）：`[0]=0x01 | [1..8]=float64BE tMs | [9..]=s16le 16k mono`（`protocol.mjs` 的 `encodeAudioFrame`）。
+
+### 3.2 引擎 -> 客户端（全部 JSON）
+
+| 事件 | 字段 | 说明 |
+|---|---|---|
+| `ready` | `sessionId, protocol, providers:{asr,translate,tts}, voice:{mode,voiceId}, limits` | 会话就绪，客户端可以开始送音频 |
+| `status` | `state: idle\|listening\|translating\|speaking\|paused\|error, detail?, tsMs?` | 驱动 UI 状态/压音 |
+| `partial` | `id, t0Ms, t1Ms, text` | ASR 中间结果（覆盖式，同一 id 后到覆盖先到） |
+| `segment` | `id, t0Ms, t1Ms, text, lang` | ASR 最终句 |
+| `translation` | `id, text, final:false` | 该句译文增量（覆盖式） |
+| `translation` | `id, text, final:true` | 该句译文最终 |
+| `dub` | `id, seq, startMs, sampleRate, format:"s16le", pcm:"<base64>", durationMs, voiceId, final:boolean` | 配音音频块；客户端按 startMs 尽量对齐播放，来不及就立即播 |
+| `voice` | `mode:"clone"\|"preset", voiceId, degraded?, reason?` | 音色切换/降级通知 |
+| `metrics` | `id, asrFinalMs, mtFirstMs, mtDoneMs, ttsFirstMs, e2eLagMs, ...` | 每句一条（可开关，默认开） |
+| `error` | `scope:"asr"\|"translate"\|"tts"\|"voice"\|"session"\|"server", message, recoverable, segmentId?, code?` | 可恢复错误不终止会话 |
+| `pong` | `t` | 回 ping |
+| `bye` | `reason` | 引擎关闭会话 |
+
+## 4. Provider 工厂契约（Session 注入 deps，便于 mock 测试）
+
+`engine/pipeline.mjs` 通过 `deps` 注入所有工厂；默认 deps 由 `engine/registry.mjs` 提供。
+每个工厂都是 **async 函数**，返回对象。失败要 `throw` 带可读信息的 Error；长任务接受 `AbortSignal`。
+
+```js
+// ---- ASR ----
+createAsr({ config, log, onEvent }) -> {
+  name: string,
+  push(pcm: Buffer, tMs: number): Promise<void>,   // 引擎收到一段音频就调用（顺序调用，不并发）
+  flush(): Promise<void>,                          // 会话结束/暂停时把剩余语音落成 final
+  close(): Promise<void>,
+}
+// onEvent 事件：
+//   { type:'partial', text, t0Ms, t1Ms }
+//   { type:'final',   text, t0Ms, t1Ms, lang }
+// 约束：final 必须按时间顺序、不重叠；partial 是同一段语音的覆盖式结果。
+
+// ---- 翻译 ----
+createTranslator({ config, log }) -> {
+  name: string,
+  translate({ text, context, glossary, signal, onPartial }) -> Promise<{ text, model?, provider? }>
+}
+// context: [{ src, dst }] 最近若干句；glossary: [{ src, dst }]
+// onPartial(textSoFar) 每收到一段增量就调用；最终返回完整译文。
+// 失败必须 throw；由 Session 决定链式降级。
+
+// ---- TTS ----
+createTts({ config, log, fetchImpl? }) -> {
+  name: string,
+  synthesize({ text, voiceId, speed, signal }) -> Promise<{ pcm: Buffer, sampleRate: number, format:'s16le', durationMs?, voiceId? }>,
+  synthesizeStream?({ text, voiceId, speed, signal }) -> AsyncIterable<{ pcm: Buffer, sampleRate, format:'s16le', durationMs? }>,
+  listVoices() -> Promise<Array<{ id, label, gender?, cloned? }>>,
+  cloneVoice({ pcm, sampleRate, name, signal }) -> Promise<{ voiceId, mode:'clone', provider, name? }>,
+}
+// engine/tts/index.mjs 还必须导出（pipeline 延迟加载）：
+splitForTts(text, { minClauseChars=8, maxChunkChars=80 } = {}) -> string[]
+// 工厂可选 fetchImpl / spawnImpl 等「测试注入钩子」：额外参数只允许出现在测试里，生产调用方不传。
+
+// ---- 音色管理（克隆优先 -> 降级）----
+createVoiceManager({ config, tts, log }) -> {
+  state: { mode:'preset'|'clone', voiceId, reason? },
+  ensureVoice({ pcm?, sampleRate?, gender? }) -> Promise<{ mode, voiceId, degraded?, reason? }>,
+  stats(): object,
+}
+// 语义：mode=clone-first 时累积讲师语音样本，够 minSampleSec 后尝试 cloneVoice；
+// 失败一次后记住 reason 并用 preset 音色，不得每句重试。
+
+// ---- 配音调度 ----
+createScheduler({ config, log }) -> {
+  name: string,
+  plan({ readyAtMs, durationMs, playheadMs?, lagMs? }) -> {
+    action: 'play'|'skip', startMs: number, rate: number, reason?: string
+  },
+  stats(): object,
+}
+// readyAtMs = 会话时间轴上「音频就绪」的时刻；durationMs = 音频时长。
+// 落后 > dub.maxLagMs 可 skip；允许 rate ∈ [1, dub.maxAccelerate] 追赶。
+```
+
+**默认 provider 名称**：`whisper-local` / `mock`（ASR）；`deepseek`、`minimax`、`mimo-plan`（翻译链）；`minimax`、`macos-say`、`mock`（TTS）。
+配置里出现未知名称：抛 `new Error('unknown provider: ...')`，不要静默回退。
+
+## 5. 配置（`config/livedub.config.json`，字段名即契约）
+
+关键字段：`asr.whisper.{bin,models,language,threads,vad.*,partial.*}`、`translate.{provider,chain,contextSegments,maxTokens,timeoutMs,style}`、
+`tts.{provider,model,sampleRate,voiceMode,presetVoices,clone.*,fallbacks,chunk.*}`、`dub.{enabled,duckOriginal,startBufferMs,maxLagMs,maxAccelerate}`、
+`subs.{bilingual,maxCps,maxCharsPerLine}`、`glossary`。provider 凭据从 `~/.sayless/config.json` 的 `providers.<name>` 只读解析（`config.mjs#resolveProvider`）。
+
+## 6. 测试 & 质量
+
+- 测试框架：`node:test` + `node:assert/strict`，文件放 `tests/`（各自命名，勿动别人的）。
+- 单测不联网、不依赖真模型；重资源（whisper-server/TTS）测试必须放在 `if (process.env.LIVEDUB_INTEGRATION === '1')` 里或做超时兜底。
+- 自己的模块必须覆盖：正常路径、边界（空文本/超长/异常音频）、失败降级路径。
+- 运行：`node --test tests/asr.test.mjs`（单文件）或 `node --test tests/`（全量，应 < 90s）。
+- 代码风格：ESM `import`；命名英文、注释中文；错误信息带「下一步怎么办」；日志走 `log()`；不引入 npm 包。
+- `node --check` 必须通过所有新文件；不允许 console 噪音污染测试输出。
+
+## 7. 协作规则
+
+1. 先读本文件 + 自己 scope 的现有 stub（若有）+ `engine/protocol.mjs`，再动手。
+2. 只改自己 scope 的文件；跨文件需求 → `send_message` 给 Lead（lead），不要直接改。
+3. 每完成一块就 `node --check` / 跑自己的测试；完成时给 Lead 一条交付消息，包含：
+   `状态 / 文件清单 / 测试命令与结果 / 真实 API 冒烟结果 / 已知限制与 TODO`。
+4. 任务板上认领自己的 task（team_task_get/update），完成就 complete。
+5. 不要 kill 别人的进程；不要占用 8787/18765 端口做测试。
+
+## 8. 已知坑（别重复踩）
+
+- `~/.sayless/models/` 目录在本机曾消失，`ggml-large-v3-turbo.bin` 已不可用；用项目内 `models/ggml-large-v3-turbo-q5_0.bin`。
+- whisper-server 在沙箱里冷启动 ~20-25s（Metal 缓存 EPERM），测试要预留启动超时；热推理很快。
+- MiniMax 流式 SSE：行格式 `data: {"data":{"audio":"<hex>", ...}}`；hex 不是 base64。非流式是 `data.audio` hex。
+- MiniMax 克隆：当前 plan 返回 2061；实现要捕获并降级，不能抛到会话层。
+- deepseek baseUrl 是 `https://api.deepseek.com`，chat 路径 `/chat/completions`（`resolveProvider` 会给 `chatPath`）。
+- macOS `say` 可用中文音色 `Tingting`（zh_CN）；`say -o out.aiff` 后用 ffmpeg 转 PCM。
+- Chrome 扩展 MV3 的 `tabCapture.getMediaStreamId` 必须在用户手势（action 点击）里调用；offscreen document 里用 `getUserMedia` 消费 streamId。

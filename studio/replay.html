@@ -1,0 +1,156 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>livedub · 离线回放</title>
+  <meta name="description" content="livedub 离线回放：载入会话 JSONL，按时间轴复现双语字幕与配音，用于演示与检查。" />
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%230b0d14'/%3E%3Cg stroke='%235eead4' stroke-width='2.4' stroke-linecap='round'%3E%3Cpath d='M8 13v6M13 9v14M18 12v8M23 15v2'/%3E%3C/g%3E%3C/svg%3E" />
+  <link rel="stylesheet" href="/studio/styles.css" />
+</head>
+<body>
+  <svg class="icon-sprite" aria-hidden="true" focusable="false">
+    <symbol id="i-play" viewBox="0 0 24 24"><path d="M8 5.5v13l10-6.5-10-6.5Z" fill="currentColor" stroke="none"/></symbol>
+    <symbol id="i-pause" viewBox="0 0 24 24"><path d="M8 5h3v14H8zM13 5h3v14h-3z" fill="currentColor" stroke="none"/></symbol>
+    <symbol id="i-download" viewBox="0 0 24 24"><path d="M12 4v11m0 0 4-4m-4 4-4-4"/><path d="M5 19h14"/></symbol>
+    <symbol id="i-refresh" viewBox="0 0 24 24"><path d="M20 11a8 8 0 1 0-.6 4"/><path d="M20 5v6h-6"/></symbol>
+    <symbol id="i-subtitles" viewBox="0 0 24 24"><rect x="3" y="5" width="18" height="14" rx="3"/><path d="M6.5 14h4M13.5 14h4M6.5 10.5h3M12.5 10.5h5"/></symbol>
+    <symbol id="i-film" viewBox="0 0 24 24"><rect x="3.5" y="5" width="17" height="14" rx="2.5"/><path d="M7.5 5v14M16.5 5v14M3.5 9.5h4M3.5 14.5h4M16.5 9.5h4M16.5 14.5h4"/></symbol>
+  </svg>
+
+  <div class="app replay-page">
+    <header class="replay-topbar">
+      <a class="replay-back" href="/studio/">← 工作台</a>
+      <span class="brand-mark" aria-hidden="true">
+        <svg viewBox="0 0 40 40" width="34" height="34"><g stroke="url(#brandGrad2)" stroke-width="3" stroke-linecap="round"><path d="M9 17v6"/><path d="M15 11v18"/><path d="M21 14v12"/><path d="M27 9v22"/><path d="M33 17v6"/></g><defs><linearGradient id="brandGrad2" x1="0" y1="0" x2="40" y2="40"><stop stop-color="#5eead4"/><stop offset="1" stop-color="#818cf8"/></linearGradient></defs></svg>
+      </span>
+      <div class="replay-title">
+        <strong id="sessionTitle">正在加载会话回放…</strong>
+        <span id="sessionSubtitle">离线回放 · 会话 JSONL</span>
+      </div>
+      <span class="spacer"></span>
+      <span class="tag" id="replayModeTag">离线</span>
+      <span class="badge" id="replayBadge" data-tone="ok"><i class="badge-dot"></i><span id="replayBadgeText">回放就绪</span></span>
+      <button id="btnExport" class="btn btn-ghost btn-sm" disabled>
+        <svg class="icon"><use href="#i-download"/></svg><span>导出 SRT</span>
+      </button>
+    </header>
+
+    <main class="workspace replay-workspace">
+      <section class="replay-main">
+        <div class="replay-stage no-video" id="replayStage">
+          <video id="video" class="video" playsinline preload="metadata" muted></video>
+
+          <div class="replay-topline">
+            <span class="media-chip" id="mediaChip"><svg class="icon"><use href="#i-film"/></svg><span id="mediaLabel">未加载视频（纯字幕回放）</span></span>
+            <span class="stage-clock" id="clock">00:00 / 00:00</span>
+          </div>
+
+          <div class="subs" id="subs" hidden>
+            <div class="subs-src" id="subsSrc"></div>
+            <div class="subs-dst" id="subsDst"></div>
+          </div>
+
+          <div class="replay-loading" id="loading">正在加载会话回放…</div>
+          <div class="replay-empty" id="empty" hidden>
+            没有可回放的事件。<br />
+            试试 <a href="/replay/?session=/studio/sample/session.jsonl&t=5200">示例会话</a>。
+          </div>
+        </div>
+
+        <div class="replay-controls">
+          <button id="btnPlay" class="icon-btn icon-btn-lg" title="播放 / 暂停">
+            <svg class="icon"><use href="#i-play"/></svg>
+          </button>
+          <button id="btnRestart" class="icon-btn" title="回到开头">
+            <svg class="icon"><use href="#i-refresh"/></svg>
+          </button>
+          <span class="time" id="timeCurrent">00:00</span>
+          <input id="seek" class="seek" type="range" min="0" max="1000" step="1" value="0" aria-label="回放进度" />
+          <span class="time dim" id="timeDuration">00:00</span>
+          <label class="toggle" title="播放会话里录下的配音音频">
+            <input id="toggleDub" type="checkbox" checked /><span>配音</span>
+          </label>
+          <span class="spacer"></span>
+          <span class="muted" id="eventStat">—</span>
+        </div>
+
+        <div class="card transcript" style="flex-basis: 190px">
+          <div class="card-head">
+            <h2><svg class="icon"><use href="#i-subtitles"/></svg>字幕时间轴</h2>
+            <span class="muted" id="transcriptCount">0 句</span>
+            <span class="spacer"></span>
+            <button id="btnCopySrt" class="link">复制 SRT</button>
+          </div>
+          <div class="transcript-list" id="transcriptList">
+            <div class="list-empty">会话里还没有识别出的字幕句子。</div>
+          </div>
+        </div>
+      </section>
+
+      <aside class="replay-side">
+        <section class="card panel replay-meta">
+          <div class="card-head"><h2>会话信息</h2><span class="tag" id="metaTag">JSONL</span></div>
+          <div class="kv"><span>标题</span><b id="metaTitle">—</b></div>
+          <div class="kv"><span>来源</span><b id="metaSource">—</b></div>
+          <div class="kv"><span>会话 ID</span><b class="mono" id="metaSessionId">—</b></div>
+          <div class="kv"><span>语言</span><b id="metaLangs">英语 → 中文</b></div>
+          <div class="kv"><span>事件数</span><b class="mono" id="metaEvents">0</b></div>
+          <div class="kv"><span>配音块</span><b class="mono" id="metaDubs">0</b></div>
+          <div class="kv"><span>时长</span><b class="mono" id="metaDuration">00:00</b></div>
+        </section>
+
+        <section class="card panel">
+          <div class="card-head"><h2>引擎能力</h2><span class="tag">录制时</span></div>
+          <div class="provider-grid">
+            <div class="provider"><span>ASR</span><b id="pvAsr">—</b></div>
+            <div class="provider"><span>翻译</span><b id="pvMt">—</b></div>
+            <div class="provider"><span>配音</span><b id="pvTts">—</b></div>
+          </div>
+        </section>
+
+        <section class="card panel">
+          <div class="card-head"><h2>延迟 HUD</h2><span class="tag">快照</span></div>
+          <div class="latency-list">
+            <div class="lat"><span>ASR 出字</span><div class="bar"><i id="barAsr"></i></div><b class="mono" id="latAsr">—</b></div>
+            <div class="lat"><span>首字翻译</span><div class="bar"><i id="barMt"></i></div><b class="mono" id="latMt">—</b></div>
+            <div class="lat"><span>首段配音</span><div class="bar"><i id="barTts"></i></div><b class="mono" id="latTts">—</b></div>
+            <div class="lat"><span>端到端</span><div class="bar"><i id="barE2e"></i></div><b class="mono" id="latE2e">—</b></div>
+          </div>
+          <p class="panel-hint">回放不重新跑识别/翻译/配音，指标来自录制时的 metrics 事件。</p>
+        </section>
+
+        <section class="card panel panel-log">
+          <div class="card-head"><h2>事件流</h2><span class="spacer"></span><span class="muted" id="eventCount">0</span></div>
+          <div class="event-log replay-eventlog" id="eventLog">
+            <div class="log-empty">按时间轴记录的事件会显示在这里。</div>
+          </div>
+        </section>
+
+        <section class="card panel">
+          <div class="card-head"><h2>用法</h2></div>
+          <p class="panel-hint" style="margin: 2px 16px 6px">
+            URL 参数：<br />
+            <span class="mono">session</span> 会话 JSONL 地址（必填）<br />
+            <span class="mono">video</span> 视频地址（可选，缺省时纯字幕回放）<br />
+            <span class="mono">t</span> 起始毫秒（用于截图/定位）<br />
+            <span class="mono">autoplay=1</span> 自动播放<br /><br />
+            示例：<span class="mono">/replay/?session=/studio/sample/session.jsonl&amp;t=5200</span>
+          </p>
+        </section>
+      </aside>
+    </main>
+
+    <footer class="statusbar">
+      <span class="status-brand" aria-hidden="true"><i></i> offline replay</span>
+      <span class="status-item">数据来自会话 JSONL</span>
+      <span class="status-item">按 tMs 渲染字幕 · 按 startMs 播放配音</span>
+      <span class="spacer"></span>
+      <span class="status-item privacy">不连接引擎、不发起网络请求（除会话/视频文件）</span>
+    </footer>
+  </div>
+
+  <div class="toasts" id="toasts" aria-live="polite"></div>
+  <script type="module" src="/studio/replay.mjs"></script>
+</body>
+</html>

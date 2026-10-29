@@ -1,0 +1,60 @@
+{
+  "title": "Gradient Descent: The Engine of Deep Learning",
+  "voice": "Samantha",
+  "width": 1280,
+  "height": 720,
+  "durationMs": 52700,
+  "timeline": [
+    {
+      "index": 1,
+      "title": "Gradient Descent",
+      "startMs": 0,
+      "endMs": 7271,
+      "narration": [
+        "Welcome to this short lecture on gradient descent.",
+        "Gradient descent is the workhorse algorithm behind modern deep learning."
+      ]
+    },
+    {
+      "index": 2,
+      "title": "The Core Idea",
+      "startMs": 7271,
+      "endMs": 18838,
+      "narration": [
+        "The idea is simple. We compute the gradient of the loss with respect to the parameters, and then we take a small step in the opposite direction.",
+        "We repeat this process until the loss stops improving."
+      ]
+    },
+    {
+      "index": 3,
+      "title": "The Learning Rate",
+      "startMs": 18838,
+      "endMs": 28524,
+      "narration": [
+        "The learning rate controls how big each step is.",
+        "If the learning rate is too large, training can diverge. If it is too small, training becomes very slow."
+      ]
+    },
+    {
+      "index": 4,
+      "title": "In Practice",
+      "startMs": 28524,
+      "endMs": 41159,
+      "narration": [
+        "In practice we rarely use the exact gradient. Stochastic gradients trade exactness for speed.",
+        "Momentum and adaptive methods smooth the trajectory, and learning rate schedules start large and decay over time."
+      ]
+    },
+    {
+      "index": 5,
+      "title": "Next Steps",
+      "startMs": 41159,
+      "endMs": 52703,
+      "narration": [
+        "In the next lecture, we will derive the gradient for a linear model, and implement the update rule in code.",
+        "We will also visualize the loss surface and the optimization path. Thanks for watching."
+      ]
+    }
+  ],
+  "generatedAt": "2026-10-29T09:49:52.259Z"
+}

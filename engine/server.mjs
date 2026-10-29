@@ -1,0 +1,1383 @@
+#!/usr/bin/env node
+/**
+ * livedub 本地引擎服务：HTTP（静态工作台 + 只读 API）+ WebSocket（/ws 实时同传）。
+ *
+ * 职责边界：
+ * - 传输层：静态托管 studio/（/studio/、/replay/）与 demo/（回放素材）；HTTP API：/health、/api/config、/api/voices；
+ *   WebSocket：hello -> createSession() 建会话，二进制音频帧 / JSON 音频 / control/config/glossary 全部转发给会话，
+ *   会话事件原样下发；连接关闭时调用 session.close('client disconnected')。
+ * - 会话编排在 engine/pipeline.mjs（Lead scope）。本文件只依赖契约，不关心 ASR/翻译/TTS 细节。
+ *   createSession 由 `opts.sessionFactory` 注入（测试用假会话/真 pipeline + mock deps），默认动态 import './pipeline.mjs'；
+ *   pipeline 暂缺时回退内置演示会话（mock ASR/翻译/TTS），保证工作台可先跑通。
+ * - 安全：只监听本机；WS checkOrigin 仅允许 chrome-extension://* 与本机 http(s)；静态服务白名单目录 + 防目录穿越；
+ *   /api/config 走 config.publicConfig + 深删密钥字段；任何日志都不打印 apiKey。
+ *
+ * 用法：
+ *   node engine/server.mjs [--port 8787] [--host 127.0.0.1] [--open] [--demo] [--verbose]
+ */
+import crypto from 'node:crypto';
+import fs from 'node:fs';
+import http from 'node:http';
+import path from 'node:path';
+import { spawn } from 'node:child_process';
+import { pathToFileURL } from 'node:url';
+
+import {
+  AUDIO_FRAME_MS,
+  AUDIO_INPUT_SAMPLE_RATE,
+  MAX_AUDIO_FRAME_BYTES,
+  MSG,
+  PROTOCOL_VERSION,
+  decodeAudioFrame,
+  encodeEvent,
+  errorEvent,
+  normalizeHello,
+  parseClientMessage,
+  sanitizeGlossary,
+  statusEvent,
+} from './protocol.mjs';
+import { base64Pcm, pcmFromBase64 } from './audio.mjs';
+import {
+  PROJECT_ROOT,
+  loadConfig,
+  publicConfig,
+  readJsonIfExists,
+  resolveWhisperModel,
+} from './config.mjs';
+import { attachWebSocketServer } from './ws.mjs';
+import { createMockAsr, createMockTranslator, createMockTts } from './mock.mjs';
+
+// ------------------------------------------------------------------ constants
+
+export const DEFAULT_PORT = 8787;
+export const DEFAULT_HOST = '127.0.0.1';
+/** 会话初始化上限：whisper-server 冷启动 ~20-30s，留余量 */
+export const DEFAULT_READY_TIMEOUT_MS = 35_000;
+/** 建链后必须尽快发 hello，否则关闭空连接 */
+export const DEFAULT_HELLO_TIMEOUT_MS = 30_000;
+/** 音频帧积压上限（每帧 100ms，约 20s），超了丢帧防内存膨胀 */
+const MAX_QUEUED_AUDIO_FRAMES = 200;
+/** 音色列表接口单步超时 */
+const VOICES_TIMEOUT_MS = 5_000;
+
+const MIME_TYPES = Object.freeze({
+  '.html': 'text/html; charset=utf-8',
+  '.css': 'text/css; charset=utf-8',
+  '.js': 'text/javascript; charset=utf-8',
+  '.mjs': 'text/javascript; charset=utf-8',
+  '.json': 'application/json; charset=utf-8',
+  '.jsonl': 'application/x-ndjson; charset=utf-8',
+  '.ndjson': 'application/x-ndjson; charset=utf-8',
+  '.txt': 'text/plain; charset=utf-8',
+  '.srt': 'application/x-subrip; charset=utf-8',
+  '.vtt': 'text/vtt; charset=utf-8',
+  '.mp4': 'video/mp4',
+  '.m4v': 'video/mp4',
+  '.webm': 'video/webm',
+  '.ogv': 'video/ogg',
+  '.mp3': 'audio/mpeg',
+  '.m4a': 'audio/mp4',
+  '.wav': 'audio/wav',
+  '.ogg': 'audio/ogg',
+  '.png': 'image/png',
+  '.jpg': 'image/jpeg',
+  '.jpeg': 'image/jpeg',
+  '.webp': 'image/webp',
+  '.svg': 'image/svg+xml',
+  '.ico': 'image/x-icon',
+  '.woff': 'font/woff',
+  '.woff2': 'font/woff2',
+  '.map': 'application/json; charset=utf-8',
+});
+
+/** 密钥字段名（大小写不敏感）：/api/config 与日志统一过滤 */
+const SECRET_KEY_RE = /^(api_?key|apikey|token|secret|password|authorization|access_?key|refresh_?token)$/i;
+
+// -------------------------------------------------------------------- helpers
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, Math.max(0, ms)));
+}
+
+function makeLog(log) {
+  if (typeof log === 'function') return log;
+  return (msg, ...rest) => {
+    if (process.env.LIVEDUB_DEBUG) console.error(`[livedub] ${msg}`, ...rest);
+  };
+}
+
+let pkgCache = null;
+function packageInfo() {
+  if (pkgCache === null) {
+    pkgCache = readJsonIfExists(path.join(PROJECT_ROOT, 'package.json')) ?? {};
+  }
+  return pkgCache;
+}
+
+function toProjectRelative(file) {
+  if (!file) return null;
+  const abs = path.resolve(file);
+  const root = path.resolve(PROJECT_ROOT);
+  if (abs === root) return '.';
+  if (abs.startsWith(root + path.sep)) return path.relative(root, abs).split(path.sep).join('/');
+  return abs;
+}
+
+function withTimeout(promise, ms, message) {
+  let timer = null;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new Error(message)), Math.max(1, ms));
+    timer.unref?.();
+  });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+}
+
+/** 深拷贝并删除一切密钥字段（/api/config 兜底，publicConfig 之后再过一遍） */
+export function scrubSecrets(value, seen = new WeakSet()) {
+  if (Array.isArray(value)) return value.map((item) => scrubSecrets(item, seen));
+  if (!value || typeof value !== 'object') return value;
+  if (seen.has(value)) return undefined;
+  seen.add(value);
+  const out = {};
+  for (const [key, item] of Object.entries(value)) {
+    if (SECRET_KEY_RE.test(key)) continue;
+    out[key] = scrubSecrets(item, seen);
+  }
+  return out;
+}
+
+function formatHost(host) {
+  const h = String(host ?? DEFAULT_HOST);
+  if (h === '0.0.0.0' || h === '::' || h === '') return '127.0.0.1';
+  if (h.includes(':') && !h.startsWith('[')) return `[${h}]`;
+  return h;
+}
+
+function sendJson(res, status, payload, { head = false } = {}) {
+  if (res.writableEnded) return;
+  const body = Buffer.from(JSON.stringify(payload), 'utf8');
+  res.writeHead(status, {
+    'Content-Type': 'application/json; charset=utf-8',
+    'Content-Length': body.length,
+    'Cache-Control': 'no-store',
+  });
+  res.end(head ? undefined : body);
+}
+
+function sendText(res, status, text, contentType = 'text/plain; charset=utf-8') {
+  if (res.writableEnded) return;
+  const body = Buffer.from(String(text), 'utf8');
+  res.writeHead(status, { 'Content-Type': contentType, 'Content-Length': body.length, 'Cache-Control': 'no-store' });
+  res.end(body);
+}
+
+function redirect(res, location) {
+  if (res.writableEnded) return;
+  res.writeHead(302, { Location: location, 'Content-Length': 0, 'Cache-Control': 'no-store' });
+  res.end();
+}
+
+function notFound(res, detail = 'not found') {
+  sendText(res, 404, `livedub: ${detail}\n`);
+}
+
+/** 静态路径归一化：拒绝 ..、空字节，确保落在白名单根目录内 */
+function resolveStaticFile(root, pathname, prefix) {
+  let decoded;
+  try {
+    decoded = decodeURIComponent(pathname);
+  } catch {
+    return { error: 400, message: '路径编码非法' };
+  }
+  if (decoded.includes('\0')) return { error: 400, message: '路径含空字节' };
+  const segments = decoded.split('/');
+  if (segments.includes('..')) return { error: 403, message: '禁止目录穿越' };
+  const rel = decoded.slice(prefix.length).replace(/^\/+/, '');
+  const resolved = path.resolve(root, rel || 'index.html');
+  const rootAbs = path.resolve(root);
+  if (resolved !== rootAbs && !resolved.startsWith(rootAbs + path.sep)) {
+    return { error: 403, message: '禁止访问白名单之外的路径' };
+  }
+  return { file: resolved };
+}
+
+function parseRangeHeader(header, size) {
+  const match = /^bytes=(\d*)-(\d*)$/.exec(String(header ?? '').trim());
+  if (!match || (match[1] === '' && match[2] === '')) return { invalid: true };
+  let start = match[1] === '' ? null : Number(match[1]);
+  let end = match[2] === '' ? null : Number(match[2]);
+  if (start == null) {
+    const suffix = end ?? 0;
+    start = Math.max(0, size - suffix);
+    end = size - 1;
+  } else if (end == null || end >= size) {
+    end = size - 1;
+  }
+  if (!Number.isFinite(start) || !Number.isFinite(end) || start > end || start >= size) return { invalid: true };
+  return { start, end };
+}
+
+// --------------------------------------------------------------- static serve
+
+function serveStaticFile(req, res, file, log) {
+  let stat;
+  try {
+    stat = fs.statSync(file);
+  } catch {
+    return notFound(res);
+  }
+  if (stat.isDirectory()) {
+    const indexFile = path.join(file, 'index.html');
+    try {
+      stat = fs.statSync(indexFile);
+      file = indexFile;
+    } catch {
+      return notFound(res, '目录不提供列表');
+    }
+  }
+  if (!stat.isFile()) return notFound(res);
+
+  const ext = path.extname(file).toLowerCase();
+  const contentType = MIME_TYPES[ext] ?? 'application/octet-stream';
+  const headers = {
+    'Content-Type': contentType,
+    'X-Content-Type-Options': 'nosniff',
+    'Accept-Ranges': 'bytes',
+    'Cache-Control': 'no-store',
+  };
+
+  const rangeHeader = req.headers.range;
+  if (rangeHeader && stat.size > 0) {
+    const range = parseRangeHeader(rangeHeader, stat.size);
+    if (range.invalid) {
+      res.writeHead(416, { ...headers, 'Content-Range': `bytes */${stat.size}`, 'Content-Length': 0 });
+      return res.end();
+    }
+    headers['Content-Range'] = `bytes ${range.start}-${range.end}/${stat.size}`;
+    headers['Content-Length'] = range.end - range.start + 1;
+    res.writeHead(206, headers);
+    if (req.method === 'HEAD') return res.end();
+    const stream = fs.createReadStream(file, { start: range.start, end: range.end });
+    stream.on('error', (err) => {
+      log(`静态文件读取失败：${err.message}`);
+      res.destroy();
+    });
+    return stream.pipe(res);
+  }
+
+  headers['Content-Length'] = stat.size;
+  res.writeHead(200, headers);
+  if (req.method === 'HEAD' || stat.size === 0) return res.end();
+  const stream = fs.createReadStream(file);
+  stream.on('error', (err) => {
+    log(`静态文件读取失败：${err.message}`);
+    res.destroy();
+  });
+  stream.pipe(res);
+}
+
+// ------------------------------------------------------------- HTTP API data
+
+function buildHealth(state) {
+  const config = state.config;
+  const model = resolveWhisperModel(config);
+  const saylessPath = config?._meta?.saylessConfigPath ?? null;
+  const pkg = packageInfo();
+  return {
+    ok: true,
+    name: 'livedub',
+    version: pkg.version ?? '0.0.0',
+    protocol: PROTOCOL_VERSION,
+    mode: state.mode, // pipeline | demo | injected
+    uptimeMs: Date.now() - state.startedAt,
+    server: { host: state.host, port: state.port, url: state.url },
+    providers: {
+      asr: config?.asr?.provider ?? null,
+      translate: config?.translate?.provider ?? null,
+      translateChain: Array.isArray(config?.translate?.chain) ? config.translate.chain : [],
+      tts: config?.tts?.provider ?? null,
+      ttsModel: config?.tts?.model ?? null,
+      voiceMode: config?.tts?.voiceMode ?? null,
+    },
+    whisper: { found: Boolean(model), model: toProjectRelative(model) },
+    sayless: { configPath: saylessPath, found: Boolean(saylessPath) },
+    sessions: { active: state.sessions.size },
+    limits: {
+      audioFrameMs: AUDIO_FRAME_MS,
+      sampleRate: AUDIO_INPUT_SAMPLE_RATE,
+      maxAudioFrameBytes: MAX_AUDIO_FRAME_BYTES,
+    },
+  };
+}
+
+function buildPublicConfigPayload(state) {
+  const snapshot = publicConfig(state.config);
+  snapshot.server = { ...(snapshot.server ?? {}), host: state.host, port: state.port, url: state.url };
+  snapshot.runtime = {
+    ...(snapshot.runtime ?? {}),
+    host: state.host,
+    port: state.port,
+    mode: state.mode,
+    studioUrl: `${state.url}/studio/`,
+    replayUrl: `${state.url}/replay/`,
+  };
+  return { ok: true, protocol: PROTOCOL_VERSION, config: scrubSecrets(snapshot) };
+}
+
+const PRESET_VOICE_LABELS = Object.freeze({
+  default: '默认音色',
+  male: '男声',
+  female: '女声',
+  narrator: '旁白',
+});
+
+/** 由 config.tts.presetVoices / fallbacks 生成静态音色列表（/api/voices 回退值） */
+export function buildPresetVoices(config) {
+  const out = [];
+  const seen = new Set();
+  const add = (id, label, extra = {}) => {
+    const voiceId = typeof id === 'string' ? id.trim() : '';
+    if (!voiceId || seen.has(voiceId)) return;
+    seen.add(voiceId);
+    out.push({ id: voiceId, label: String(label ?? voiceId), ...extra });
+  };
+  const presets = config?.tts?.presetVoices ?? {};
+  for (const [role, id] of Object.entries(presets)) {
+    add(id, `预设 · ${PRESET_VOICE_LABELS[role] ?? role}`, { role, preset: true });
+  }
+  for (const fallback of config?.tts?.fallbacks ?? []) {
+    if (fallback?.voiceId) {
+      add(fallback.voiceId, `回退 · ${fallback.provider ?? 'tts'}`, {
+        provider: fallback.provider ?? null,
+        fallback: true,
+      });
+    }
+  }
+  return out;
+}
+
+function normalizeVoices(list) {
+  if (!Array.isArray(list)) return [];
+  const out = [];
+  const seen = new Set();
+  for (const item of list) {
+    if (!item || typeof item !== 'object') continue;
+    const id = typeof item.id === 'string' ? item.id.trim() : '';
+    if (!id || seen.has(id)) continue;
+    seen.add(id);
+    const voice = { id, label: String(item.label ?? id).slice(0, 80) };
+    if (item.gender) voice.gender = String(item.gender).slice(0, 20);
+    if (item.cloned != null) voice.cloned = Boolean(item.cloned);
+    if (item.provider) voice.provider = String(item.provider).slice(0, 40);
+    out.push(voice);
+    if (out.length >= 200) break;
+  }
+  return out;
+}
+
+/**
+ * 尽力获取真实音色列表：T3 的 engine/tts/index.mjs#createTts().listVoices()。
+ * 不经过 registry.createDeps（避免连带初始化 ASR/翻译）；失败抛错，由调用方回退预设列表。
+ */
+async function listVoicesBestEffort(state) {
+  const { config, log } = state;
+  if (typeof state.voiceLister === 'function') {
+    const listed = await withTimeout(Promise.resolve().then(() => state.voiceLister({ config, log })), VOICES_TIMEOUT_MS, '音色列表获取超时');
+    return listed;
+  }
+  const mod = await import('./tts/index.mjs');
+  if (typeof mod.createTts !== 'function') throw new Error('engine/tts/index.mjs 未导出 createTts');
+  const tts = await withTimeout(Promise.resolve().then(() => mod.createTts({ config, log })), VOICES_TIMEOUT_MS, 'TTS 初始化超时');
+  try {
+    if (typeof tts?.listVoices !== 'function') throw new Error('当前 TTS 实现不支持 listVoices()');
+    return await withTimeout(Promise.resolve().then(() => tts.listVoices()), VOICES_TIMEOUT_MS, '音色列表获取超时');
+  } finally {
+    try {
+      await tts?.close?.();
+    } catch {
+      /* 尽力而为 */
+    }
+  }
+}
+
+async function sendVoicesPayload(state, req, res, head) {
+  if (state.voicesCache && Date.now() - state.voicesCache.at < 60_000) {
+    return sendJson(res, 200, state.voicesCache.payload, { head });
+  }
+  let payload = null;
+  let lastError = null;
+  try {
+    const listed = await listVoicesBestEffort(state);
+    const voices = normalizeVoices(listed);
+    if (voices.length > 0) payload = { ok: true, source: 'provider', voices, note: null };
+  } catch (err) {
+    lastError = String(err?.message ?? err).slice(0, 300);
+    state.log(`获取实时音色列表失败，回退配置预设：${lastError}`);
+  }
+  if (!payload) {
+    payload = {
+      ok: true,
+      source: 'preset',
+      voices: buildPresetVoices(state.config),
+      note: lastError ? '实时音色列表不可用，已回退到配置里的预设音色' : '当前使用配置里的预设音色',
+    };
+  }
+  state.voicesCache = { at: Date.now(), payload };
+  sendJson(res, 200, payload, { head });
+}
+
+// ------------------------------------------------------------- HTTP dispatch
+
+function createRequestHandler(state) {
+  return async function handleRequest(req, res) {
+    const method = req.method ?? 'GET';
+    let url;
+    try {
+      url = new URL(req.url ?? '/', `http://${req.headers.host ?? '127.0.0.1'}`);
+    } catch {
+      return sendText(res, 400, 'livedub: bad request url\n');
+    }
+    const pathname = url.pathname;
+
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+    res.setHeader('Referrer-Policy', 'no-referrer');
+
+    if (method === 'OPTIONS') {
+      res.setHeader('Access-Control-Allow-Origin', '*');
+      res.setHeader('Access-Control-Allow-Methods', 'GET,HEAD,OPTIONS');
+      res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+      res.writeHead(204, { 'Cache-Control': 'no-store' });
+      return res.end();
+    }
+
+    const isApi = pathname === '/health' || pathname.startsWith('/api/');
+    if (isApi) {
+      res.setHeader('Access-Control-Allow-Origin', '*');
+      res.setHeader('Cache-Control', 'no-store');
+    }
+
+    if (method !== 'GET' && method !== 'HEAD') {
+      if (isApi) return sendJson(res, 405, { ok: false, error: 'method not allowed', allow: 'GET, HEAD' });
+      return sendText(res, 405, 'livedub: method not allowed\n');
+    }
+
+    try {
+      if (pathname === '/health') return sendJson(res, 200, buildHealth(state), { head: method === 'HEAD' });
+
+      if (pathname === '/api/config') {
+        return sendJson(res, 200, buildPublicConfigPayload(state), { head: method === 'HEAD' });
+      }
+
+      if (pathname === '/api/voices') {
+        return await sendVoicesPayload(state, req, res, method === 'HEAD');
+      }
+
+      if (pathname === '/ws') {
+        return sendJson(res, 426, {
+          ok: false,
+          error: '需要 WebSocket 升级',
+          hint: '请用 ws:// 连接 /ws，先发 hello 建立会话（见 docs/CONTRACTS.md §3）',
+        });
+      }
+
+      if (pathname === '/' || pathname === '') return redirect(res, '/studio/');
+      if (pathname === '/studio') return redirect(res, `/studio/${url.search}`);
+      if (pathname === '/replay') return redirect(res, `/replay/${url.search}`);
+
+      if (pathname === '/replay/') {
+        return serveStaticFile(req, res, path.join(state.studioDir, 'replay.html'), state.log);
+      }
+
+      if (pathname === '/favicon.ico') {
+        res.writeHead(204, { 'Cache-Control': 'no-store' });
+        return res.end();
+      }
+
+      if (pathname.startsWith('/studio/')) {
+        const requestPath = pathname.slice('/studio'.length);
+        const target = resolveStaticFile(state.studioDir, requestPath, '');
+        if (target.error) return sendText(res, target.error, `livedub: ${target.message}\n`);
+        return serveStaticFile(req, res, target.file, state.log);
+      }
+
+      // demo/ 只读托管：回放会话 JSONL 与演示视频（由 scripts/make-demo.mjs 生成）
+      if (pathname.startsWith('/demo/')) {
+        const resolved = resolveStaticFile(state.demoDir, pathname, '/demo');
+        if (resolved.error) return sendText(res, resolved.error, `livedub: ${resolved.message}\n`);
+        return serveStaticFile(req, res, resolved.file, state.log);
+      }
+
+      return notFound(res, `没有这个路由：${pathname}`);
+    } catch (err) {
+      state.log(`HTTP 处理失败 ${method} ${pathname}：${err?.message ?? err}`);
+      if (!res.headersSent) return sendJson(res, 500, { ok: false, error: 'internal error' });
+      try {
+        res.destroy();
+      } catch {
+        /* ignore */
+      }
+    }
+  };
+}
+
+// --------------------------------------------------------------- WS transport
+
+/**
+ * WS Origin 白名单：chrome-extension://*、http(s)://127.0.0.1*、http(s)://localhost*。
+ * 没有 Origin 的客户端（Node 测试、curl）放行；其它 Origin 一律 403。
+ */
+export function isAllowedOrigin(origin) {
+  if (origin == null || origin === '') return true;
+  const value = String(origin);
+  if (/^chrome-extension:\/\/[a-z0-9]{8,}$/i.test(value)) return true;
+  try {
+    const url = new URL(value);
+    if (url.protocol !== 'http:' && url.protocol !== 'https:') return false;
+    return url.hostname === '127.0.0.1' || url.hostname === 'localhost' || url.hostname === '[::1]';
+  } catch {
+    return false;
+  }
+}
+
+/** 处理一条 WebSocket 连接（hello -> 会话，之后纯转发） */
+function handleWebSocketConnection(ws, req, state) {
+  const { config, log } = state;
+  const conn = {
+    ws,
+    req,
+    session: null,
+    sessionId: null,
+    phase: 'awaiting-hello', // awaiting-hello | initializing | ready | closed
+    readyAt: null,
+    closed: false,
+    audioFrames: 0,
+    badFrames: 0,
+    queuedAudio: 0,
+    audioChain: Promise.resolve(),
+    dropWarned: false,
+    helloWarned: false,
+    initTimer: null,
+    helloTimer: null,
+  };
+  state.sessions.add(conn);
+
+  const send = (event) => {
+    if (conn.closed || ws.closed) return false;
+    if (!event || typeof event !== 'object') return false;
+    try {
+      return ws.sendText(encodeEvent(event));
+    } catch (err) {
+      log(`WS 下发事件失败：${err?.message ?? err}`);
+      return false;
+    }
+  };
+  const sendError = (scope, message, extra = {}) => send(errorEvent(scope, message, extra));
+
+  /** 会话事件出口：拦截 ready/bye 做连接状态管理，其余原样下发 */
+  const emitToClient = (event) => {
+    if (!event || typeof event !== 'object') return;
+    if (event.type === MSG.READY) {
+      conn.readyAt = Date.now();
+      conn.phase = 'ready';
+      clearTimeout(conn.initTimer);
+      conn.initTimer = null;
+    }
+    if (event.type === MSG.BYE) {
+      send(event);
+      setTimeout(() => {
+        if (conn.closed) return;
+        try {
+          ws.close(1000, 'session bye');
+        } catch {
+          /* ignore */
+        }
+      }, 80).unref?.();
+      return;
+    }
+    send(event);
+  };
+
+  const handleAudio = (pcm, tMs) => {
+    if (conn.closed) return;
+    if (!conn.session) {
+      // hello 前送音频属于误用；初始化阶段（whisper 冷启动）按 Lead 约定直接丢弃
+      if (conn.phase === 'awaiting-hello' && !conn.helloWarned) {
+        conn.helloWarned = true;
+        sendError('server', '收到音频但还没有 hello：请先发送 hello 建立会话');
+      }
+      return;
+    }
+    if (!Number.isFinite(tMs) || tMs < 0) {
+      sendError('server', `音频时间戳非法：${tMs}（需要非负毫秒数）`, { recoverable: true });
+      return;
+    }
+    if (pcm.length > MAX_AUDIO_FRAME_BYTES) {
+      sendError('server', '音频帧过大（上限 256KB）', { recoverable: true });
+      return;
+    }
+    const copy = Buffer.from(pcm); // 复制：避免持有 ws 大 buffer
+    if (conn.queuedAudio >= MAX_QUEUED_AUDIO_FRAMES && !conn.dropWarned) {
+      conn.dropWarned = true;
+      sendError('session', '音频处理积压，正在丢弃部分帧。请降低帧率或检查 ASR 性能。', { recoverable: true });
+    }
+    if (conn.queuedAudio >= MAX_QUEUED_AUDIO_FRAMES) return;
+    conn.audioFrames += 1;
+    conn.queuedAudio += 1;
+    conn.audioChain = conn.audioChain
+      .then(() => {
+        const session = conn.session;
+        if (!session || typeof session.onAudio !== 'function') return undefined;
+        return session.onAudio(copy, tMs);
+      })
+      .catch((err) => {
+        sendError('session', `处理音频失败：${err?.message ?? err}`, { recoverable: true });
+      })
+      .finally(() => {
+        conn.queuedAudio = Math.max(0, conn.queuedAudio - 1);
+      });
+  };
+
+  const handleBinary = (data) => {
+    let frame;
+    try {
+      frame = decodeAudioFrame(Buffer.isBuffer(data) ? data : Buffer.from(data));
+    } catch (err) {
+      frame = { ok: false, error: err?.message ?? 'decode failed' };
+    }
+    if (!frame.ok) {
+      conn.badFrames += 1;
+      if (conn.badFrames <= 3) {
+        sendError('server', `音频帧格式错误：${frame.error}（期望 [0]=0x01 + float64BE tMs + s16le PCM）`, { recoverable: true });
+      }
+      if (conn.badFrames > 50) {
+        try {
+          ws.close(1008, 'too many bad frames');
+        } catch {
+          /* ignore */
+        }
+      }
+      return;
+    }
+    handleAudio(frame.pcm, frame.tMs);
+  };
+
+  const forwardJson = (msg) => {
+    const session = conn.session;
+    if (!session || typeof session.onJson !== 'function') {
+      sendError('server', `会话尚未就绪，忽略 ${msg.type} 消息`, { recoverable: true });
+      return;
+    }
+    try {
+      const maybe = session.onJson(msg);
+      if (maybe && typeof maybe.then === 'function') {
+        maybe.catch((err) => sendError('session', `处理 ${msg.type} 失败：${err?.message ?? err}`, { recoverable: true }));
+      }
+    } catch (err) {
+      sendError('session', `处理 ${msg.type} 失败：${err?.message ?? err}`, { recoverable: true });
+    }
+  };
+
+  const handleJsonAudio = (msg) => {
+    const pcm = pcmFromBase64(msg.pcm);
+    if (!pcm || pcm.length < 2 || pcm.length % 2 !== 0) {
+      sendError('server', 'audio.pcm 不是合法的 base64 s16le 数据', { recoverable: true });
+      return;
+    }
+    const tMs = Number(msg.tMs);
+    handleAudio(pcm, Number.isFinite(tMs) ? tMs : -1);
+  };
+
+  const handleHello = (msg) => {
+    if (conn.closed) return;
+    clearTimeout(conn.helloTimer);
+    conn.helloTimer = null;
+    if (conn.phase !== 'awaiting-hello') {
+      sendError('session', '本连接已有会话，重复 hello 已忽略；如需新会话请重连', { recoverable: true });
+      return;
+    }
+    const normalized = normalizeHello(msg);
+    if (!normalized.ok) {
+      sendError('server', `hello 无效：${normalized.error}。请按 docs/CONTRACTS.md §3.1 发送 protocol:1 的 hello。`, {
+        recoverable: false,
+      });
+      try {
+        ws.close(1002, 'bad hello');
+      } catch {
+        /* ignore */
+      }
+      return;
+    }
+
+    conn.phase = 'initializing';
+    conn.sessionId = `s_${crypto.randomUUID()}`;
+    state.totalSessions += 1;
+    log(`新会话 ${conn.sessionId}（source=${normalized.options.source}）开始初始化`);
+
+    const options = normalized.options;
+    const factoryPromise = Promise.resolve().then(() =>
+      state.sessionFactory({ id: conn.sessionId, options, emit: emitToClient, log, config }),
+    );
+
+    const timeoutMs = state.readyTimeoutMs;
+    let timer = null;
+    const timeoutPromise = new Promise((_, reject) => {
+      timer = setTimeout(() => {
+        const err = new Error(
+          `会话初始化超时（${Math.round(timeoutMs / 1000)} 秒）：whisper-server 冷启动或网络较慢。请稍候重连，或运行 npm run doctor 检查环境。`,
+        );
+        err.code = 'INIT_TIMEOUT';
+        reject(err);
+      }, timeoutMs);
+      timer.unref?.();
+      conn.initTimer = timer;
+    });
+
+    (async () => {
+      try {
+        const session = await Promise.race([factoryPromise, timeoutPromise]);
+        clearTimeout(timer);
+        conn.initTimer = null;
+        if (conn.closed) {
+          try {
+            await session?.close?.('client disconnected');
+          } catch {
+            /* ignore */
+          }
+          return;
+        }
+        conn.session = session;
+        conn.phase = 'ready';
+        log(`会话 ${conn.sessionId} 就绪（pipeline 事件已开始下发）`);
+      } catch (err) {
+        clearTimeout(timer);
+        conn.initTimer = null;
+        if (conn.closed) return;
+        const message =
+          err?.code === 'INIT_TIMEOUT'
+            ? err.message
+            : `会话初始化失败：${err?.message ?? err}。请检查 provider 配置/密钥与 whisper 模型后重连。`;
+        log(`会话 ${conn.sessionId} 初始化失败：${err?.message ?? err}`);
+        sendError('session', message, { recoverable: false });
+        send(statusEvent('error', message, 0));
+        try {
+          ws.close(1011, 'session init failed');
+        } catch {
+          /* ignore */
+        }
+        factoryPromise.then((late) => late?.close?.('init failed')).catch(() => {});
+      }
+    })();
+  };
+
+  const handleJson = (text) => {
+    const parsed = parseClientMessage(text);
+    if (!parsed.ok) {
+      sendError('server', `无法解析文本消息：${parsed.error}（需要 JSON 文本帧，见 docs/CONTRACTS.md §3）`);
+      return;
+    }
+    const msg = parsed.msg;
+    if (msg.type === MSG.HELLO) return handleHello(msg);
+    if (msg.type === MSG.PING) {
+      if (conn.session && typeof conn.session.onJson === 'function') return forwardJson(msg);
+      return send({ type: MSG.PONG, t: msg.t ?? null });
+    }
+    if (msg.type === MSG.BYE) {
+      try {
+        ws.close(1000, 'client bye');
+      } catch {
+        /* ignore */
+      }
+      return;
+    }
+    if (msg.type === MSG.AUDIO) return handleJsonAudio(msg);
+    if (!conn.session) {
+      if (conn.phase === 'awaiting-hello') sendError('server', '第一条消息必须是 hello：先建立会话再发送音频/控制消息');
+      else if (conn.phase === 'initializing') sendError('server', '会话正在初始化（whisper 冷启动约 20-30 秒），消息暂被忽略', { recoverable: true });
+      return;
+    }
+    forwardJson(msg);
+  };
+
+  ws.on('message', (data, isBinary) => {
+    if (conn.closed) return;
+    try {
+      if (isBinary) handleBinary(data);
+      else handleJson(typeof data === 'string' ? data : Buffer.from(data).toString('utf8'));
+    } catch (err) {
+      log(`处理 WS 消息异常：${err?.message ?? err}`);
+      sendError('server', '处理消息时发生内部错误', { recoverable: true });
+    }
+  });
+  ws.on('error', (err) => log(`WS 错误（${req?.socket?.remoteAddress ?? '?'}）：${err?.message ?? err}`));
+  ws.on('close', () => {
+    conn.closed = true;
+    conn.phase = 'closed';
+    clearTimeout(conn.helloTimer);
+    clearTimeout(conn.initTimer);
+    conn.helloTimer = null;
+    conn.initTimer = null;
+    state.sessions.delete(conn);
+    const session = conn.session;
+    conn.session = null;
+    if (session && typeof session.close === 'function') {
+      Promise.resolve()
+        .then(() => session.close('client disconnected'))
+        .catch((err) => log(`关闭会话失败：${err?.message ?? err}`));
+    }
+  });
+
+  conn.helloTimer = setTimeout(() => {
+    if (conn.closed || conn.phase !== 'awaiting-hello') return;
+    sendError('server', '建立连接后 30 秒内没有收到 hello，连接将关闭', { recoverable: false });
+    try {
+      ws.close(1008, 'hello timeout');
+    } catch {
+      /* ignore */
+    }
+  }, state.helloTimeoutMs);
+  conn.helloTimer.unref?.();
+}
+
+// ---------------------------------------------------------------- demo session
+
+/**
+ * 内置演示会话：pipeline.mjs 尚不可用时的兜底（mock ASR -> mock 翻译 -> mock TTS）。
+ * 与 pipeline.createSession 的对外行为一致：工厂内部完成初始化并 emit ready；
+ * 返回 { start(), onAudio(), onJson(), close(), stats() }。
+ */
+export async function createDemoSession({ id, options = {}, emit = () => {}, log = () => {}, config = {} } = {}) {
+  const sessionId = id ?? `demo_${crypto.randomUUID().slice(0, 8)}`;
+  const demoConfig = { ...config, mock: { ...(config?.mock ?? {}), translateDelayMs: 30 } };
+  const sampleRate = Number(config?.tts?.sampleRate) || 24000;
+  const voiceId = config?.tts?.presetVoices?.default ?? 'demo-voice';
+  let closed = false;
+  let segmentCounter = 0;
+  let partialId = null;
+  let dubSeq = 0;
+  let lastDubEndMs = 0;
+  let glossary = sanitizeGlossary(options.glossary ?? config?.glossary ?? []);
+  let workChain = Promise.resolve();
+  const speakingTimers = new Set();
+
+  const send = (event) => {
+    if (closed) return;
+    try {
+      emit(event);
+    } catch (err) {
+      log(`演示会话 emit 失败：${err?.message ?? err}`);
+    }
+  };
+
+  const asr = createMockAsr({ config: demoConfig, log, onEvent: onAsrEvent });
+  const translator = createMockTranslator({ config: demoConfig, log });
+  const tts = createMockTts({ config: demoConfig, log });
+
+  function onAsrEvent(ev) {
+    if (closed || !ev) return;
+    if (ev.type === 'partial') {
+      partialId = partialId ?? `p_${segmentCounter + 1}`;
+      send({
+        type: MSG.PARTIAL,
+        id: partialId,
+        t0Ms: Math.round(ev.t0Ms ?? 0),
+        t1Ms: Math.round(ev.t1Ms ?? 0),
+        text: String(ev.text ?? ''),
+      });
+      return;
+    }
+    if (ev.type === 'final') {
+      partialId = null;
+      const segId = `seg_${++segmentCounter}`;
+      send({
+        type: MSG.SEGMENT,
+        id: segId,
+        t0Ms: Math.round(ev.t0Ms ?? 0),
+        t1Ms: Math.round(ev.t1Ms ?? 0),
+        text: String(ev.text ?? ''),
+        lang: ev.lang ?? 'en',
+      });
+      send(statusEvent('translating', '', Math.round(ev.t1Ms ?? 0)));
+      workChain = workChain
+        .then(() => processSegment(segId, ev))
+        .catch((err) => {
+          log(`演示会话处理句子失败：${err?.message ?? err}`);
+          send(errorEvent('session', `演示会话处理失败：${err?.message ?? err}`, { recoverable: true }));
+        });
+    }
+  }
+
+  async function processSegment(segId, ev) {
+    if (closed) return;
+    const t1Ms = Math.round(ev.t1Ms ?? 0);
+    const translateStart = Date.now();
+    const result = await translator.translate({
+      text: ev.text,
+      context: [],
+      glossary,
+      onPartial: (partial) => send({ type: MSG.TRANSLATION, id: segId, text: String(partial ?? ''), final: false }),
+    });
+    const mtFirstMs = Math.max(1, Date.now() - translateStart);
+    const mtDoneMs = Math.max(mtFirstMs, Date.now() - translateStart);
+    send({ type: MSG.TRANSLATION, id: segId, text: String(result?.text ?? ''), final: true });
+
+    const ttsStart = Date.now();
+    const audio = await tts.synthesize({ text: result?.text ?? ev.text, voiceId, speed: 1 });
+    const ttsFirstMs = Math.max(1, Date.now() - ttsStart);
+    const durationMs = audio?.durationMs ?? 1000;
+    const startMs = Math.max(t1Ms, lastDubEndMs + 60);
+    lastDubEndMs = startMs + durationMs;
+    send({
+      type: MSG.DUB,
+      id: segId,
+      seq: ++dubSeq,
+      startMs,
+      sampleRate: audio?.sampleRate ?? sampleRate,
+      format: 's16le',
+      pcm: base64Pcm(audio?.pcm ?? Buffer.alloc(0)),
+      durationMs,
+      voiceId: audio?.voiceId ?? voiceId,
+      final: true,
+    });
+    send({
+      type: MSG.METRICS,
+      id: segId,
+      t0Ms: Math.round(ev.t0Ms ?? 0),
+      t1Ms,
+      asrFinalMs: Math.round(900 + String(ev.text ?? '').length * 12),
+      mtFirstMs,
+      mtDoneMs,
+      ttsFirstMs,
+      e2eLagMs: Math.round(1400 + String(ev.text ?? '').length * 15),
+      voiceMode: 'preset',
+    });
+    send(statusEvent('speaking', '', t1Ms));
+    const timer = setTimeout(() => {
+      speakingTimers.delete(timer);
+      if (!closed) send(statusEvent('listening', '', lastDubEndMs));
+    }, Math.min(Math.max(300, durationMs), 4000));
+    timer.unref?.();
+    speakingTimers.add(timer);
+  }
+
+  const session = {
+    id: sessionId,
+    async start() {
+      return session;
+    },
+    async onAudio(pcm, tMs) {
+      if (closed) return;
+      if (!Buffer.isBuffer(pcm) || pcm.length < 2 || pcm.length % 2 !== 0) return;
+      try {
+        await asr.push(pcm, tMs);
+      } catch (err) {
+        send(errorEvent('asr', `演示 ASR 处理失败：${err?.message ?? err}`, { recoverable: true }));
+      }
+    },
+    async onJson(msg) {
+      if (closed || !msg || typeof msg !== 'object') return;
+      switch (msg.type) {
+        case MSG.CONTROL:
+          if (msg.action === 'pause') send(statusEvent('paused', '', 0));
+          else if (msg.action === 'resume') send(statusEvent('listening', '', 0));
+          else if (msg.action === 'flush') await asr.flush();
+          else if (msg.action === 'stop') await session.close('client stop');
+          return;
+        case MSG.CONFIG:
+          if (msg.patch?.tts?.voiceMode === 'clone-first') {
+            send({ type: MSG.VOICE, mode: 'preset', voiceId, degraded: true, reason: '演示会话不支持声音克隆，已使用预设音色' });
+          }
+          return;
+        case MSG.GLOSSARY:
+          glossary = sanitizeGlossary(msg.terms ?? []);
+          send(statusEvent('listening', `术语表已更新（${glossary.length} 条）`, 0));
+          return;
+        case MSG.PING:
+          send({ type: MSG.PONG, t: msg.t ?? null });
+          return;
+        default:
+          return;
+      }
+    },
+    async close(reason = 'closed') {
+      if (closed) return;
+      closed = true;
+      for (const timer of speakingTimers) clearTimeout(timer);
+      speakingTimers.clear();
+      try {
+        await asr.close?.();
+      } catch {
+        /* ignore */
+      }
+      try {
+        emit({ type: MSG.BYE, reason: String(reason) });
+      } catch {
+        /* ignore */
+      }
+      log(`演示会话 ${sessionId} 已关闭：${reason}`);
+    },
+    stats() {
+      return { id: sessionId, demo: true, segments: segmentCounter, voiceId, glossary: glossary.length };
+    },
+  };
+
+  // 与 pipeline 一致：工厂返回前完成初始化并下发 ready / voice / status
+  send({
+    type: MSG.READY,
+    sessionId,
+    protocol: PROTOCOL_VERSION,
+    providers: {
+      asr: 'mock',
+      translate: { provider: 'mock', chain: ['mock'] },
+      tts: { provider: 'mock', model: 'mock', voiceMode: 'preset' },
+      sampleRate: AUDIO_INPUT_SAMPLE_RATE,
+    },
+    voice: { mode: 'preset', voiceId },
+    limits: {
+      audioFrameMs: AUDIO_FRAME_MS,
+      sampleRate: AUDIO_INPUT_SAMPLE_RATE,
+      langFrom: config?.session?.langFrom ?? 'en',
+      langTo: config?.session?.langTo ?? 'zh',
+      demo: true,
+    },
+  });
+  send({ type: MSG.VOICE, mode: 'preset', voiceId });
+  send(statusEvent('listening', '演示会话已就绪（engine/pipeline.mjs 尚未接入）', 0));
+  log(`演示会话 ${sessionId} 已就绪（pipeline.mjs 缺失时的兜底）`);
+  return session;
+}
+
+// ------------------------------------------------------------- session factory
+
+/** 默认会话工厂：优先 engine/pipeline.mjs；缺失则回退内置演示会话 */
+async function loadDefaultSessionFactory({ log, forceDemo = false }) {
+  if (forceDemo) {
+    log('已通过 --demo 强制使用内置演示会话（mock ASR/翻译/TTS）');
+    return { factory: createDemoSession, mode: 'demo' };
+  }
+  try {
+    const mod = await import('./pipeline.mjs');
+    if (typeof mod.createSession === 'function') {
+      log('会话层：engine/pipeline.mjs');
+      return { factory: mod.createSession, mode: 'pipeline' };
+    }
+    log('engine/pipeline.mjs 未导出 createSession，回退内置演示会话');
+  } catch (err) {
+    if (err?.code === 'ERR_MODULE_NOT_FOUND') {
+      log('engine/pipeline.mjs 尚未就绪，使用内置演示会话（mock ASR/翻译/TTS）');
+    } else {
+      log(`加载 engine/pipeline.mjs 失败：${err?.message ?? err}；回退内置演示会话`);
+    }
+  }
+  return { factory: createDemoSession, mode: 'demo' };
+}
+
+// ---------------------------------------------------------------- server start
+
+/**
+ * 启动本地引擎服务。
+ * @param {object} [options]
+ * @param {number} [options.port] 0 = 随机端口（测试用）
+ * @param {string} [options.host]
+ * @param {object} [options.config] 直接注入完整配置（测试用）
+ * @param {object} [options.configOverrides] loadConfig 的 overrides（测试用 mock provider）
+ * @param {Function} [options.sessionFactory] 注入会话工厂（{id, options, emit, log, config} -> session）
+ * @param {Function} [options.voiceLister] 注入音色列表实现（测试用；默认读 T3 tts/index.mjs）
+ * @param {Function} [options.log]
+ * @param {boolean} [options.demo] 强制内置演示会话
+ * @param {number} [options.readyTimeoutMs]
+ * @param {string} [options.studioDir]
+ * @param {string} [options.demoDir]
+ */
+export async function startServer(options = {}) {
+  const env = options.env ?? process.env;
+  const log = makeLog(options.log);
+  const config = options.config ?? loadConfig({ env, overrides: options.configOverrides ?? {} });
+  const studioDir = path.resolve(options.studioDir ?? path.join(PROJECT_ROOT, 'studio'));
+  const demoDir = path.resolve(options.demoDir ?? path.join(PROJECT_ROOT, 'demo'));
+
+  let sessionFactory = options.sessionFactory;
+  let mode;
+  if (typeof sessionFactory === 'function') {
+    mode = options.sessionMode ?? 'injected';
+    log('会话层：外部注入 sessionFactory（测试/集成模式）');
+  } else {
+    const loaded = await loadDefaultSessionFactory({ log, forceDemo: options.demo === true });
+    sessionFactory = loaded.factory;
+    mode = loaded.mode;
+  }
+
+  const state = {
+    config,
+    log,
+    studioDir,
+    demoDir,
+    sessionFactory,
+    mode,
+    sessions: new Set(),
+    totalSessions: 0,
+    startedAt: Date.now(),
+    host: options.host ?? config?.server?.host ?? DEFAULT_HOST,
+    port: 0,
+    url: '',
+    pkg: packageInfo(),
+    readyTimeoutMs:
+      Number.isFinite(options.readyTimeoutMs) && options.readyTimeoutMs >= 0 ? options.readyTimeoutMs : DEFAULT_READY_TIMEOUT_MS,
+    helloTimeoutMs:
+      Number.isFinite(options.helloTimeoutMs) && options.helloTimeoutMs >= 0 ? options.helloTimeoutMs : DEFAULT_HELLO_TIMEOUT_MS,
+    voiceLister: typeof options.voiceLister === 'function' ? options.voiceLister : null,
+    voicesCache: null,
+    env,
+  };
+
+  const server = http.createServer(createRequestHandler(state));
+  server.on('clientError', (err, socket) => {
+    if (!socket.writable) return;
+    socket.end('HTTP/1.1 400 Bad Request\r\nConnection: close\r\nContent-Length: 0\r\n\r\n');
+  });
+
+  const wsAttachment = attachWebSocketServer(server, {
+    path: '/ws',
+    maxPayload: MAX_AUDIO_FRAME_BYTES + 64,
+    checkOrigin: (req) => isAllowedOrigin(req.headers.origin),
+    log,
+    onConnection: (ws, req) => {
+      try {
+        handleWebSocketConnection(ws, req, state);
+      } catch (err) {
+        log(`WS 连接处理失败：${err?.message ?? err}`);
+        try {
+          ws.close(1011, 'internal error');
+        } catch {
+          /* ignore */
+        }
+      }
+    },
+  });
+
+  const desiredPort = options.port ?? config?.server?.port ?? DEFAULT_PORT;
+  try {
+    await new Promise((resolve, reject) => {
+      const onError = (err) => {
+        server.off('listening', onListening);
+        reject(err);
+      };
+      const onListening = () => {
+        server.off('error', onError);
+        resolve();
+      };
+      server.once('error', onError);
+      server.once('listening', onListening);
+      server.listen(desiredPort, state.host);
+    });
+  } catch (err) {
+    wsAttachment.close();
+    throw err;
+  }
+
+  const address = server.address();
+  if (address && typeof address === 'object') {
+    state.port = address.port;
+    state.host = address.address && address.address !== '::' ? address.address : state.host;
+  }
+  state.url = `http://${formatHost(state.host)}:${state.port}`;
+  state.studioUrl = `${state.url}/studio/`;
+  log(`livedub 引擎已监听 ${state.url}（mode=${mode}）`);
+
+  let closing = false;
+  async function close() {
+    if (closing) return;
+    closing = true;
+    const connections = [...state.sessions];
+    for (const conn of connections) {
+      try {
+        conn.ws.sendText(encodeEvent({ type: MSG.BYE, reason: 'server shutdown' }));
+      } catch {
+        /* ignore */
+      }
+      try {
+        conn.ws.close(1001, 'server shutdown');
+      } catch {
+        /* ignore */
+      }
+    }
+    await sleep(80);
+    for (const conn of connections) {
+      try {
+        if (!conn.ws.closed) conn.ws.terminate();
+      } catch {
+        /* ignore */
+      }
+    }
+    state.sessions.clear();
+    wsAttachment.close();
+    await new Promise((resolve) => {
+      const done = () => resolve();
+      try {
+        server.close(done);
+      } catch {
+        done();
+      }
+      server.closeAllConnections?.();
+      setTimeout(done, 1000).unref?.();
+    });
+    log('livedub 引擎已关闭');
+  }
+
+  return {
+    server,
+    state,
+    config,
+    mode,
+    host: state.host,
+    port: state.port,
+    url: state.url,
+    studioUrl: state.studioUrl,
+    sessions: state.sessions,
+    close,
+  };
+}
+
+// ----------------------------------------------------------------------- CLI
+
+export function parseCliArgs(argv = []) {
+  const args = { port: undefined, host: undefined, open: false, demo: false, help: false, verbose: false };
+  for (let i = 0; i < argv.length; i += 1) {
+    const item = String(argv[i]);
+    if (item === '--open' || item === '-o') args.open = true;
+    else if (item === '--demo') args.demo = true;
+    else if (item === '--verbose' || item === '-v') args.verbose = true;
+    else if (item === '--help' || item === '-h') args.help = true;
+    else if (item === '--port' || item === '-p') {
+      args.port = Number(argv[++i]);
+    } else if (item.startsWith('--port=')) args.port = Number(item.slice('--port='.length));
+    else if (item === '--host') args.host = argv[++i];
+    else if (item.startsWith('--host=')) args.host = item.slice('--host='.length);
+    else throw new Error(`未知参数：${item}（支持 --port/--host/--open/--demo/--verbose/--help）`);
+  }
+  if (args.port !== undefined) {
+    if (!Number.isInteger(args.port) || args.port < 0 || args.port > 65535) {
+      throw new Error('--port 必须是 0-65535 的整数');
+    }
+  }
+  return args;
+}
+
+function formatMode(mode) {
+  if (mode === 'pipeline') return 'engine/pipeline.mjs（真实会话）';
+  if (mode === 'demo') return '内置演示会话（mock ASR/翻译/TTS）';
+  return '外部注入 sessionFactory';
+}
+
+function openInBrowser(url, log) {
+  if (process.platform !== 'darwin') {
+    log(`请手动在浏览器打开：${url}`);
+    return;
+  }
+  try {
+    const child = spawn('open', [url], { stdio: 'ignore', detached: true });
+    child.on('error', (err) => log(`无法自动打开浏览器：${err.message}；请手动打开 ${url}`));
+    child.unref();
+    log(`已在默认浏览器打开 ${url}`);
+  } catch (err) {
+    log(`无法自动打开浏览器：${err.message}；请手动打开 ${url}`);
+  }
+}
+
+function printHelp() {
+  console.log(`livedub 本地引擎 + 工作台
+
+用法：
+  node engine/server.mjs [选项]
+
+选项：
+  -p, --port <端口>   监听端口（默认取 config/livedub.config.json，8787）
+      --host <地址>   监听地址（默认 127.0.0.1）
+  -o, --open          启动后在默认浏览器打开工作台（macOS: open）
+      --demo          强制使用内置演示会话（mock ASR/翻译/TTS，不需要密钥/模型）
+  -v, --verbose       输出调试日志（也不打印密钥）
+  -h, --help          显示帮助
+
+工作台：http://127.0.0.1:<port>/studio/    回放：/replay/?session=/demo/session.jsonl
+API：  /health  /api/config  /api/voices      WS：/ws（见 docs/CONTRACTS.md §3）`);
+}
+
+async function main(argv = process.argv.slice(2)) {
+  let args;
+  try {
+    args = parseCliArgs(argv);
+  } catch (err) {
+    console.error(`[livedub] ${err.message}`);
+    process.exitCode = 2;
+    return;
+  }
+  if (args.help) {
+    printHelp();
+    return;
+  }
+
+  const log = (msg) => console.log(`[livedub ${new Date().toISOString().slice(11, 19)}] ${msg}`);
+  let started;
+  try {
+    started = await startServer({
+      port: args.port,
+      host: args.host,
+      demo: args.demo,
+      verbose: args.verbose,
+      log,
+    });
+  } catch (err) {
+    if (err?.code === 'EADDRINUSE') {
+      const port = err.port ?? args.port ?? DEFAULT_PORT;
+      console.error(
+        `[livedub] 端口 ${port} 已被占用。\n  换一个端口：node engine/server.mjs --port ${Number(port) + 1}\n  或查看占用：lsof -nP -iTCP:${port} -sTCP:LISTEN`,
+      );
+    } else {
+      console.error(`[livedub] 启动失败：${err?.message ?? err}`);
+    }
+    process.exitCode = 1;
+    return;
+  }
+
+  const config = started.config;
+  const whisperModel = resolveWhisperModel(config);
+  const saylessPath = config?._meta?.saylessConfigPath ?? null;
+  const line = (label, value) => console.log(`  ${label.padEnd(6, ' ')} ${value}`);
+  console.log('');
+  console.log('  livedub 本地引擎已启动');
+  console.log('  ─────────────────────────────────────────────');
+  line('引擎', started.url);
+  line('工作台', started.studioUrl);
+  line('回放', `${started.url}/replay/`);
+  line('会话层', formatMode(started.mode));
+  line('ASR', `${config?.asr?.provider ?? '?'}${whisperModel ? `（模型 ${toProjectRelative(whisperModel)}）` : '（⚠ 未找到 whisper 模型）'}`);
+  line('翻译', `${config?.translate?.provider ?? '?'}${Array.isArray(config?.translate?.chain) ? `（链：${config.translate.chain.join(' → ')}）` : ''}`);
+  line('配音', `${config?.tts?.provider ?? '?'} · ${config?.tts?.voiceMode ?? 'preset'}`);
+  line('凭据', saylessPath ? `~/.sayless 配置已发现` : '未发现 ~/.sayless/config.json（可使用 --demo 体验）');
+  console.log('  ─────────────────────────────────────────────');
+  console.log('  按 Ctrl+C 退出');
+
+  if (args.open) openInBrowser(started.studioUrl, log);
+
+  let shuttingDown = false;
+  const shutdown = async (signal) => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    log(`收到 ${signal}，正在关闭…`);
+    try {
+      await started.close();
+    } catch (err) {
+      console.error(`[livedub] 关闭时出错：${err?.message ?? err}`);
+    }
+    process.exit(0);
+  };
+  process.once('SIGINT', () => void shutdown('SIGINT'));
+  process.once('SIGTERM', () => void shutdown('SIGTERM'));
+}
+
+const entry = process.argv[1] ? pathToFileURL(path.resolve(process.argv[1])).href : null;
+if (entry && import.meta.url === entry) {
+  main().catch((err) => {
+    console.error(`[livedub] 启动失败：${err?.message ?? err}`);
+    process.exit(1);
+  });
+}

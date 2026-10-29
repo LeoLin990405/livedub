@@ -1,0 +1,68 @@
+1
+00:00:00,000 --> 00:00:02,780
+Welcome to this short lecture on gradient descent.
+欢迎来到这节关于梯度下降的短课。
+
+2
+00:00:02,780 --> 00:00:06,680
+Gradient descent is the workhorse algorithm behind modern deep
+learning.
+梯度下降是现代深度学习背后的主力算法。
+
+3
+00:00:07,120 --> 00:00:15,120
+The idea is simple. We compute the gradient of the loss with respect to
+the parameters. And then we take a small step in the opposite
+direction.
+思路很简单。我们计算损失对参数的梯度。然后朝相反的方
+向走一小步。
+
+4
+00:00:15,120 --> 00:00:18,240
+We repeat this process until the loss stops improving.
+我们重复这个过程，直到损失不再改善。
+
+5
+00:00:18,680 --> 00:00:23,360
+The learning rate controls how big each step is. If the learning rate
+is too large.
+学习率控制每一步走多大。如果学习率太大。
+
+6
+00:00:23,360 --> 00:00:27,940
+Training can diverge. If it is too small, training becomes very slow.
+训练可能会发散。如果学习率太小，训练就会变得非常慢。
+
+7
+00:00:28,340 --> 00:00:31,280
+In practice we rarely use the exact gradient.
+在实际中，我们很少使用精确的梯度。
+
+8
+00:00:31,440 --> 00:00:34,260
+Stochastic gradients trade exactness for speed.
+随机梯度用精确性换取速度。
+
+9
+00:00:34,260 --> 00:00:40,560
+Momentum and adaptive methods smooth the trajectory, and learning rate
+schedules start large and decay over time.
+动量法和自适应方法会让训练轨迹更平滑，学习率调度则从
+较大的值开始，随时间逐渐衰减。
+
+10
+00:00:40,980 --> 00:00:46,980
+In the next lecture, we will derive the gradient for a linear model,
+and implement the update rule and code.
+下一讲，我们会推导线性模型的梯度，并实现更新规则和代
+码。
+
+11
+00:00:46,980 --> 00:00:50,760
+We will also visualize the loss surface and the optimization path.
+我们还会把损失曲面和优化路径可视化。
+
+12
+00:00:50,820 --> 00:00:52,120
+Thanks for watching.
+感谢观看。

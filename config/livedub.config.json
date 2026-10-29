@@ -1,0 +1,177 @@
+{
+  "server": {
+    "host": "127.0.0.1",
+    "port": 8787
+  },
+  "session": {
+    "langFrom": "en",
+    "langTo": "zh",
+    "sampleRate": 16000,
+    "maxSessionMinutes": 240
+  },
+  "asr": {
+    "provider": "whisper-local",
+    "whisper": {
+      "bin": "whisper-server",
+      "host": "127.0.0.1",
+      "port": 18765,
+      "models": [
+        "models/ggml-large-v3-turbo-q5_0.bin",
+        "~/.sayless/models/ggml-large-v3-turbo.bin",
+        "~/.sayless/ggml-small.bin",
+        "~/.sayless/ggml-base.bin"
+      ],
+      "language": "en",
+      "threads": 8,
+      "startupTimeoutMs": 120000,
+      "requestTimeoutMs": 60000,
+      "vad": {
+        "frameMs": 20,
+        "energyThreshold": 0.012,
+        "adaptive": true,
+        "minSpeechMs": 240,
+        "minSilenceMs": 280,
+        "maxUtteranceMs": 8000,
+        "preRollMs": 200,
+        "tailPadMs": 150
+      },
+      "partial": {
+        "enabled": true,
+        "intervalMs": 1500,
+        "windowMs": 9000,
+        "minChars": 6,
+        "skipWhileBusy": true
+      },
+      "prompt": "Gradient descent, loss function, learning rate, stochastic gradient, momentum, backpropagation, neural network, optimization."
+    }
+  },
+  "translate": {
+    "provider": "deepseek",
+    "chain": [
+      "deepseek",
+      "minimax",
+      "mimo-plan"
+    ],
+    "temperature": 0,
+    "maxTokens": 360,
+    "contextSegments": 3,
+    "timeoutMs": 15000,
+    "style": "teaching"
+  },
+  "tts": {
+    "provider": "minimax",
+    "model": "speech-2.8-hd",
+    "sampleRate": 24000,
+    "speed": 1.0,
+    "voiceMode": "clone-first",
+    "presetVoices": {
+      "default": "male-qn-qingse",
+      "male": "male-qn-qingse",
+      "female": "female-shaonv",
+      "narrator": "male-qn-qingse"
+    },
+    "clone": {
+      "provider": "minimax",
+      "minSampleSec": 12,
+      "maxSampleSec": 45,
+      "model": "speech-2.8-hd"
+    },
+    "fallbacks": [
+      {
+        "provider": "minimax",
+        "voiceId": "male-qn-qingse"
+      },
+      {
+        "provider": "macos-say",
+        "voice": "Tingting"
+      }
+    ],
+    "chunk": {
+      "minClauseChars": 8,
+      "maxChunkChars": 80
+    },
+    "timeoutMs": 20000
+  },
+  "dub": {
+    "enabled": true,
+    "duckOriginal": 0.18,
+    "catchUp": "accelerate",
+    "maxAccelerate": 1.25,
+    "maxLagMs": 4000,
+    "minGapMs": 60,
+    "startBufferMs": 120
+  },
+  "subs": {
+    "bilingual": true,
+    "maxCps": 9,
+    "maxCharsPerLine": 24,
+    "maxLines": 2,
+    "position": "bottom"
+  },
+  "glossary": [
+    {
+      "src": "gradient descent",
+      "dst": "梯度下降"
+    },
+    {
+      "src": "learning rate",
+      "dst": "学习率"
+    },
+    {
+      "src": "loss function",
+      "dst": "损失函数"
+    },
+    {
+      "src": "neural network",
+      "dst": "神经网络"
+    },
+    {
+      "src": "backpropagation",
+      "dst": "反向传播"
+    },
+    {
+      "src": "deep learning",
+      "dst": "深度学习"
+    },
+    {
+      "src": "overfitting",
+      "dst": "过拟合"
+    },
+    {
+      "src": "regularization",
+      "dst": "正则化"
+    },
+    {
+      "src": "optimizer",
+      "dst": "优化器"
+    },
+    {
+      "src": "epoch",
+      "dst": "轮次"
+    },
+    {
+      "src": "batch size",
+      "dst": "批大小"
+    },
+    {
+      "src": "transformer",
+      "dst": "Transformer"
+    },
+    {
+      "src": "attention",
+      "dst": "注意力"
+    },
+    {
+      "src": "embedding",
+      "dst": "嵌入"
+    },
+    {
+      "src": "fine-tuning",
+      "dst": "微调"
+    }
+  ],
+  "privacy": {
+    "persistAudio": false,
+    "persistTranscript": false
+  }
+}

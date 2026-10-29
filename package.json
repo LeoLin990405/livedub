@@ -1,0 +1,22 @@
+{
+  "name": "livedub",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "实时同传看视频：本地优先的流式 ASR -> 增量翻译 -> 克隆音色配音引擎（Chrome 扩展 + 本地工作台）",
+  "engines": {
+    "node": ">=22.0.0"
+  },
+  "scripts": {
+    "start": "node engine/server.mjs",
+    "studio": "node engine/server.mjs --open",
+    "doctor": "node scripts/doctor.mjs",
+    "batch": "node scripts/batch.mjs",
+    "demo": "node scripts/make-demo.mjs",
+    "test": "node --test tests/*.test.mjs",
+    "test:core": "node --test tests/core.test.mjs tests/pipeline.test.mjs",
+    "demo:video": "node scripts/make-demo.mjs",
+    "demo:batch": "node scripts/batch.mjs"
+  },
+  "license": "MIT"
+}
