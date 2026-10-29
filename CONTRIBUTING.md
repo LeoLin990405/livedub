@@ -34,14 +34,25 @@ LIVEDUB_INTEGRATION=1 node --test tests/tts.test.mjs
 |---|---|
 | `engine/protocol.mjs` | WS 线协议 / 二进制音频帧 |
 | `engine/pipeline.mjs` | Session 编排（ASR → 翻译 → TTS → 调度 → 事件） |
-| `engine/asr/` + `engine/segmenter.mjs` | 本地 whisper 流式识别、VAD 切分、partial |
+| `engine/asr/` + `engine/segmenter.mjs` | 本地 whisper 流式识别 / MiniMax 云端 ASR、VAD 切分、partial、降级熔断 |
 | `engine/translate/` | 流式翻译、术语表、failover、子句提取 |
-| `engine/tts/` + `engine/voice.mjs` | MiniMax / macOS say TTS、克隆降级、缓存 |
+| `engine/tts/` + `engine/voice.mjs` | MiniMax / 火山引擎 / macOS say TTS、声音复刻、克隆降级、缓存与预热 |
 | `engine/dub/` | 配音调度策略 |
 | `engine/server.mjs` | HTTP + WebSocket 服务、静态工作台 |
-| `studio/` | 本地工作台 UI（零依赖） |
-| `extension/` | Chrome MV3 扩展（抓声 + 浮层 + 配音） |
-| `scripts/` | doctor / batch / demo 生成 / 图层渲染 |
+| `studio/` | 本地工作台 UI（零依赖；ASR 本地/云端切换、隐私提示、事件导出） |
+| `extension/` | Chrome MV3 扩展（抓声 + 浮层 + 配音 + 全局限定压音 + 全屏包装） |
+| `apps/macos/` | macOS 原生桌面悬浮窗（Swift 5.10 + ScreenCaptureKit，零第三方依赖） |
+| `config/livedub.{fast,cloud}.json` | 快速档（small ASR）/ 云端档（MiniMax ASR）配置覆盖（`LIVEDUB_PROFILE`） |
+| `scripts/` | doctor / batch / demo 生成 / 图层渲染 / `build-macos.sh` |
+
+## macOS App（可选）
+
+若改动 `apps/macos/**`，需要 macOS 14+ 与 Swift 5.10+（CommandLineTools 即可，不需要 Xcode 工程）：
+
+```bash
+bash scripts/build-macos.sh --check   # 编译 + self-test（76 checks）
+node --test tests/macos.test.mjs
+```
 
 ## 代码约定
 

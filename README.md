@@ -6,6 +6,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Node](https://img.shields.io/badge/node-%E2%89%A522-brightgreen.svg)](package.json)
 [![runtime deps](https://img.shields.io/badge/runtime%20deps-0-blue.svg)](package.json)
+[![Release](https://img.shields.io/github/v/release/LeoLin990405/livedub)](https://github.com/LeoLin990405/livedub/releases)
 [![stars](https://img.shields.io/github/stars/LeoLin990405/livedub.svg?style=social)](https://github.com/LeoLin990405/livedub)
 
 > 本地优先的**实时同声传译引擎**：抓取视频声音 → 流式识别 → 增量翻译 → 克隆音色配音 + 双语字幕。
@@ -169,10 +170,11 @@ livedub/
 │   ├── ws.mjs              极简 RFC6455 服务端
 │   └── server.mjs          HTTP + WS + 静态工作台
 ├── studio/                 本地工作台（HTML/JS，零依赖，暗色 UI）
-├── extension/              Chrome MV3 扩展（抓声 + 浮层 + 配音）
+├── extension/              Chrome MV3 扩展（抓声 + 浮层 + 配音 + 全局限定压音）
+├── apps/macos/             macOS 原生桌面悬浮窗（Swift + ScreenCaptureKit）
 ├── scripts/                doctor / batch / make-demo / 图层渲染
 ├── tests/                  node:test（含 mock 端到端）
-├── config/                 livedub.config.json
+├── config/                 livedub.config.json + fast/cloud 档位覆盖
 └── docs/                   CONTRACTS / ARCHITECTURE / PROVIDERS / ROADMAP / MEASUREMENTS
 ```
 
