@@ -227,8 +227,9 @@ test('HTTP /health：ok、版本、provider、whisper 是否找到、sayless 路
     assert.equal(health.providers.translate, 'mock');
     assert.equal(health.providers.tts, 'mock');
     assert.equal(typeof health.whisper.found, 'boolean');
-    assert.equal(health.whisper.found, true, '项目内 models/ 应能找到 whisper 模型');
-    assert.ok(health.whisper.model.includes('ggml-large-v3-turbo-q5_0.bin'));
+    // 模型是否存在取决于运行环境（CI 不下载 574MB 模型）：只校验字段自洽
+    if (health.whisper.found) assert.ok(String(health.whisper.model ?? '').length > 0);
+    else assert.ok(health.whisper.model == null || health.whisper.model === '');
     assert.equal(typeof health.sayless, 'object');
     assert.ok('configPath' in health.sayless);
     assert.equal(typeof health.mode, 'string');
@@ -257,7 +258,7 @@ test('HTTP /api/config：publicConfig 脱敏，任何 apiKey 都不出现', asyn
     assert.ok(!serialized.includes('sk-ENV-SECRET'), '环境变量里的 apiKey 泄漏了');
     assert.ok(!serialized.includes('"apiKey"'), '响应里不应有 apiKey 字段');
     assert.equal(body.config.asr.provider, 'mock');
-    assert.equal(body.config.runtime.whisperModelFound, true);
+    assert.equal(typeof body.config.runtime.whisperModelFound, 'boolean');
     assert.equal(body.config.runtime.mode, 'pipeline');
   } finally {
     if (previousEnv === undefined) delete process.env[envKey];

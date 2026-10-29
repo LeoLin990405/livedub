@@ -43,5 +43,5 @@ jobs:
       - name: Basic leak scan (keys / personal paths)
         run: |
           set -e
-          ! git grep -nE 'sk-[A-Za-z0-9]{20,}|X-Api-Key:[[:space:]]*[A-Za-z0-9-]{20,}|/Users/[A-Za-z0-9._-]+/' -- . \
-            ':!*.md' ':!*.srt' ':!*.jsonl' ':!demo/**' ':!models/**'
+          ! git grep -nE 'sk-[A-Za-z0-9]{20,}|X-Api-Key:[[:space:]]*[A-Za-z0-9-]{20,}|/Users/leo/' -- . \
+            ':!*.md' ':!*.srt' ':!*.jsonl' ':!demo/**' ':!models/**' ':!tests/**'

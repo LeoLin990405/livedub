@@ -995,11 +995,12 @@ export function createTranslator({ config = {}, log = () => {}, fetchImpl = glob
     if (signal?.aborted) throw makeAbortError('翻译开始前已被中断');
     signal?.addEventListener?.('abort', onExternalAbort, { once: true });
     if (providerTimeoutMs > 0) {
+      // 注意：这里不能 unref。若事件循环里没有其它 ref（例如测试注入的 fetch 是一个挂起 Promise），
+      // 定时器被 unref 会导致 Node 22 直接排空事件循环、超时永远不触发（CI 中表现为 cancelledByParent）。
       timer = setTimeout(() => {
         timedOut = true;
         controller.abort();
       }, providerTimeoutMs);
-      timer.unref?.();
     }
 
     try {

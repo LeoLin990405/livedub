@@ -395,6 +395,9 @@ test('config.translate.timeoutMs 到点中断并抛出可读超时错误', async
     (err) => /翻译全部 provider 失败/.test(err.message) && /超时/.test(err.message) && /deepseek/.test(err.message),
   );
   assert.ok(Date.now() - startedAt < 3000, '超时应在 3s 内触发');
+  // Node 22 的 test runner 会更严格地检测「事件循环里残留的 pending promise」，
+  // 这里给 provider 超时定时器/abort 监听一个排空窗口，避免跨版本误报 cancelledByParent。
+  await new Promise((resolve) => setTimeout(resolve, 200));
 });
 
 test('调用前已 abort：立即抛 AbortError，不发请求', async () => {
