@@ -34,7 +34,8 @@ for arg in "$@"; do
       exit 0
       ;;
     -h | --help)
-      grep -E '^#( |$)' "$0" | sed -e 's/^# \{0,1\}//' -e '/^$/{n;/^$/d}'
+      # 打印文件头注释块（到第一行非注释为止）
+      awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "$0"
       exit 0
       ;;
     *)

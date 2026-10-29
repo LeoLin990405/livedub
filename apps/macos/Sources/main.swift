@@ -300,7 +300,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return
         }
         let options = HelloOptions(
-            source: "studio",
+            source: "macos",
             title: "macOS 系统音频 · livedub app",
             url: "",
             langFrom: settings.langFrom,

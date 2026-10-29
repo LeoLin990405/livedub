@@ -60,7 +60,7 @@
 - `hello`（必须第一条）
   ```json
   { "type": "hello", "protocol": 1,
-    "session": { "source": "extension|studio|batch|test", "title": "", "url": "",
+    "session": { "source": "extension|studio|batch|test|macos", "title": "", "url": "",
                  "langFrom": "en", "langTo": "zh", "tMsBase": null, "overrides": {} },
     "glossary": [{"src":"gradient descent","dst":"梯度下降"}] }
   ```

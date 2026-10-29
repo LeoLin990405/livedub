@@ -139,7 +139,7 @@ enum AudioFrameCodec {
 struct HelloOptions {
     /// 客户端类型。契约枚举：extension | studio | batch | test。
     /// macOS App 复用 "studio"（引擎 normalizeHello 只接受这四个值，未知值会回退 studio）。
-    var source: String = "studio"
+    var source: String = "macos"
     var title: String = ""
     var url: String = ""
     var langFrom: String = "en"

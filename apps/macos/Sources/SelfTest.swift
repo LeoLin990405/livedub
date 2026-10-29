@@ -142,7 +142,7 @@ enum SelfTest {
 
     private static func checkHello() {
         let options = HelloOptions(
-            source: "studio",
+            source: "macos",
             title: "macOS 系统音频（livedub）",
             url: "",
             langFrom: "en",

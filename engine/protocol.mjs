@@ -139,7 +139,7 @@ export function normalizeHello(msg) {
     ...DEFAULT_SESSION_OPTIONS,
     ...pick(raw, ['source', 'title', 'url', 'langFrom', 'langTo', 'tMsBase', 'overrides']),
   };
-  if (!['extension', 'studio', 'batch', 'test'].includes(options.source)) options.source = 'studio';
+  if (!['extension', 'studio', 'batch', 'test', 'macos'].includes(options.source)) options.source = 'studio';
   for (const k of ['title', 'url']) options[k] = String(options[k] ?? '').slice(0, 500);
   for (const k of ['langFrom', 'langTo']) options[k] = String(options[k] ?? '').slice(0, 20) || DEFAULT_SESSION_OPTIONS[k];
   if (options.tMsBase != null && (!Number.isFinite(options.tMsBase) || options.tMsBase < 0)) options.tMsBase = null;

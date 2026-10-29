@@ -30,8 +30,8 @@ const PARTIAL_DEFAULTS = Object.freeze({ enabled: false, mode: 'final-only', int
 
 function sleep(ms) {
   return new Promise((resolve) => {
-    const timer = setTimeout(resolve, Math.max(0, ms));
-    timer.unref?.();
+    // 不 unref：该 sleep 会在 await 路径上使用（重试/收尾），必须保持事件循环
+    setTimeout(resolve, Math.max(0, ms));
   });
 }
 
