@@ -32,6 +32,9 @@ Two surfaces:
   shows a floating bilingual subtitle panel + Chinese dub over Zoom/Meetings/players.
 - **Offline batch** (`scripts/batch.mjs`) — video → dubbed MP4 with burned-in bilingual
   subtitles + SRT + replayable event stream.
+- **Learning notes** — time-stamped notes with bilingual quotes, screenshots and code
+  blocks; capture from the workbench (`N`), the extension (`Alt+Shift+N`), the macOS
+  overlay (`⌥N`) or the CLI (`npm run note -- "..."`); export Markdown for Obsidian.
 
 Measured on this machine (Apple M2 / 16GB, 52.7s demo lecture, real providers):
 

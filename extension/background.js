@@ -24,11 +24,23 @@ import {
   OFFSCREEN_JUSTIFICATION,
   OFFSCREEN_REASONS,
   STORAGE_KEYS,
+  deriveEngineHttpBase,
   isCapturablePage,
   normalizeEngineUrl,
 } from './lib/constants.js';
-import { pickLatencyMs } from './lib/pcm.js';
+import { base64ToBytes, pickLatencyMs } from './lib/pcm.js';
 import { buildSrtFromCaptions, suggestSrtFilename } from './lib/srt.js';
+import {
+  buildNoteToastText,
+  buildQuickNoteMarkdown,
+  buildQuickNoteRequest,
+  buildVideoIdentity,
+  createNoteQueue,
+  nextDailyStats,
+  notesEndpoint,
+  readDailyCount,
+  resolveAssetUrl,
+} from './lib/notes.js';
 
 const LOG_PREFIX = '[livedub:bg]';
 const log = (...args) => console.debug(LOG_PREFIX, ...args);
@@ -48,6 +60,8 @@ const BACKGROUND_MESSAGE_TYPES = new Set([
   MSG.CONFIG_PATCH,
   MSG.GET_SRT,
   MSG.RECONNECT,
+  MSG.CAPTURE_NOTE,
+  MSG.EXPORT_NOTES,
   MSG.OFFSCREEN_HELLO,
   MSG.OFFSCREEN_STATE,
   MSG.OFFSCREEN_EVENT,
@@ -76,6 +90,12 @@ function emptyState(engineUrl = DEFAULT_ENGINE_URL) {
     capture: null, // {sampleRate, targetRate}
     error: null, // {scope, message, code?, recoverable?}
     notice: '', // 一次性提示（重连 / 引擎地址变更 / 已停止...）
+    /** v0.4：今日笔记计数 {date, count}（本地统计，离线可用） */
+    noteStats: null,
+    /** v0.4：离线队列中待同步的笔记条数 */
+    noteQueueCount: 0,
+    /** v0.4：最近一条笔记结果（popup 展示） */
+    lastNote: null, // {at, tMs, text, queued, videoTitle, imageUrl?}
     updatedAt: Date.now(),
   };
 }
@@ -88,6 +108,393 @@ let persistTimer = null;
 let broadcastTimer = null;
 let dubActiveTimer = null;
 let finishedStop = true;
+
+// ---------------------------------------------------------------------------
+// v0.4 边看边写笔记：quick note / 截图 / 离线队列 / 今日计数
+// ---------------------------------------------------------------------------
+
+/** 笔记离线队列（chrome.storage.local 持久化，最多 50 条） */
+let noteQueue = null;
+/** 今日计数 {date,count}（chrome.storage.local: livedub:note-stats） */
+let noteStats = null;
+/** 截图 PNG 上限（契约 4MB） */
+const NOTE_ASSET_LIMIT_BYTES = 4 * 1024 * 1024;
+/** 最近一次触发队列 flush 的时间（节流，避免引擎事件风暴里反复请求） */
+let lastNoteFlushAt = 0;
+
+function getNoteQueue() {
+  if (!noteQueue) {
+    noteQueue = createNoteQueue({
+      key: STORAGE_KEYS.noteQueue,
+      maxNotes: 50,
+      storage: {
+        async getItem(key) {
+          const stored = await chrome.storage.local.get({ [key]: null });
+          return stored[key];
+        },
+        async setItem(key, value) {
+          await chrome.storage.local.set({ [key]: value });
+        },
+      },
+    });
+  }
+  return noteQueue;
+}
+
+function publicNoteStats() {
+  if (!noteStats) return null;
+  return { date: noteStats.date, count: readDailyCount(noteStats, new Date()) };
+}
+
+async function loadNoteStats() {
+  try {
+    const stored = await chrome.storage.local.get({ [STORAGE_KEYS.noteStats]: null });
+    noteStats = stored[STORAGE_KEYS.noteStats] || null;
+  } catch {
+    noteStats = null;
+  }
+  // 把队列长度也带进运行态（popup 展示）
+  try {
+    const queue = getNoteQueue();
+    await queue.load();
+    bgState.noteQueueCount = queue.list().length;
+  } catch {
+    bgState.noteQueueCount = 0;
+  }
+}
+
+async function bumpNoteStats() {
+  noteStats = nextDailyStats(noteStats, new Date());
+  try {
+    await chrome.storage.local.set({ [STORAGE_KEYS.noteStats]: noteStats });
+  } catch {
+    /* ignore */
+  }
+  updateState({ noteStats: publicNoteStats() });
+}
+
+/** 引擎 HTTP base（http://127.0.0.1:8787）；地址非法时抛可读错误 */
+function engineHttpBase() {
+  const base = deriveEngineHttpBase(settings.engineUrl) || deriveEngineHttpBase(DEFAULT_ENGINE_URL);
+  if (!base) throw new Error('引擎地址无效，请在 popup 里检查引擎地址');
+  return base;
+}
+
+/**
+ * 调本地引擎 HTTP API（host_permissions 已含 127.0.0.1/localhost）。
+ * @param {string} path
+ * @param {{method?:string, body?:any, rawBody?:BodyInit|null, headers?:Record<string,string>, timeoutMs?:number}} [opts]
+ */
+async function engineFetch(path, { method = 'GET', body = null, rawBody = null, headers = {}, timeoutMs = 5000 } = {}) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const requestHeaders = { ...headers };
+    let payload = rawBody;
+    if (payload == null && body != null) {
+      requestHeaders['content-type'] = requestHeaders['content-type'] || 'application/json';
+      payload = JSON.stringify(body);
+    }
+    const response = await fetch(`${engineHttpBase()}${path}`, {
+      method,
+      headers: requestHeaders,
+      body: payload,
+      signal: controller.signal,
+      cache: 'no-store',
+    });
+    const text = await response.text();
+    let data = {};
+    if (text) {
+      try {
+        data = JSON.parse(text);
+      } catch {
+        data = { text };
+      }
+    }
+    if (!response.ok) {
+      const detail = (data && (data.error || data.message)) || `HTTP ${response.status}`;
+      const error = new Error(`HTTP ${response.status}: ${String(detail)}`);
+      error.status = response.status;
+      throw error;
+    }
+    if (data && data.ok === false) {
+      const error = new Error(String(data.error || data.message || '引擎返回失败'));
+      error.status = 200;
+      throw error;
+    }
+    return data;
+  } catch (err) {
+    const message = String((err && err.message) || err);
+    if (/abort/i.test(message)) throw new Error('连接引擎超时（请确认 npm start 已运行）');
+    throw new Error(message);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/** POST /api/notes/quick（老引擎/每日 quick md 兜底；字段白名单不含 imageUrl） */
+async function postQuickNote(payload) {
+  const quickPayload = { ...payload };
+  delete quickPayload.imageUrl;
+  const data = await engineFetch(notesEndpoint(engineHttpBase(), 'quick'), {
+    method: 'POST',
+    body: quickPayload,
+    timeoutMs: 6000,
+  });
+  return { ok: true, path: data.path || '', markdown: data.markdown || '', fallbackQuick: true };
+}
+
+/**
+ * 笔记主写入：POST /api/notes（引擎笔记库存档，支持 imageUrl/quotes/tags，工作台「笔记本」与
+ * 导出 Markdown 都基于它）；若引擎尚无笔记库路由（404/405）则回退 POST /api/notes/quick
+ * （追加 data/notes/quick-YYYY-MM-DD.md，不支持 imageUrl）。
+ * @param {object} payload buildQuickNoteRequest 的结果
+ */
+async function postNoteRecord(payload) {
+  const base = engineHttpBase();
+  const body = {
+    video: payload.video,
+    tMs: payload.tMs,
+    body: buildQuickNoteMarkdown(payload),
+    kind: 'quick',
+    source: 'extension',
+  };
+  if (payload.quotes) body.quotes = payload.quotes;
+  if (payload.tags) body.tags = payload.tags;
+  if (payload.imageUrl) body.imageUrl = payload.imageUrl;
+  const send = async (record) => {
+    const data = await engineFetch(notesEndpoint(base, 'list'), { method: 'POST', body: record, timeoutMs: 6000 });
+    return { ok: true, path: '', markdown: record.body, noteId: (data.note && data.note.id) || '' };
+  };
+  try {
+    return await send(body);
+  } catch (err) {
+    const status = err && typeof err.status === 'number' ? err.status : 0;
+    // 旧引擎没有 POST /api/notes：回退 quick 每日摘录
+    if (status === 404 || status === 405) return postQuickNote(payload);
+    // 严格字段白名单拒绝 imageUrl（如 invalid_image/unknown_field）：去掉截图重试一次
+    if (body.imageUrl && status >= 400 && status < 500) {
+      const withoutImage = { ...body };
+      delete withoutImage.imageUrl;
+      try {
+        const retried = await send(withoutImage);
+        retried.imageSkipped = true;
+        retried.imageError = `引擎不接受 imageUrl（HTTP ${status}），已保存无图笔记`;
+        return retried;
+      } catch (retryErr) {
+        throw retryErr;
+      }
+    }
+    throw err;
+  }
+}
+
+/** POST /api/notes/assets（raw PNG）；url 保持引擎返回的相对路径（笔记 imageUrl 白名单要求） */
+async function postAssetPng(bytes) {
+  const data = await engineFetch(notesEndpoint(engineHttpBase(), 'assets'), {
+    method: 'POST',
+    rawBody: bytes,
+    headers: { 'content-type': 'image/png' },
+    timeoutMs: 8000,
+  });
+  const relativeUrl = typeof data.url === 'string' ? data.url : '';
+  return { ok: true, url: relativeUrl, absoluteUrl: resolveAssetUrl(engineHttpBase(), relativeUrl) };
+}
+
+/** 抓当前活动标签页截图（需要 activeTab / 命令手势）；返回 PNG bytes */
+async function captureTabScreenshot(tab) {
+  const windowId = tab && typeof tab.windowId === 'number' ? tab.windowId : null;
+  // API 重载：captureVisibleTab(options) / captureVisibleTab(windowId, options)
+  const dataUrl =
+    windowId != null
+      ? await chrome.tabs.captureVisibleTab(windowId, { format: 'png' })
+      : await chrome.tabs.captureVisibleTab({ format: 'png' });
+  const comma = typeof dataUrl === 'string' ? dataUrl.indexOf(',') : -1;
+  if (comma < 0) throw new Error('截图数据格式异常');
+  const bytes = base64ToBytes(dataUrl.slice(comma + 1));
+  if (!bytes || bytes.byteLength === 0) throw new Error('截图数据为空');
+  if (bytes.byteLength > NOTE_ASSET_LIMIT_BYTES) throw new Error('截图超过 4MB 限制');
+  return bytes;
+}
+
+/** 向 content script 要当前视频/字幕上下文；失败返回 null */
+async function getContentNoteContext(tabId) {
+  try {
+    const response = await chrome.tabs.sendMessage(tabId, { type: MSG.NOTE_CONTEXT });
+    if (response && response.ok && response.context) return response.context;
+  } catch {
+    /* content script 不在 / 页面受限 */
+  }
+  return null;
+}
+
+/** 无 content script 时的兜底上下文（停止抓音后仍可记笔记的基础） */
+function fallbackNoteContext(tab) {
+  return {
+    url: (tab && tab.url) || '',
+    title: (tab && tab.title) || '',
+    durationMs: 0,
+    tMs: 0,
+    text: '（无字幕）',
+    quotes: [],
+  };
+}
+
+function notifyContentNoteResult(tabId, result) {
+  if (tabId == null) return;
+  chrome.tabs.sendMessage(tabId, { type: MSG.NOTE_RESULT, result }).catch(() => {});
+}
+
+/**
+ * 记录一条 quick note：上下文 -> 可选截图上传 -> POST quick -> 失败入队。
+ * @param {{tabId?:number|null, withScreenshot?:boolean, trigger?:string}} [opts]
+ */
+async function captureQuickNote({ tabId = null, withScreenshot = null, trigger = 'ui' } = {}) {
+  await ensureInit();
+  let tab = null;
+  try {
+    tab = tabId != null ? await chrome.tabs.get(tabId) : await getActiveTab();
+  } catch {
+    tab = null;
+  }
+  if (!tab || tab.id == null) {
+    return { ok: false, error: { code: 'NO_TAB', message: '没有可记录笔记的标签页' } };
+  }
+  const takeScreenshot = withScreenshot == null ? settings.noteScreenshot !== false : withScreenshot === true;
+  const context = (await getContentNoteContext(tab.id)) || fallbackNoteContext(tab);
+  const video = buildVideoIdentity({
+    url: context.url || tab.url || '',
+    title: context.title || tab.title || '',
+    durationMs: context.durationMs,
+  });
+  const payload = buildQuickNoteRequest({
+    video,
+    tMs: context.tMs,
+    text: context.text,
+    quotes: context.quotes,
+  });
+
+  let imageSkipped = false;
+  let imageError = '';
+  if (takeScreenshot) {
+    try {
+      const pngBytes = await captureTabScreenshot(tab);
+      const asset = await postAssetPng(pngBytes);
+      if (asset.url) payload.imageUrl = asset.url; // 引擎要求相对路径 /api/notes/assets/xxx.png
+    } catch (err) {
+      imageSkipped = true;
+      imageError = String((err && err.message) || err);
+      log('note screenshot skipped', imageError);
+    }
+  }
+
+  let queued = false;
+  let queueSize = 0;
+  let notePath = '';
+  let markdown = '';
+  let engineError = '';
+  try {
+    // 主写入：POST /api/notes（笔记库存档；支持 imageUrl，工作台笔记本/导出可见）
+    // 旧引擎没有笔记库路由时 postNoteRecord 内部会回退 POST /api/notes/quick
+    const result = await postNoteRecord(payload);
+    notePath = result.path || '';
+    markdown = result.markdown || buildQuickNoteMarkdown(payload);
+    if (result.imageSkipped) {
+      imageSkipped = true;
+      imageError = result.imageError || imageError;
+    }
+  } catch (err) {
+    engineError = String((err && err.message) || err);
+    const queue = getNoteQueue();
+    await queue.enqueue(payload);
+    queued = true;
+    queueSize = queue.list().length;
+    log('note queued (engine offline)', engineError);
+  }
+
+  await bumpNoteStats();
+  if (!queued) flushNotesQueue().catch(() => {});
+  const toast = buildNoteToastText({ tMs: payload.tMs, queued, queueSize, imageSkipped });
+  const result = {
+    ok: true,
+    queued,
+    queueSize,
+    tMs: payload.tMs,
+    path: notePath,
+    markdown,
+    imageSkipped,
+    imageError,
+    engineError,
+    toast,
+  };
+  updateState({
+    noteQueueCount: queued ? queueSize : bgState.noteQueueCount,
+    lastNote: {
+      at: Date.now(),
+      tMs: payload.tMs,
+      text: payload.text,
+      queued,
+      videoTitle: video.title,
+      imageUrl: payload.imageUrl || '',
+      trigger,
+    },
+    notice: queued ? `笔记已排队（引擎未连接），恢复后自动同步` : '',
+  });
+  notifyContentNoteResult(tab.id, result);
+  return result;
+}
+
+/** popup「导出 Markdown」：POST /api/notes/export {videoId} -> {ok,path} */
+async function exportNotesMarkdown({ tabId = null } = {}) {
+  await ensureInit();
+  let tab = null;
+  try {
+    tab = tabId != null ? await chrome.tabs.get(tabId) : await getActiveTab();
+  } catch {
+    tab = null;
+  }
+  const context = tab && tab.id != null ? (await getContentNoteContext(tab.id)) || fallbackNoteContext(tab) : fallbackNoteContext(tab);
+  const video = buildVideoIdentity({
+    url: context.url || (tab && tab.url) || '',
+    title: context.title || (tab && tab.title) || '',
+    durationMs: context.durationMs,
+  });
+  try {
+    const data = await engineFetch(notesEndpoint(engineHttpBase(), 'export'), {
+      method: 'POST',
+      body: { videoId: video.id },
+      timeoutMs: 10000,
+    });
+    return { ok: true, path: data.path || '', videoId: video.id, videoTitle: video.title };
+  } catch (err) {
+    return {
+      ok: false,
+      error: {
+        code: 'ENGINE_OFFLINE',
+        message: `导出失败：${String((err && err.message) || err)}。请确认引擎已启动（cd livedub && npm start）且 http://127.0.0.1:8787/health 可访问。`,
+      },
+    };
+  }
+}
+
+/** 引擎恢复连接后 flush 离线队列（节流 5s） */
+async function flushNotesQueue() {
+  if (Date.now() - lastNoteFlushAt < 5000 && lastNoteFlushAt !== 0) return { sent: 0, remaining: bgState.noteQueueCount };
+  lastNoteFlushAt = Date.now();
+  const queue = getNoteQueue();
+  await queue.load();
+  if (queue.list().length === 0) {
+    if (bgState.noteQueueCount !== 0) updateState({ noteQueueCount: 0 });
+    return { sent: 0, remaining: 0 };
+  }
+  const result = await queue.flush({ send: (payload) => postNoteRecord(payload) });
+  updateState({
+    noteQueueCount: result.remaining,
+    notice: result.sent > 0 ? `已同步 ${result.sent} 条离线笔记` : '',
+  });
+  if (result.sent > 0) log('offline notes flushed', result.sent);
+  return result;
+}
 
 // ---------------------------------------------------------------------------
 // 字幕累积（客户端 segment + translation -> 导出 SRT）
@@ -204,6 +611,23 @@ async function init() {
     log('init failed', err && err.message);
   }
   if (bgState && typeof bgState === 'object') bgState.captionCount = captionItems.length;
+  // v0.4：加载笔记统计/离线队列；SW 重启后若引擎可用则尝试同步
+  try {
+    await loadNoteStats();
+    if (bgState && typeof bgState === 'object') {
+      bgState.noteStats = publicNoteStats();
+      const queue = getNoteQueue();
+      await queue.load();
+      bgState.noteQueueCount = queue.list().length;
+    }
+    if (bgState && bgState.noteQueueCount > 0) {
+      setTimeout(() => {
+        flushNotesQueue().catch((err) => log('note queue flush failed', err && err.message));
+      }, 1500);
+    }
+  } catch (err) {
+    log('loadNoteStats failed', err && err.message);
+  }
 }
 
 function ensureInit() {
@@ -559,6 +983,8 @@ function handleEngineEvent(event) {
         },
         notice: '',
       });
+      // 引擎恢复：把离线排队的笔记补发
+      flushNotesQueue().catch((err) => log('note queue flush failed', err && err.message));
       break;
     case 'status':
       updateState({ engineState: event.state || 'idle' });
@@ -722,6 +1148,8 @@ async function syncEngineConfig(previous, next) {
 // ---------------------------------------------------------------------------
 
 async function handleMessage(message, sender) {
+  // 确保设置/SW 运行态已恢复（GET_STATE、笔记统计等都依赖）
+  await ensureInit();
   switch (message.type) {
     case MSG.GET_STATE: {
       // SW 可能在别处被回收后重启：顺手校验 offscreen 是否还在
@@ -734,7 +1162,8 @@ async function handleMessage(message, sender) {
           schedulePersist(0);
         }
       }
-      return { ok: true, state: publicState(), settings: { ...settings }, studioUrl: null };
+      updateState({ noteStats: publicNoteStats(), noteQueueCount: getNoteQueue().list().length }, { broadcast: false, persist: false });
+      return { ok: true, state: publicState(), settings: { ...settings } };
     }
     case MSG.START:
       return startCapture({
@@ -783,6 +1212,18 @@ async function handleMessage(message, sender) {
         };
       }
       return { ok: true, ...payload };
+    }
+    case MSG.CAPTURE_NOTE: {
+      const tabId = message.tabId ?? (sender && sender.tab && sender.tab.id) ?? null;
+      return captureQuickNote({
+        tabId,
+        withScreenshot: typeof message.withScreenshot === 'boolean' ? message.withScreenshot : null,
+        trigger: message.trigger || 'ui',
+      });
+    }
+    case MSG.EXPORT_NOTES: {
+      const tabId = message.tabId ?? (sender && sender.tab && sender.tab.id) ?? null;
+      return exportNotesMarkdown({ tabId });
     }
     case MSG.RECONNECT: {
       if (!['running', 'starting'].includes(bgState.phase)) {
@@ -854,6 +1295,13 @@ chrome.action.onClicked.addListener((tab) => {
 });
 
 chrome.commands.onCommand.addListener((command, tab) => {
+  if (command === 'capture-note') {
+    // v0.4：Alt+Shift+N 记笔记；command 属于用户手势，允许 captureVisibleTab（activeTab 已授予）
+    captureQuickNote({ tabId: tab && typeof tab.id === 'number' ? tab.id : null, trigger: 'command' }).catch((err) =>
+      log('capture-note command failed', err && err.message),
+    );
+    return;
+  }
   if (command !== 'toggle-capture') return;
   // 快捷键触发属于用户手势链，可以直接调用 tabCapture.getMediaStreamId
   toggleFromUserGesture(tab).catch((err) => log('command toggle failed', err && err.message));

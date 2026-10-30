@@ -27,6 +27,8 @@ final class Settings {
         static let langFrom = prefix + "langFrom"
         static let langTo = prefix + "langTo"
         static let autoStart = prefix + "autoStart"
+        static let notesIncludeScreenshot = prefix + "notesIncludeScreenshot"
+        static let notesWhenPaused = prefix + "notesWhenPaused"
     }
 
     init(defaults: UserDefaults = .standard) {
@@ -48,7 +50,8 @@ final class Settings {
     /// - 空 -> 默认地址
     /// - 无 scheme -> 补 ws://
     /// - http(s) -> ws(s)
-    /// - 无端口 -> 补 8787；路径为空或 "/" -> 补 /ws
+    /// - 无端口：ws:// 补 8787（本地引擎默认）；wss:// 保持 443（远端引擎）
+    /// - 路径为空或 "/" -> 补 /ws
     /// - 解析失败 -> 默认地址
     static func normalizeEngineURL(_ raw: String) -> String {
         let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -64,7 +67,9 @@ final class Settings {
         guard var components = URLComponents(string: candidate) else {
             return LiveDubProtocol.defaultEngineURL
         }
-        if components.port == nil { components.port = LiveDubProtocol.enginePort }
+        if components.port == nil && components.scheme == "ws" {
+            components.port = LiveDubProtocol.enginePort
+        }
         if components.path.isEmpty || components.path == "/" { components.path = LiveDubProtocol.wsPath }
         components.query = nil
         components.fragment = nil
@@ -135,6 +140,20 @@ final class Settings {
     var autoStart: Bool {
         get { bool(forKey: Key.autoStart, default: false) }
         set { defaults.set(newValue, forKey: Key.autoStart) }
+    }
+
+    // MARK: - 快捷笔记（v0.4）
+
+    /// 记笔记时附屏幕截图（默认开；复用屏幕录制权限）
+    var notesIncludeScreenshot: Bool {
+        get { bool(forKey: Key.notesIncludeScreenshot, default: true) }
+        set { defaults.set(newValue, forKey: Key.notesIncludeScreenshot) }
+    }
+
+    /// 同传暂停时仍允许 ⌥N 记笔记（默认开）
+    var notesWhenPaused: Bool {
+        get { bool(forKey: Key.notesWhenPaused, default: true) }
+        set { defaults.set(newValue, forKey: Key.notesWhenPaused) }
     }
 
     var langFrom: String {

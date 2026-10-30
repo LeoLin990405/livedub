@@ -28,6 +28,28 @@ import { PROJECT_ROOT, deepMerge, loadConfig } from '../engine/config.mjs';
 import { createMockDeps } from '../engine/mock.mjs';
 import { buildEventJsonl, parseSessionJsonl } from '../studio/session-parse.mjs';
 import {
+  buildNoteExportFilename,
+  buildNotesMarkdown,
+  buildOutlineMarkdown,
+  buildQuoteMarkdown,
+  buildVideoRef,
+  filterNotes,
+  fnv1aHex,
+  formatNoteTimestamp,
+  formatShortTimestamp,
+  insertAtCursor,
+  localNotesKey,
+  makeQuote,
+  makeVideoId,
+  noteExcerpt,
+  parseTags,
+  renderMarkdown,
+  resolveEditorShortcut,
+  sortNotesByTime,
+  timestampAnchor,
+  videoTitleFrom,
+} from '../studio/notes-kit.mjs';
+import {
   ASR_ENGINE_OPTIONS,
   asrEngineLabel,
   asrPrivacyCopy,
@@ -366,6 +388,11 @@ test('HTTP 静态服务：/ -> /studio/、/studio/ 与 /replay/ 200、缺失 404
     assert.ok(studio.body.includes('音频不离开本机'));
     assert.ok(studio.body.includes('桌面 App'));
     assert.ok(studio.body.includes('data/ui-settings.json'));
+    // v0.4：学习笔记面板（含 ?notes=1 打开入口所需的 DOM）
+    assert.ok(studio.body.includes('学习笔记'));
+    assert.ok(studio.body.includes('notesDrawer'));
+    assert.ok(studio.body.includes('notesEditor'));
+    assert.ok(studio.body.includes('data/notes/'));
 
     const app = await httpRequest(srv.port, '/studio/app.mjs');
     assert.equal(app.status, 200);
@@ -1125,4 +1152,509 @@ test('UI 纯函数（v0.3）：ASR 标签/隐私文案/桌面 App 引导/设置�
   const fallback = mergeSettingsSnapshot({}, 'minimax-cloud');
   assert.equal(fallback.asrProvider, 'minimax-cloud');
   assert.equal(fallback.dubEnabled, true);
+});
+
+
+// ================================================== v0.4 共享 Notes API
+
+const NOTES_VIDEO = {
+  id: 'local-demo-abc123',
+  title: 'Gradient Descent Demo',
+  url: 'http://127.0.0.1:8787/demo/original.mp4',
+  durationMs: 52700,
+};
+
+/** 最小合法 PNG 头（服务端只校验 PNG 签名） */
+function tinyPng(extra = 'payload') {
+  return Buffer.concat([Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]), Buffer.from(extra)]);
+}
+
+async function notesApi(srv, method, pathname, body, headers = {}) {
+  const isRaw = Buffer.isBuffer(body);
+  const response = await fetch(`${srv.url}${pathname}`, {
+    method,
+    headers: {
+      ...(body !== undefined && body !== null ? { 'Content-Type': isRaw ? headers['Content-Type'] ?? 'application/octet-stream' : 'application/json' } : {}),
+      ...headers,
+    },
+    body: body === undefined || body === null ? undefined : isRaw ? body : JSON.stringify(body),
+  });
+  const contentType = String(response.headers.get('content-type') ?? '');
+  const data = contentType.includes('application/json') ? await response.json() : Buffer.from(await response.arrayBuffer());
+  return { status: response.status, headers: response.headers, data };
+}
+
+test('Notes API：CRUD / 列表搜索 / 持久化 / 校验 / 405', async () => {
+  const dataDir = makeTempDir('livedub-notes-crud-');
+  let srv = await startTestServer({ config: testConfig(), dataDir });
+  try {
+    const createPayload = {
+      video: NOTES_VIDEO,
+      tMs: 20000,
+      body: '# 梯度下降\n\n- 反方向走一小步',
+      quotes: [{ t0Ms: 18000, t1Ms: 20000, src: 'We repeat this process.', dst: '我们重复这个过程。' }],
+      tags: ['gradient', 'gd'],
+      kind: 'note',
+      source: 'studio',
+    };
+    let result = await notesApi(srv, 'POST', '/api/notes', createPayload);
+    assert.equal(result.status, 200);
+    assert.equal(result.data.ok, true);
+    const note = result.data.note;
+    assert.match(note.id, /^[A-Za-z0-9._-]+$/);
+    assert.equal(note.video.id, NOTES_VIDEO.id);
+    assert.equal(note.video.title, NOTES_VIDEO.title);
+    assert.equal(note.tMs, 20000);
+    assert.equal(note.body, createPayload.body);
+    assert.equal(note.kind, 'note');
+    assert.equal(note.source, 'studio');
+    assert.equal(note.quotes.length, 1);
+    assert.deepEqual(note.tags, ['gradient', 'gd']);
+    assert.equal(typeof note.createdAt, 'string');
+    assert.equal(typeof note.updatedAt, 'string');
+
+    result = await notesApi(srv, 'GET', `/api/notes?videoId=${encodeURIComponent(NOTES_VIDEO.id)}`);
+    assert.equal(result.status, 200);
+    assert.equal(result.data.notes.length, 1);
+    assert.equal(result.data.videos.length, 1);
+    assert.equal(result.data.videos[0].video.id, NOTES_VIDEO.id);
+    assert.equal(result.data.videos[0].count, 1);
+    assert.equal(typeof result.data.videos[0].updatedAt, 'string');
+
+    // 搜索 body / quotes / tags
+    for (const [query, expected] of [
+      ['梯度下降', 1],
+      ['重复这个过程', 1],
+      ['gradient', 1],
+      ['not-found-xyz', 0],
+    ]) {
+      const searched = await notesApi(srv, 'GET', `/api/notes?videoId=${encodeURIComponent(NOTES_VIDEO.id)}&q=${encodeURIComponent(query)}`);
+      assert.equal(searched.data.notes.length, expected, `q=${query}`);
+    }
+
+    // PUT 部分更新
+    result = await notesApi(srv, 'PUT', `/api/notes/${note.id}`, { body: '# 更新后的笔记', tMs: 21000, tags: ['updated'] });
+    assert.equal(result.status, 200);
+    assert.equal(result.data.note.body, '# 更新后的笔记');
+    assert.equal(result.data.note.tMs, 21000);
+    assert.deepEqual(result.data.note.tags, ['updated']);
+    assert.ok(result.data.note.updatedAt >= note.updatedAt);
+
+    // 第二条笔记 + limit
+    result = await notesApi(srv, 'POST', '/api/notes', { video: NOTES_VIDEO, tMs: 5000, body: 'second note' });
+    assert.equal(result.status, 200);
+    assert.notEqual(result.data.note.id, note.id);
+    const limited = await notesApi(srv, 'GET', `/api/notes?videoId=${encodeURIComponent(NOTES_VIDEO.id)}&limit=1`);
+    assert.equal(limited.data.notes.length, 1);
+    assert.equal(limited.data.total, 2);
+    const allVideos = await notesApi(srv, 'GET', '/api/notes');
+    assert.equal(allVideos.data.notes.length, 2);
+    assert.equal(allVideos.data.videos[0].count, 2);
+
+    // 落盘：data/notes/<slug>.json，文件名安全
+    const notesDir = path.join(dataDir, 'notes');
+    const files = fs.readdirSync(notesDir).filter((file) => file.endsWith('.json'));
+    assert.equal(files.length, 1);
+    assert.match(files[0], /^[A-Za-z0-9._-]+\.json$/);
+    const store = JSON.parse(fs.readFileSync(path.join(notesDir, files[0]), 'utf8'));
+    assert.equal(store.notes.length, 2);
+    assert.equal(store.video.id, NOTES_VIDEO.id);
+
+    // 校验：非法字段/值 400
+    const invalidPayloads = [
+      { video: NOTES_VIDEO, secret: 'leak' },
+      { video: { id: '' }, body: 'x' },
+      { video: NOTES_VIDEO, body: 'x'.repeat(200 * 1024 + 1) },
+      { video: NOTES_VIDEO, tags: Array.from({ length: 21 }, (_, i) => `t${i}`) },
+      { video: NOTES_VIDEO, tags: ['x'.repeat(41)] },
+      { video: NOTES_VIDEO, kind: 'evil' },
+      { video: NOTES_VIDEO, source: 'browser' },
+      { video: NOTES_VIDEO, tMs: -1 },
+      { video: NOTES_VIDEO, imageUrl: '../evil.png' },
+      { video: NOTES_VIDEO, quotes: 'nope' },
+    ];
+    for (const payload of invalidPayloads) {
+      result = await notesApi(srv, 'POST', '/api/notes', payload);
+      assert.equal(result.status, 400, `payload ${JSON.stringify(payload).slice(0, 80)} 应 400`);
+      assert.equal(result.data.ok, false);
+      assert.equal(typeof result.data.error, 'string');
+    }
+    result = await notesApi(srv, 'PUT', `/api/notes/${note.id}`, { video: NOTES_VIDEO });
+    assert.equal(result.status, 400);
+    result = await notesApi(srv, 'PUT', '/api/notes/..%2Fevil', { body: 'x' });
+    assert.equal(result.status, 400);
+    result = await notesApi(srv, 'PUT', '/api/notes/n_does_not_exist', { body: 'x' });
+    assert.equal(result.status, 404);
+    result = await notesApi(srv, 'DELETE', '/api/notes/n_does_not_exist');
+    assert.equal(result.status, 404);
+    // 方法限制
+    result = await notesApi(srv, 'POST', '/api/notes/some-id', {});
+    assert.equal(result.status, 405);
+    result = await notesApi(srv, 'GET', '/api/notes/quick');
+    assert.equal(result.status, 405);
+    result = await notesApi(srv, 'DELETE', '/api/notes');
+    assert.equal(result.status, 405);
+
+    // 删除
+    result = await notesApi(srv, 'DELETE', `/api/notes/${note.id}`);
+    assert.equal(result.status, 200);
+    assert.equal(result.data.deleted, true);
+    result = await notesApi(srv, 'DELETE', `/api/notes/${note.id}`);
+    assert.equal(result.status, 404);
+
+    // 重启后仍能读取持久化笔记
+    await srv.close();
+    srv = await startTestServer({ config: testConfig(), dataDir });
+    const afterRestart = await notesApi(srv, 'GET', `/api/notes?videoId=${encodeURIComponent(NOTES_VIDEO.id)}`);
+    assert.equal(afterRestart.data.notes.length, 1);
+    assert.equal(afterRestart.data.notes[0].body, 'second note');
+  } finally {
+    await srv.close();
+    fs.rmSync(dataDir, { recursive: true, force: true });
+  }
+});
+
+test('Notes API：quick 追加 / PNG assets / export.md / export 写文件 / health 统计', async () => {
+  const dataDir = makeTempDir('livedub-notes-export-');
+  const srv = await startTestServer({ config: testConfig(), dataDir });
+  try {
+    await notesApi(srv, 'POST', '/api/notes', {
+      video: NOTES_VIDEO,
+      tMs: 20000,
+      body: '笔记正文',
+      quotes: [{ src: 'English quote', dst: '中文引用' }],
+      tags: ['demo'],
+    });
+    // quick 追加两次
+    const quick1 = await notesApi(srv, 'POST', '/api/notes/quick', {
+      video: NOTES_VIDEO,
+      tMs: 30000,
+      text: '快速摘录第一条',
+      source: 'extension',
+      tags: ['quick'],
+    });
+    assert.equal(quick1.status, 200);
+    assert.match(quick1.data.path, /quick-\d{4}-\d{2}-\d{2}\.md$/);
+    assert.match(quick1.data.markdown, /快速摘录第一条/);
+    assert.ok(quick1.data.note, 'quick 响应应包含 note');
+    assert.equal(quick1.data.note.kind, 'quick');
+    assert.equal(quick1.data.note.source, 'extension');
+    assert.equal(quick1.data.note.body, '快速摘录第一条');
+    assert.equal(quick1.data.note.tMs, 30000);
+    assert.equal(quick1.data.note.video.id, NOTES_VIDEO.id);
+    const quickFile = path.join(dataDir, 'notes', path.basename(quick1.data.path));
+    assert.ok(fs.existsSync(quickFile));
+    const quick2 = await notesApi(srv, 'POST', '/api/notes/quick', {
+      video: NOTES_VIDEO,
+      tMs: 40000,
+      text: '快速摘录第二条',
+      source: 'macos',
+      quotes: [{ src: 'quote en', dst: '引文' }],
+    });
+    assert.equal(quick2.status, 200);
+    assert.equal(quick2.data.path, quick1.data.path, '同一天追加到同一个 md');
+    const quickContent = fs.readFileSync(quickFile, 'utf8');
+    assert.ok(quickContent.includes('快速摘录第一条'));
+    assert.ok(quickContent.includes('快速摘录第二条'));
+    assert.ok(quickContent.includes('macos'));
+    assert.ok(quickContent.includes('quote en'));
+    assert.equal(quick2.data.note.source, 'macos');
+    assert.deepEqual(quick2.data.note.quotes, [{ src: 'quote en', dst: '引文' }]);
+
+    // quick 也进入 per-video 笔记库：工作台面板 / GET / export 都能看到
+    const quickList = await notesApi(srv, 'GET', `/api/notes?videoId=${encodeURIComponent(NOTES_VIDEO.id)}&limit=500`);
+    assert.equal(quickList.status, 200);
+    assert.equal(quickList.data.notes.length, 3, '1 条普通笔记 + 2 条 quick');
+    const quickNotes = quickList.data.notes.filter((note) => note.kind === 'quick');
+    assert.equal(quickNotes.length, 2);
+    assert.ok(quickNotes.some((note) => note.body === '快速摘录第一条'));
+    assert.equal(quickList.data.videos.length, 1);
+    assert.equal(quickList.data.videos[0].count, 3);
+    assert.equal(quickList.data.videos[0].video.title, NOTES_VIDEO.title);
+    assert.equal(quickList.data.videos[0].video.url, NOTES_VIDEO.url);
+    assert.equal(quickList.data.videos[0].video.durationMs, NOTES_VIDEO.durationMs);
+
+    // PNG 上传/读取
+    const png = tinyPng('asset-content');
+    let result = await notesApi(srv, 'POST', '/api/notes/assets', png, { 'Content-Type': 'image/png' });
+    assert.equal(result.status, 200);
+    assert.match(result.data.url, /^\/api\/notes\/assets\/[A-Za-z0-9._-]+\.png$/);
+    const assetFile = path.join(dataDir, 'notes', 'assets', result.data.url.split('/').pop());
+    assert.ok(fs.existsSync(assetFile));
+    assert.deepEqual(fs.readFileSync(assetFile), png);
+    result = await notesApi(srv, 'GET', result.data.url);
+    assert.equal(result.status, 200);
+    assert.match(String(result.headers.get('content-type')), /image\/png/);
+    assert.deepEqual(result.data, png);
+
+    // assets 安全/校验
+    result = await notesApi(srv, 'POST', '/api/notes/assets', Buffer.from('not png'), { 'Content-Type': 'image/png' });
+    assert.equal(result.status, 400);
+    result = await notesApi(srv, 'POST', '/api/notes/assets', png, { 'Content-Type': 'text/plain' });
+    assert.equal(result.status, 415);
+    result = await notesApi(srv, 'POST', '/api/notes/assets', Buffer.alloc(4 * 1024 * 1024 + 16, 0x41), { 'Content-Type': 'image/png' });
+    assert.equal(result.status, 413);
+    result = await notesApi(srv, 'GET', '/api/notes/assets/..%2F..%2Fdata%2Fui-settings.json');
+    assert.equal(result.status, 403);
+    result = await notesApi(srv, 'GET', '/api/notes/assets/nope.png');
+    assert.equal(result.status, 404);
+
+    // export.md
+    result = await notesApi(srv, 'GET', `/api/notes/export.md?videoId=${encodeURIComponent(NOTES_VIDEO.id)}`);
+    assert.equal(result.status, 200);
+    assert.match(String(result.headers.get('content-type')), /text\/markdown/);
+    assert.match(String(result.headers.get('content-disposition')), /attachment/);
+    const markdown = result.data.toString('utf8');
+    assert.match(markdown, /^---\n/);
+    assert.ok(markdown.includes(NOTES_VIDEO.title));
+    assert.ok(markdown.includes('[00:00:20](?t=20000)'));
+    assert.ok(markdown.includes('English quote'));
+    assert.ok(markdown.includes('中文引用'));
+    assert.ok(markdown.includes('标签：demo'));
+    assert.ok(markdown.includes('快速摘录第一条'), '导出应包含 quick 笔记');
+    assert.ok(markdown.includes('快速摘录第二条'));
+    result = await notesApi(srv, 'GET', '/api/notes/export.md');
+    assert.equal(result.status, 400);
+
+    // export 写 data/exports
+    result = await notesApi(srv, 'POST', '/api/notes/export', { videoId: NOTES_VIDEO.id });
+    assert.equal(result.status, 200);
+    assert.match(result.data.path, /(?:^data\/exports\/|[\\/]exports\/)[A-Za-z0-9._-]+-\d{4}-\d{2}-\d{2}\.md$/);
+    const exported = path.isAbsolute(result.data.path) ? result.data.path : path.join(PROJECT_ROOT, result.data.path);
+    assert.ok(fs.existsSync(exported));
+    assert.ok(fs.readFileSync(exported, 'utf8').includes('笔记正文'));
+    fs.rmSync(exported, { force: true });
+
+    // /health 与 /api/config 的 notes 统计（不带内容）
+    const health = await (await fetch(`${srv.url}/health`)).json();
+    assert.equal(typeof health.notes, 'object');
+    assert.equal(health.notes.count, 3, 'quick 也应计入笔记统计');
+    assert.equal(health.notes.videos, 1);
+    assert.match(String(health.notes.notesDir), /notes$/);
+    assert.match(String(health.notes.exportsDir), /exports$/);
+    assert.ok(!JSON.stringify(health.notes).includes('笔记正文'));
+    const configBody = await (await fetch(`${srv.url}/api/config`)).json();
+    assert.equal(configBody.config.runtime.notes.count, 3);
+  } finally {
+    await srv.close();
+    fs.rmSync(dataDir, { recursive: true, force: true });
+  }
+});
+
+test('Notes API：并发写串行化（不丢笔记/不损坏文件）', async () => {
+  const dataDir = makeTempDir('livedub-notes-concurrent-');
+  const srv = await startTestServer({ config: testConfig(), dataDir });
+  try {
+    const results = await Promise.all(
+      Array.from({ length: 12 }, (_, index) =>
+        notesApi(srv, 'POST', '/api/notes', { video: NOTES_VIDEO, tMs: index * 1000, body: `并发笔记 ${index}` }),
+      ),
+    );
+    assert.deepEqual([...new Set(results.map((item) => item.status))], [200]);
+    const ids = new Set(results.map((item) => item.data.note?.id));
+    assert.equal(ids.size, 12);
+    const list = await notesApi(srv, 'GET', `/api/notes?videoId=${encodeURIComponent(NOTES_VIDEO.id)}&limit=500`);
+    assert.equal(list.data.notes.length, 12);
+
+    // 并发 PUT 同一笔记：不损坏 JSON，最终 body 为其中一次写入
+    const target = results[0].data.note.id;
+    const patches = await Promise.all(
+      Array.from({ length: 8 }, (_, index) => notesApi(srv, 'PUT', `/api/notes/${target}`, { body: `patch-${index}` })),
+    );
+    assert.deepEqual([...new Set(patches.map((item) => item.status))], [200]);
+    const finalList = await notesApi(srv, 'GET', `/api/notes?videoId=${encodeURIComponent(NOTES_VIDEO.id)}&limit=500`);
+    const targetNote = finalList.data.notes.find((note) => note.id === target);
+    assert.match(targetNote.body, /^patch-[0-7]$/);
+    const notesDir = path.join(dataDir, 'notes');
+    for (const file of fs.readdirSync(notesDir).filter((name) => name.endsWith('.json'))) {
+      JSON.parse(fs.readFileSync(path.join(notesDir, file), 'utf8')); // 能解析即未损坏
+    }
+  } finally {
+    await srv.close();
+    fs.rmSync(dataDir, { recursive: true, force: true });
+  }
+});
+
+test('Notes 纯函数：视频身份 / Markdown 渲染 / 导出 / 大纲 / 时间戳 / 快捷键', () => {
+  // 视频身份稳定
+  const idA = makeVideoId({ name: 'lecture.mp4', size: 12345 });
+  const idB = makeVideoId({ name: 'lecture.mp4', size: 12345 });
+  assert.equal(idA, idB);
+  assert.match(idA, /^local-[0-9a-f]{8}$/);
+  assert.notEqual(idA, makeVideoId({ name: 'lecture.mp4', size: 54321 }));
+  assert.match(makeVideoId({ url: 'https://example.com/a.mp4#t=100' }), /^url-[0-9a-f]{8}$/);
+  assert.equal(makeVideoId({ url: 'https://example.com/a.mp4#t=100' }), makeVideoId({ url: 'https://example.com/a.mp4' }));
+  assert.notEqual(makeVideoId({ url: 'https://example.com/a.mp4' }), makeVideoId({ url: 'https://example.com/b.mp4' }));
+  assert.equal(videoTitleFrom({ name: 'demo.mp4' }), 'demo.mp4');
+  assert.equal(videoTitleFrom({ url: 'https://example.com/x/lecture.mp4' }), 'lecture.mp4');
+  assert.deepEqual(buildVideoRef({ id: 'local-1', title: 'T', url: 'https://e/x', durationMs: 1000 }), {
+    id: 'local-1',
+    title: 'T',
+    url: 'https://e/x',
+    durationMs: 1000,
+  });
+  assert.equal(fnv1aHex('livedub'), fnv1aHex('livedub'));
+  assert.notEqual(fnv1aHex('a'), fnv1aHex('b'));
+
+  // 时间戳
+  assert.equal(formatNoteTimestamp(0), '00:00:00');
+  assert.equal(formatNoteTimestamp(754000), '00:12:34');
+  assert.equal(formatShortTimestamp(754000), '12:34');
+  assert.equal(timestampAnchor(754000), '[00:12:34](?t=754000)');
+  assert.equal(formatNoteTimestamp(-100), '00:00:00');
+
+  // Markdown 渲染（安全转义 + 常见语法）
+  const html = renderMarkdown('# 标题\n\n- a\n- b\n\n**粗体** 和 *斜体* 和 `code`\n\n[链接](https://example.com) ![图](/api/notes/assets/x.png)\n\n> 引用\n\n```js\nconst a = 1 < 2;\n```');
+  assert.match(html, /<h1>标题<\/h1>/);
+  assert.match(html, /<ul>\n<li>a<\/li>\n<li>b<\/li>\n<\/ul>/);
+  assert.match(html, /<strong>粗体<\/strong>/);
+  assert.match(html, /<em>斜体<\/em>/);
+  assert.match(html, /<code>code<\/code>/);
+  assert.match(html, /<a href="https:\/\/example.com"/);
+  assert.match(html, /<img src="\/api\/notes\/assets\/x.png"/);
+  assert.match(html, /<blockquote>/);
+  assert.match(html, /<pre><code class="language-js">const a = 1 &lt; 2;/);
+  assert.match(renderMarkdown('<script>alert(1)</script>'), /&lt;script&gt;/);
+  assert.doesNotMatch(renderMarkdown('<script>alert(1)</script>'), /<script>/);
+  assert.doesNotMatch(renderMarkdown('[bad](javascript:alert(1))'), /href="javascript:/);
+  assert.equal(renderMarkdown(''), '');
+
+  // 插入/标签/搜索
+  assert.deepEqual(insertAtCursor('abc', 'X', 1, 2), { value: 'a\nX\nc', selectionStart: 3, selectionEnd: 3 });
+  assert.deepEqual(parseTags('a, b、c; a\n d'), ['a', 'b', 'c', 'd']);
+  assert.deepEqual(parseTags('x'.repeat(50)), ['x'.repeat(40)]);
+  const notes = [
+    { id: '1', tMs: 5000, body: 'alpha gradient', tags: ['ml'], quotes: [{ src: 'quote one' }] },
+    { id: '2', tMs: 1000, body: 'beta', tags: [] },
+    { id: '3', tMs: 1000, body: 'gamma', tags: ['opt'] },
+  ];
+  assert.deepEqual(sortNotesByTime(notes).map((note) => note.id), ['2', '3', '1']);
+  assert.deepEqual(filterNotes(notes, 'gradient').map((note) => note.id), ['1']);
+  assert.deepEqual(filterNotes(notes, 'quote').map((note) => note.id), ['1']);
+  assert.deepEqual(filterNotes(notes, 'opt').map((note) => note.id), ['3']);
+  assert.deepEqual(filterNotes(notes, '').length, 3);
+  assert.match(noteExcerpt(notes[0]), /alpha gradient/);
+  assert.equal(
+    noteExcerpt({ body: '---\ntitle: "x"\nvideoId: "v"\n---\n\n# 大纲标题\n\n内容' }),
+    '大纲标题 内容',
+    '列表摘要应跳过 YAML front matter',
+  );
+  assert.equal(localNotesKey('v1'), 'livedub.notes.v1:v1');
+  assert.deepEqual(makeQuote({ src: 'en', dst: '中', t0Ms: 10, t1Ms: 20 }), { t0Ms: 10, t1Ms: 20, src: 'en', dst: '中' });
+  assert.equal(buildQuoteMarkdown({ src: 'en', dst: '中' }), '> 原文：en\n> 译文：中');
+
+  // 导出 Markdown（YAML front matter + 时间戳 anchor + 截图/标签）
+  const exported = buildNotesMarkdown({
+    video: { id: 'local-1', title: 'Demo Talk', url: 'https://e/x', durationMs: 60000 },
+    notes: [{ id: '1', tMs: 20000, body: '正文', tags: ['a'], imageUrl: '/api/notes/assets/x.png', quotes: [{ src: 'en', dst: '中' }] }],
+    date: new Date('2026-01-02T00:00:00Z'),
+  });
+  assert.match(exported, /^---\n/);
+  assert.match(exported, /title: "Demo Talk"/);
+  assert.match(exported, /url: "https:\/\/e\/x"/);
+  assert.match(exported, /date: 2026-01-02/);
+  assert.match(exported, /\[00:00:20\]\(\?t=20000\)/);
+  assert.match(exported, /!\[截图\]\(\/api\/notes\/assets\/x\.png\)/);
+  assert.match(exported, /标签：a/);
+  assert.equal(buildNoteExportFilename('Demo Talk / v1', new Date('2026-01-02T00:00:00Z')), 'Demo-Talk-v1-notes-2026-01-02.md');
+
+  // 大纲
+  const outline = buildOutlineMarkdown({
+    video: { id: 'local-1', title: 'Demo', url: 'https://e/x' },
+    segments: [
+      { t0Ms: 61000, t1Ms: 62000, text: 'Second', translation: '第二' },
+      { t0Ms: 0, t1Ms: 1000, text: 'First', translation: '第一' },
+    ],
+    date: new Date('2026-01-02T00:00:00Z'),
+  });
+  assert.match(outline, /# Demo · 课程大纲/);
+  assert.match(outline, /## 1\. \[00:00:00\]\(\?t=0\)/);
+  assert.match(outline, /## 2\. \[00:01:01\]\(\?t=61000\)/);
+  assert.match(outline, /- 原文：First/);
+  assert.match(outline, /- 译文：第一/);
+  assert.ok(outline.indexOf('First') < outline.indexOf('Second'));
+
+  // 快捷键
+  assert.equal(resolveEditorShortcut({ ctrlKey: true, key: 'Enter', code: 'Enter' }), 'save');
+  assert.equal(resolveEditorShortcut({ metaKey: true, key: 'Enter', code: 'Enter' }), 'save');
+  assert.equal(resolveEditorShortcut({ ctrlKey: true, shiftKey: true, key: 'C', code: 'KeyC' }), 'codeblock');
+  assert.equal(resolveEditorShortcut({ key: 'Enter', code: 'Enter' }), null);
+  assert.equal(resolveShortcut({ preventDefault: false, ctrlKey: false, metaKey: false, altKey: false, repeat: false, code: 'KeyN', key: 'n' }), 'new-note');
+  assert.equal(resolveShortcut({ code: 'KeyN', key: 'n' }, { editable: true }), null);
+});
+
+
+test('Notes API：quick -> 笔记库 -> GET -> export 链路（扩展/CLI 快捷笔记可见）', async () => {
+  const dataDir = makeTempDir('livedub-notes-quick-chain-');
+  const srv = await startTestServer({ config: testConfig(), dataDir });
+  try {
+    const video = {
+      id: 'local-quick-chain',
+      title: 'Quick Capture Lecture',
+      url: 'https://example.com/lecture.mp4',
+      durationMs: 120000,
+    };
+    // 先按扩展流程上传截图，再带 imageUrl quick
+    const png = tinyPng('quick-shot');
+    const asset = await notesApi(srv, 'POST', '/api/notes/assets', png, { 'Content-Type': 'image/png' });
+    assert.equal(asset.status, 200);
+    const quick = await notesApi(srv, 'POST', '/api/notes/quick', {
+      video,
+      tMs: 65000,
+      text: '扩展快捷笔记：这段讲学习率',
+      quotes: [{ t0Ms: 63000, t1Ms: 65000, src: 'The learning rate controls the step size.', dst: '学习率控制步长。' }],
+      source: 'extension',
+      tags: ['extension', 'quick'],
+      imageUrl: asset.data.url,
+    });
+    assert.equal(quick.status, 200);
+    assert.ok(quick.data.note?.id);
+    assert.equal(quick.data.note.kind, 'quick');
+    assert.equal(quick.data.note.source, 'extension');
+    assert.equal(quick.data.note.body, '扩展快捷笔记：这段讲学习率');
+    assert.equal(quick.data.note.imageUrl, asset.data.url);
+    assert.equal(quick.data.note.tMs, 65000);
+    assert.equal(quick.data.note.video.title, video.title);
+    assert.equal(quick.data.note.video.url, video.url);
+    assert.equal(quick.data.note.video.durationMs, video.durationMs);
+
+    // GET /api/notes?videoId= 能看到 quick 笔记 + video 元信息
+    const list = await notesApi(srv, 'GET', `/api/notes?videoId=${encodeURIComponent(video.id)}`);
+    assert.equal(list.status, 200);
+    assert.equal(list.data.notes.length, 1);
+    assert.equal(list.data.notes[0].kind, 'quick');
+    assert.equal(list.data.videos.length, 1);
+    assert.equal(list.data.videos[0].video.title, video.title);
+    assert.equal(list.data.videos[0].video.url, video.url);
+    assert.equal(list.data.videos[0].video.durationMs, video.durationMs);
+    assert.equal(list.data.videos[0].count, 1);
+
+    // 导出能看到 quick
+    const exported = await notesApi(srv, 'GET', `/api/notes/export.md?videoId=${encodeURIComponent(video.id)}`);
+    assert.equal(exported.status, 200);
+    const markdown = exported.data.toString('utf8');
+    assert.ok(markdown.includes('扩展快捷笔记：这段讲学习率'));
+    assert.ok(markdown.includes('The learning rate controls the step size.'));
+    assert.ok(markdown.includes(asset.data.url));
+
+    // health / config 统计包含 quick
+    const health = await (await fetch(`${srv.url}/health`)).json();
+    assert.equal(health.notes.count, 1);
+    assert.equal(health.notes.videos, 1);
+
+    // 同一个 quick 同时写入每日 markdown
+    const quickPath = path.isAbsolute(quick.data.path) ? quick.data.path : path.join(PROJECT_ROOT, quick.data.path);
+    assert.ok(fs.existsSync(quickPath));
+    assert.ok(fs.readFileSync(quickPath, 'utf8').includes('扩展快捷笔记'));
+
+    // PUT 可以更新 quick 笔记（工作台编辑历史快捷笔记）
+    const updated = await notesApi(srv, 'PUT', `/api/notes/${quick.data.note.id}`, { body: '更新后的 quick 笔记' });
+    assert.equal(updated.status, 200);
+    assert.equal(updated.data.note.kind, 'quick');
+    const afterUpdate = await notesApi(srv, 'GET', `/api/notes?videoId=${encodeURIComponent(video.id)}`);
+    assert.equal(afterUpdate.data.notes[0].body, '更新后的 quick 笔记');
+  } finally {
+    await srv.close();
+    fs.rmSync(dataDir, { recursive: true, force: true });
+  }
 });

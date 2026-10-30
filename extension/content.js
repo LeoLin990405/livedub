@@ -17,6 +17,10 @@
  * - 裸 <video> 全屏：与 MAIN world 的 page-hook.js 通过 window.postMessage 协作，
  *   由 page-hook 把裸 video 包进容器再全屏，content 负责把浮层迁进该容器。
  *
+ * v0.4 边看边写笔记：缓存最近一句双语字幕（停止抓音后仍可用），向 background 提供
+ * 当前视频/时间/字幕上下文；浮层面板「记笔记」按钮 + 全局快捷键 Alt+Shift+N，
+ * 结果显示为浮层 toast（成功/离线排队/截图失败）。
+ *
  * 只做「显示 + 压音」，不直接连引擎：从 background 的 runtime 消息增量更新。
  * 为什么是 classic script：MV3 content_scripts 不能 import ESM。因此这里内联了与
  * extension/lib/{pcm,ui,constants,srt}.js 等价的少量纯逻辑（有注释标注），
@@ -43,6 +47,9 @@
     CONTENT_TOGGLE: 'livedub:toggle-capture',
     GET_SRT: 'livedub:get-srt',
     RECONNECT: 'livedub:reconnect',
+    CAPTURE_NOTE: 'livedub:capture-note',
+    NOTE_CONTEXT: 'livedub:note-context',
+    NOTE_RESULT: 'livedub:note-result',
   };
   const STORAGE_SETTINGS_KEY = 'livedub:settings';
   const DEFAULT_SETTINGS = {
@@ -61,6 +68,7 @@
     globalDuck: true,
     duckRecoverMs: 800,
     fullscreenWorkaround: true,
+    noteScreenshot: true,
     langFrom: 'en',
     langTo: 'zh',
     hidden: false,
@@ -109,6 +117,9 @@
     fullscreenHintShown: false,
     pageHookConfigKey: '',
     pageHookWrappedHinted: false,
+    /** v0.4：最近一句双语字幕缓存（停止抓音后记笔记仍可用） */
+    lastCaption: null, // {src,dst,t0Ms,t1Ms,updatedAt}
+    toastTimer: null,
   };
 
   const now = () => (typeof performance !== 'undefined' && performance.now ? performance.now() : Date.now());
@@ -147,6 +158,7 @@
     merged.captureReplay = merged.captureReplay !== false;
     merged.globalDuck = merged.globalDuck !== false;
     merged.fullscreenWorkaround = merged.fullscreenWorkaround !== false;
+    merged.noteScreenshot = merged.noteScreenshot !== false;
     merged.duckRecoverMs = Math.round(clampNumber(merged.duckRecoverMs, DUCK_RECOVER_MS_MIN, DUCK_RECOVER_MS_MAX, 800));
     merged.panelPos =
       merged.panelPos && typeof merged.panelPos === 'object'
@@ -362,6 +374,20 @@
     .livedub-error[data-kind="info"] {
       background: rgba(90, 169, 255, 0.16); border-color: rgba(90, 169, 255, 0.38); color: #cfe4ff;
     }
+    .livedub-toast {
+      position: fixed; top: 58px; left: 50%; transform: translateX(-50%);
+      max-width: min(72vw, 720px);
+      padding: 8px 14px; border-radius: 999px;
+      background: rgba(20, 24, 34, 0.92);
+      border: 1px solid rgba(255, 255, 255, 0.16);
+      box-shadow: 0 8px 24px rgba(0, 0, 0, 0.42);
+      color: #eaf0ff; font-size: 12.5px; line-height: 1.35;
+      pointer-events: none; white-space: pre-line; text-align: center;
+      backdrop-filter: blur(8px);
+    }
+    .livedub-toast[hidden] { display: none; }
+    .livedub-toast[data-kind="warn"] { border-color: rgba(245, 185, 63, 0.5); color: #ffe6b8; }
+    .livedub-toast[data-kind="error"] { border-color: rgba(255, 92, 108, 0.5); color: #ffd3d7; }
     .livedub-subs {
       position: fixed; left: 50%; bottom: 8vh;
       transform: translateX(-50%);
@@ -454,6 +480,10 @@
             <div class="row"><label>背景 <select data-set="subsBg"><option value="dark">深色</option><option value="light">浅色</option><option value="none">无背景</option></select></label></div>
             <div class="row"><label>不透明度 <input type="range" data-set="subsOpacity" min="0.2" max="1" step="0.02" /></label><span class="val" data-val="subsOpacity"></span></div>
             <div class="row"><label><input type="checkbox" data-set="fullscreenWorkaround" /> video 全屏兼容（包裹容器）</label></div>
+            <div class="row note-row">
+              <label><input type="checkbox" data-set="noteScreenshot" /> 附页面截图</label>
+              <button type="button" data-act="note">记笔记</button>
+            </div>
             <div class="livedub-guide" data-part="guide" hidden>
               <div class="guide-title" data-part="guide-title"></div>
               <div class="guide-body" data-part="guide-body"></div>
@@ -468,10 +498,11 @@
               <button type="button" data-act="export">导出 SRT</button>
               <button type="button" data-act="hide">隐藏浮层</button>
             </div>
-            <div class="hint">开始/停止需要用户手势；点工具栏 livedub 图标在弹窗操作更稳。字幕可拖动，位置/样式自动保存。</div>
+            <div class="hint">Alt+Shift+N 记笔记（可附截图）· Alt+Shift+L 开始/停止。开始/停止需要用户手势；字幕可拖动，位置/样式自动保存。</div>
             <div class="livedub-error" data-part="error" hidden></div>
           </div>
         </div>
+        <div class="livedub-toast" data-part="toast" data-kind="ok" hidden></div>
         <div class="livedub-subs" data-part="subs" hidden><div class="livedub-sub-list" data-part="sublist"></div></div>
       </div>`;
 
@@ -493,6 +524,7 @@
       error: shadow.querySelector('[data-part="error"]'),
       subs: shadow.querySelector('[data-part="subs"]'),
       sublist: shadow.querySelector('[data-part="sublist"]'),
+      toast: shadow.querySelector('[data-part="toast"]'),
     };
     bindOverlayEvents();
     applyOverlayVisibility();
@@ -720,6 +752,9 @@
         break;
       case 'dock-top':
         void saveSettings({ dock: 'top' });
+        break;
+      case 'note':
+        void captureNote();
         break;
       default:
         break;
@@ -1162,8 +1197,108 @@
     if (latency.length > 0) lines.push(`延迟 ${latency.join(' · ')}`);
     const count = (runtime.bgState && runtime.bgState.captionCount) || 0;
     if (count > 0) lines.push(`本次字幕 ${count} 条（可导出 SRT）`);
+    const noteStats = runtime.bgState && runtime.bgState.noteStats;
+    if (noteStats && noteStats.count > 0) lines.push(`今日笔记 ${noteStats.count} 条`);
+    const noteQueueCount = (runtime.bgState && runtime.bgState.noteQueueCount) || 0;
+    if (noteQueueCount > 0) lines.push(`离线待同步笔记 ${noteQueueCount} 条`);
     meta.hidden = lines.length === 0;
     meta.textContent = lines.join('\n');
+  }
+
+  /** v0.4：浮层 toast（记笔记结果等），2.6s 自动消失 */
+  function showToast(message, kind = 'ok', durationMs = 2600) {
+    const toast = runtime.els.toast;
+    if (!toast) return;
+    if (runtime.toastTimer) clearTimeout(runtime.toastTimer);
+    toast.hidden = false;
+    toast.setAttribute('data-kind', kind);
+    toast.textContent = String(message || '');
+    runtime.toastTimer = setTimeout(() => {
+      runtime.toastTimer = null;
+      if (runtime.els.toast) runtime.els.toast.hidden = true;
+    }, Math.max(800, durationMs));
+  }
+
+  /** 找页面主视频（优先正在播放、其次有 duration 的） */
+  function findPrimaryVideo() {
+    let videos = [];
+    try {
+      videos = [...document.querySelectorAll('video')];
+    } catch {
+      videos = [];
+    }
+    if (videos.length === 0) return null;
+    const playing = videos.find((video) => !video.paused && video.readyState > 0);
+    if (playing) return playing;
+    const withDuration = videos.find((video) => Number.isFinite(video.duration) && video.duration > 0);
+    return withDuration || videos[0] || null;
+  }
+
+  /** 缓存最近一句字幕（partial/segment/translation 增量合并，停止抓音后仍可用） */
+  function trackCaption(event) {
+    if (!event || typeof event !== 'object') return;
+    const id = `u:${event.id ?? ''}`;
+    let caption = runtime.lastCaption;
+    if (!caption || caption.id !== id) {
+      caption = { id, src: '', dst: '', t0Ms: null, t1Ms: null, updatedAt: now() };
+      runtime.lastCaption = caption;
+    }
+    if (event.type === 'partial' || event.type === 'segment') {
+      if (event.text != null) caption.src = cleanText(event.text, 600);
+    }
+    if (event.type === 'segment') {
+      if (Number.isFinite(event.t0Ms)) caption.t0Ms = Math.round(event.t0Ms);
+      if (Number.isFinite(event.t1Ms)) caption.t1Ms = Math.round(event.t1Ms);
+    }
+    if (event.type === 'translation' && event.text != null) {
+      caption.dst = cleanText(event.text, 600);
+    }
+    caption.updatedAt = now();
+  }
+
+  /** background 记笔记时请求的上下文（视频/时间轴/最近一句双语字幕） */
+  function buildNoteContext() {
+    const video = findPrimaryVideo();
+    const caption = runtime.lastCaption;
+    const currentMs = video && Number.isFinite(video.currentTime) ? Math.round(video.currentTime * 1000) : null;
+    const tMs = currentMs != null ? currentMs : caption && Number.isFinite(caption.t1Ms) ? caption.t1Ms : 0;
+    const durationMs =
+      video && Number.isFinite(video.duration) && video.duration > 0 ? Math.round(video.duration * 1000) : undefined;
+    const quotes =
+      caption && (caption.src || caption.dst)
+        ? [{ t0Ms: caption.t0Ms ?? undefined, t1Ms: caption.t1Ms ?? undefined, src: caption.src, dst: caption.dst }]
+        : [];
+    return {
+      ok: true,
+      context: {
+        url: location.href,
+        title: document.title,
+        durationMs: durationMs || 0,
+        tMs,
+        text: (caption && (caption.dst || caption.src)) || '（无字幕）',
+        quotes,
+        hasVideo: !!video,
+        capturing: isActive(),
+      },
+    };
+  }
+
+  /** 面板「记笔记」按钮：交给 background 处理截图 + POST（需要用户手势已由点击提供） */
+  async function captureNote() {
+    try {
+      const response = await chrome.runtime.sendMessage({
+        type: M.CAPTURE_NOTE,
+        withScreenshot: runtime.settings.noteScreenshot !== false,
+        trigger: 'overlay',
+      });
+      if (response && response.ok) {
+        showToast(response.toast || '已记笔记', response.queued ? 'warn' : 'ok');
+      } else {
+        showToast((response && response.error && response.error.message) || '记笔记失败，请重试', 'error', 5200);
+      }
+    } catch (err) {
+      showToast(`记笔记失败：${String((err && err.message) || err)}`, 'error', 5200);
+    }
   }
 
   function showError(message, kind = 'error') {
@@ -1257,9 +1392,11 @@
         renderStatus();
         break;
       case 'partial':
+        trackCaption(event);
         upsertItem(`u:${event.id ?? 'partial'}`, { src: event.text, draft: true });
         break;
       case 'segment': {
+        trackCaption(event);
         const key = `u:${event.id ?? 'segment'}`;
         if (!runtime.items.has(key)) {
           const last = [...runtime.items.values()].pop();
@@ -1269,6 +1406,7 @@
         break;
       }
       case 'translation':
+        trackCaption(event);
         upsertItem(`u:${event.id ?? 'segment'}`, { dst: event.text, draft: event.final === false });
         break;
       case 'dub':
@@ -1416,6 +1554,16 @@
         handleEngineEvent(message.event);
         sendResponse({ ok: true });
         return false;
+      case M.NOTE_CONTEXT:
+        sendResponse(buildNoteContext());
+        return false;
+      case M.NOTE_RESULT: {
+        const result = message.result || {};
+        if (result.toast) showToast(result.toast, result.queued ? 'warn' : 'ok');
+        else if (result.ok) showToast('已记笔记', 'ok');
+        sendResponse({ ok: true });
+        return false;
+      }
       default:
         return false;
     }

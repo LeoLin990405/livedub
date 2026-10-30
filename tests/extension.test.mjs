@@ -99,6 +99,23 @@ import {
   suggestSrtFilename,
 } from '../extension/lib/srt.js';
 import {
+  NOTE_QUEUE_LIMIT,
+  buildNoteToastText,
+  buildQuickNoteMarkdown,
+  buildQuickNoteRequest,
+  buildVideoIdentity,
+  computeVideoId,
+  createNoteQueue,
+  formatTimecode,
+  nextDailyStats,
+  normalizeVideoUrl,
+  notesEndpoint,
+  parseNotesListResponse,
+  readDailyCount,
+  resolveAssetUrl,
+  toDateKey,
+} from '../extension/lib/notes.js';
+import {
   PROTOCOL_VERSION as ENGINE_PROTOCOL_VERSION,
   decodeAudioFrame as engineDecodeAudioFrame,
   encodeAudioFrame as engineEncodeAudioFrame,
@@ -156,7 +173,7 @@ test('manifest：合法的 MV3 清单，background 为 module service worker + a
   assert.equal(typeof manifest.name, 'string');
   assert.ok(manifest.name.length > 0);
   assert.match(manifest.version, /^\d+\.\d+\.\d+$/);
-  assert.match(manifest.version, /^0\.3\./, 'v0.3 迭代应把扩展版本提升到 0.3.x');
+  assert.match(manifest.version, /^0\.4\./, 'v0.4 迭代应把扩展版本提升到 0.4.x');
   assert.equal(manifest.background.service_worker, 'background.js');
   assert.equal(manifest.background.type, 'module', 'service worker 必须是 type: module，background.js 里用了 ESM import');
   assert.equal(manifest.action.default_popup, 'popup.html');
@@ -228,6 +245,11 @@ test('manifest：没有远程代码 / 外部资源 / 放开 CSP', () => {
   assert.equal(manifest.sandbox, undefined);
   // 必须声明快捷键（用户手势入口之一）
   assert.ok(manifest.commands && manifest.commands['toggle-capture'], '缺少 toggle-capture 快捷键');
+  // v0.4：Alt+Shift+N 记笔记（command 属于用户手势，允许 captureVisibleTab）
+  const noteCommand = manifest.commands['capture-note'];
+  assert.ok(noteCommand, '缺少 capture-note 快捷键');
+  assert.equal(noteCommand.suggested_key.default, 'Alt+Shift+N');
+  assert.equal(noteCommand.suggested_key.mac, 'Alt+Shift+N');
 });
 
 // ===========================================================================
@@ -247,6 +269,7 @@ test('扩展文件齐全（background/offscreen/content/popup/lib/worklet/README
     'lib/constants.js',
     'lib/ui.js',
     'lib/srt.js',
+    'lib/notes.js',
     'page-hook.js',
     'worklet/pcm-worklet.js',
     'README.md',
@@ -255,7 +278,7 @@ test('扩展文件齐全（background/offscreen/content/popup/lib/worklet/README
 });
 
 test('所有扩展 JS 通过 node --check 语法检查', () => {
-  assert.ok(JS_FILES.length >= 10, `期望至少 10 个 JS 文件，实际 ${JS_FILES.length}`);
+  assert.ok(JS_FILES.length >= 11, `期望至少 11 个 JS 文件，实际 ${JS_FILES.length}`);
   for (const rel of JS_FILES) {
     const result = spawnSync(process.execPath, ['--check', join(EXT, rel)], { encoding: 'utf8' });
     assert.equal(result.status, 0, `node --check 失败: extension/${rel}\n${result.stderr || ''}`);
@@ -298,7 +321,7 @@ test('lib/*.js 是浏览器/Node 双端纯模块（不依赖 node: 内置模块�
   // 注释里可以出现 chrome.xxx 的说明，只检查真实代码（先去掉注释）
   const stripComments = (code) =>
     code.replace(/\/\*[\s\S]*?\*\//g, '').replace(/(^|[^:])\/\/.*$/gm, '$1');
-  for (const rel of ['lib/pcm.js', 'lib/constants.js', 'lib/ui.js', 'lib/srt.js']) {
+  for (const rel of ['lib/pcm.js', 'lib/constants.js', 'lib/ui.js', 'lib/srt.js', 'lib/notes.js']) {
     const raw = readExt(rel);
     const code = stripComments(raw);
     assert.ok(!/from\s+['"]node:/.test(code), `extension/${rel} 不应 import node: 模块`);
@@ -526,6 +549,11 @@ test('README 覆盖安装/权限/排障/手动测试清单', () => {
     '双声',
     '全屏兼容',
     '原声重放',
+    'Alt+Shift+N',
+    '笔记',
+    'Obsidian',
+    '离线队列',
+    '截图',
   ]) {
     assert.ok(source.readme.includes(keyword), `README 缺少内容: ${keyword}`);
   }
@@ -541,7 +569,7 @@ test('消息类型：background/offscreen/popup 走 MSG 常量，content 内联�
   const constantUsers = {
     background: [
       'GET_STATE', 'START', 'STOP', 'CONTENT_READY', 'CONTENT_TOGGLE', 'SET_SETTINGS', 'CONFIG_PATCH',
-      'GET_SRT', 'RECONNECT', 'STATE', 'ENGINE_EVENT', 'CONTENT_SETTINGS', 'PING',
+      'GET_SRT', 'RECONNECT', 'CAPTURE_NOTE', 'EXPORT_NOTES', 'NOTE_CONTEXT', 'STATE', 'ENGINE_EVENT', 'CONTENT_SETTINGS', 'PING',
       'OFFSCREEN_HELLO', 'OFFSCREEN_START', 'OFFSCREEN_STOP', 'OFFSCREEN_CONFIG',
       'OFFSCREEN_STATE', 'OFFSCREEN_EVENT', 'OFFSCREEN_STOPPED', 'OFFSCREEN_PING',
     ],
@@ -549,7 +577,7 @@ test('消息类型：background/offscreen/popup 走 MSG 常量，content 内联�
       'OFFSCREEN_HELLO', 'OFFSCREEN_START', 'OFFSCREEN_STOP', 'OFFSCREEN_CONFIG',
       'OFFSCREEN_STATE', 'OFFSCREEN_EVENT', 'OFFSCREEN_STOPPED', 'OFFSCREEN_PING', 'OFFSCREEN_RECONNECT',
     ],
-    popup: ['GET_STATE', 'START', 'STOP', 'STATE', 'GET_SRT', 'RECONNECT'],
+    popup: ['GET_STATE', 'START', 'STOP', 'STATE', 'GET_SRT', 'RECONNECT', 'CAPTURE_NOTE', 'EXPORT_NOTES'],
   };
   for (const [file, keys] of Object.entries(constantUsers)) {
     const code = source[file];
@@ -568,6 +596,9 @@ test('消息类型：background/offscreen/popup 走 MSG 常量，content 内联�
     MSG.CONTENT_SETTINGS,
     MSG.GET_SRT,
     MSG.RECONNECT,
+    MSG.CAPTURE_NOTE,
+    MSG.NOTE_CONTEXT,
+    MSG.NOTE_RESULT,
     STORAGE_KEYS.settings,
   ];
   for (const value of contentLiteralTypes) {
@@ -900,9 +931,13 @@ test('constants：默认设置符合契约（16k 引擎 / 配音开 / 压音 0.1
   assert.equal(DEFAULT_SETTINGS.globalDuck, true);
   assert.equal(DEFAULT_SETTINGS.duckRecoverMs, 800);
   assert.equal(DEFAULT_SETTINGS.fullscreenWorkaround, true);
+  // v0.4：记笔记默认附页面截图
+  assert.equal(DEFAULT_SETTINGS.noteScreenshot, true);
   assert.equal(STORAGE_KEYS.settings, 'livedub:settings');
   assert.equal(STORAGE_KEYS.bgState, 'livedub:bg-state');
   assert.equal(STORAGE_KEYS.captions, 'livedub:captions');
+  assert.equal(STORAGE_KEYS.noteQueue, 'livedub:note-queue');
+  assert.equal(STORAGE_KEYS.noteStats, 'livedub:note-stats');
 });
 
 test('constants：offscreen 文档配置与消息类型集合', () => {
@@ -914,6 +949,7 @@ test('constants：offscreen 文档配置与消息类型集合', () => {
     'OFFSCREEN_HELLO', 'OFFSCREEN_START', 'OFFSCREEN_STOP', 'OFFSCREEN_CONFIG',
     'OFFSCREEN_STATE', 'OFFSCREEN_EVENT', 'OFFSCREEN_STOPPED', 'OFFSCREEN_PING',
     'OFFSCREEN_RECONNECT', 'GET_SRT', 'RECONNECT',
+    'CAPTURE_NOTE', 'NOTE_CONTEXT', 'NOTE_RESULT', 'EXPORT_NOTES',
   ];
   for (const key of requiredMessages) assert.ok(typeof MSG[key] === 'string', `MSG.${key} 缺失`);
 });
@@ -1280,6 +1316,260 @@ test('srt：文件名清洗 / 时间戳 / 建议文件名', () => {
   assert.equal(name, 'livedub-CS231n-Lecture-1-Intro-20260102-030405.srt');
   assert.match(suggestSrtFilename({}), /^livedub-session-\d{8}-\d{6}\.srt$/);
 });
+
+// ===========================================================================
+// 8c. v0.4：边看边写笔记（lib/notes.js 纯函数 + 静态断言）
+// ===========================================================================
+
+test('notes：formatTimecode / toDateKey 时间格式', () => {
+  assert.equal(formatTimecode(0), '00:00');
+  assert.equal(formatTimecode(5_000), '00:05');
+  assert.equal(formatTimecode(61_000), '01:01');
+  assert.equal(formatTimecode(66_000), '01:06');
+  assert.equal(formatTimecode(3_661_000), '1:01:01');
+  assert.equal(formatTimecode(-5), '00:00');
+  assert.equal(formatTimecode(Number.NaN), '00:00');
+  assert.equal(toDateKey(new Date(2026, 0, 2, 3, 4, 5)), '2026-01-02');
+  assert.equal(toDateKey(new Date(2026, 11, 31)), '2026-12-31');
+});
+
+test('notes：normalizeVideoUrl 去追踪参数/去 hash/保留视频主键', () => {
+  assert.equal(
+    normalizeVideoUrl('https://www.youtube.com/watch?v=abc123&utm_source=x&t=42#frag'),
+    'https://www.youtube.com/watch?v=abc123',
+  );
+  assert.equal(normalizeVideoUrl('https://www.bilibili.com/video/BV1xx/?spm_id_from=333'), 'https://www.bilibili.com/video/BV1xx');
+  assert.equal(normalizeVideoUrl('https://Example.com/Path/'), 'https://example.com/Path');
+  assert.equal(normalizeVideoUrl('https://a.com/x?b=2&a=1'), 'https://a.com/x?a=1&b=2');
+  assert.equal(normalizeVideoUrl(''), '');
+  assert.equal(normalizeVideoUrl(null), '');
+  assert.equal(normalizeVideoUrl('not a url with spaces'), 'not a url with spaces');
+});
+
+test('notes：computeVideoId 稳定、不同输入不同 id', () => {
+  const input = { url: 'https://www.youtube.com/watch?v=abc', title: 'CS231n Lecture 1', durationMs: 3_600_000 };
+  const a = computeVideoId(input);
+  const b = computeVideoId({ ...input, url: 'https://www.youtube.com/watch?v=abc&utm_source=x#t=1' });
+  assert.match(a, /^ext-[0-9a-f]{16}$/);
+  assert.equal(a, b, '追踪参数/hash 不应改变 videoId');
+  assert.notEqual(a, computeVideoId({ ...input, title: 'Another Lecture' }));
+  assert.notEqual(a, computeVideoId({ ...input, durationMs: 1_800_000 }));
+  // 无时长（0/undefined）也稳定
+  assert.equal(computeVideoId({ url: 'u', title: 't', durationMs: 0 }), computeVideoId({ url: 'u', title: 't' }));
+});
+
+test('notes：buildVideoIdentity 输出 VideoRef', () => {
+  const identity = buildVideoIdentity({ url: 'https://x.com/v', title: '  ', durationMs: 125_000 });
+  assert.match(identity.id, /^ext-[0-9a-f]{16}$/);
+  assert.equal(identity.title, '未知视频');
+  assert.equal(identity.url, 'https://x.com/v');
+  assert.equal(identity.durationMs, 125_000);
+  const noDuration = buildVideoIdentity({ url: 'https://x.com/v', title: 'Lesson' });
+  assert.equal(noDuration.durationMs, undefined);
+  assert.ok(!('durationMs' in noDuration));
+});
+
+test('notes：buildQuickNoteRequest 请求体（source/text/quotes/tags/tMs）', () => {
+  const payload = buildQuickNoteRequest({
+    video: { url: 'https://youtu.be/x', title: 'Lesson 1', durationMs: 600_000 },
+    tMs: 1234.6,
+    text: '  梯度下降  ',
+    quotes: [
+      { t0Ms: 1000, t1Ms: 2400, src: 'gradient descent', dst: '梯度下降' },
+      { t0Ms: 2500, t1Ms: 4000, src: '', dst: '' },
+    ],
+    tags: ['  ml ', ''],
+  });
+  assert.equal(payload.source, 'extension');
+  assert.equal(payload.tMs, 1235);
+  assert.equal(payload.text, '梯度下降');
+  assert.equal(payload.quotes.length, 1);
+  assert.deepEqual(payload.quotes[0], { t0Ms: 1000, t1Ms: 2400, src: 'gradient descent', dst: '梯度下降' });
+  assert.deepEqual(payload.tags, ['ml']);
+  assert.match(payload.video.id, /^ext-/);
+
+  // 无字幕兜底 + 空 quotes 不出现在 body
+  const fallback = buildQuickNoteRequest({ video: { url: 'u', title: 't' }, tMs: 0, text: '' });
+  assert.equal(fallback.text, '（无字幕）');
+  assert.equal(fallback.quotes, undefined);
+  assert.equal(fallback.tags, undefined);
+  // 越界 quotes/tags 截断
+  const many = buildQuickNoteRequest({
+    video: { url: 'u', title: 't' },
+    quotes: Array.from({ length: 6 }, (_, i) => ({ t0Ms: i, t1Ms: i + 100, src: `s${i}`, dst: `d${i}` })),
+    tags: Array.from({ length: 20 }, (_, i) => `tag${i}`),
+  });
+  assert.equal(many.quotes.length, 3);
+  assert.equal(many.tags.length, 10);
+});
+
+test('notes：buildQuickNoteMarkdown 含时间戳/双语引用/视频链接', () => {
+  const markdown = buildQuickNoteMarkdown({
+    video: { url: 'https://youtu.be/x', title: 'Lesson 1' },
+    tMs: 65_000,
+    text: '梯度下降',
+    quotes: [{ src: 'gradient descent', dst: '梯度下降' }],
+  });
+  assert.match(markdown, /^\- \[ \] \*\*01:05\*\* 梯度下降/m);
+  assert.match(markdown, /原声：gradient descent/);
+  assert.match(markdown, /译文：梯度下降/);
+  assert.match(markdown, /\[Lesson 1\]\(https:\/\/youtu\.be\/x\)/);
+  const empty = buildQuickNoteMarkdown({ video: { title: 'T' }, tMs: 0, text: '' });
+  assert.match(empty, /（无字幕）/);
+});
+
+test('notes：buildNoteToastText 成功/排队/截图失败', () => {
+  assert.equal(buildNoteToastText({ tMs: 5_000 }), '已记笔记 @ 00:05');
+  assert.equal(
+    buildNoteToastText({ tMs: 65_000, queued: true, queueSize: 2 }),
+    '引擎未连接，已排队（2）@ 01:05',
+  );
+  assert.match(buildNoteToastText({ tMs: 0, imageSkipped: true }), /截图失败/);
+});
+
+test('notes：notesEndpoint / resolveAssetUrl / parseNotesListResponse', () => {
+  assert.equal(notesEndpoint('http://127.0.0.1:8787', 'quick'), 'http://127.0.0.1:8787/api/notes/quick');
+  assert.equal(notesEndpoint('http://127.0.0.1:8787/', 'assets'), 'http://127.0.0.1:8787/api/notes/assets');
+  assert.equal(notesEndpoint('http://h:1', 'list'), 'http://h:1/api/notes');
+  assert.equal(notesEndpoint('http://h:1', 'export'), 'http://h:1/api/notes/export');
+  assert.throws(() => notesEndpoint('http://h:1', 'nope'), /unknown notes endpoint/);
+
+  assert.equal(resolveAssetUrl('http://h:1', 'https://cdn/x.png'), 'https://cdn/x.png');
+  assert.equal(resolveAssetUrl('http://h:1', '/api/notes/assets/a.png'), 'http://h:1/api/notes/assets/a.png');
+  assert.equal(resolveAssetUrl('http://h:1/', 'assets/a.png'), 'http://h:1/assets/a.png');
+  assert.equal(resolveAssetUrl('', 'assets/a.png'), 'assets/a.png');
+
+  assert.deepEqual(parseNotesListResponse([{ id: 1 }]), [{ id: 1 }]);
+  assert.deepEqual(parseNotesListResponse({ ok: true, notes: [{ id: 2 }] }), [{ id: 2 }]);
+  assert.deepEqual(parseNotesListResponse({ items: [{ id: 3 }] }), [{ id: 3 }]);
+  assert.deepEqual(parseNotesListResponse({ data: { notes: [{ id: 4 }] } }), [{ id: 4 }]);
+  assert.deepEqual(parseNotesListResponse(null), []);
+  assert.deepEqual(parseNotesListResponse({ ok: true }), []);
+});
+
+test('notes：今日计数跨天归零', () => {
+  const d1 = new Date(2026, 0, 2, 10, 0, 0);
+  const d2 = new Date(2026, 0, 3, 10, 0, 0);
+  const first = nextDailyStats(null, d1);
+  assert.deepEqual(first, { date: '2026-01-02', count: 1 });
+  const second = nextDailyStats(first, d1);
+  assert.deepEqual(second, { date: '2026-01-02', count: 2 });
+  assert.equal(readDailyCount(second, d1), 2);
+  assert.equal(readDailyCount(second, d2), 0);
+  const nextDay = nextDailyStats(second, d2);
+  assert.deepEqual(nextDay, { date: '2026-01-03', count: 1 });
+});
+
+test('notes：离线队列入队/上限/flush 成功/失败/持久化', async () => {
+  assert.equal(NOTE_QUEUE_LIMIT, 50);
+  const memory = new Map();
+  const storage = {
+    getItem: (key) => memory.get(key) ?? null,
+    setItem: (key, value) => {
+      memory.set(key, JSON.parse(JSON.stringify(value)));
+    },
+  };
+  const queue = createNoteQueue({ storage, maxNotes: 3, now: () => 1_000_000 });
+  await queue.load();
+  assert.equal(queue.list().length, 0);
+  const payload = { video: { id: 'v1' }, tMs: 0, text: 'a', source: 'extension' };
+  await queue.enqueue(payload);
+  await queue.enqueue({ ...payload, text: 'b' });
+  const third = await queue.enqueue({ ...payload, text: 'c' });
+  assert.equal(third.size, 3);
+  const fourth = await queue.enqueue({ ...payload, text: 'd' });
+  assert.equal(fourth.size, 3);
+  assert.equal(fourth.dropped, 1, '超过上限应丢最旧');
+  assert.deepEqual(
+    queue.list().map((entry) => entry.payload.text),
+    ['b', 'c', 'd'],
+  );
+
+  // 持久化：新实例从同一 storage 恢复
+  const reloaded = createNoteQueue({ storage, maxNotes: 3 });
+  await reloaded.load();
+  assert.equal(reloaded.list().length, 3);
+
+  // flush 成功：全部出队
+  const sent = [];
+  const okResult = await reloaded.flush({ send: async (item) => sent.push(item.text) });
+  assert.deepEqual(okResult, { sent: 3, failed: 0, remaining: 0 });
+  assert.deepEqual(sent, ['b', 'c', 'd']);
+
+  // flush 失败：保留未发送项（最旧失败即停）
+  await reloaded.enqueue({ ...payload, text: 'x' });
+  await reloaded.enqueue({ ...payload, text: 'y' });
+  let attempts = 0;
+  const failResult = await reloaded.flush({
+    send: async () => {
+      attempts += 1;
+      throw new Error('engine offline');
+    },
+  });
+  assert.equal(failResult.sent, 0);
+  assert.equal(failResult.failed, 1);
+  assert.equal(failResult.remaining, 2);
+  assert.equal(attempts, 1, '第一条失败即停止，避免风暴');
+
+  // 再次失败后成功：全部清空
+  const okAgain = await reloaded.flush({
+    send: async () => {
+      /* ok */
+    },
+  });
+  assert.deepEqual(okAgain, { sent: 2, failed: 0, remaining: 0 });
+});
+
+test('background.js v0.4：笔记记录/截图/离线队列/导出接线', () => {
+  assert.ok(source.background.includes("from './lib/notes.js'"));
+  assert.match(source.background, /captureVisibleTab\(/);
+  assert.match(source.background, /notesEndpoint\(engineHttpBase\(\), 'quick'\)/);
+  assert.match(source.background, /notesEndpoint\(engineHttpBase\(\), 'assets'\)/);
+  assert.match(source.background, /notesEndpoint\(engineHttpBase\(\), 'export'\)/);
+  assert.match(source.background, /async function captureQuickNote\(/);
+  assert.match(source.background, /async function postNoteRecord\(/);
+  assert.match(source.background, /notesEndpoint\(base, 'list'\)/);
+  assert.match(source.background, /return postQuickNote\(payload\)/, '无笔记库路由时应回退 quick 每日摘录');
+  assert.match(source.background, /imageSkipped/, '严格 imageUrl 白名单时应降级无图');
+  assert.match(source.background, /kind: 'quick'/);
+  assert.match(source.background, /async function flushNotesQueue\(/);
+  assert.match(source.background, /createNoteQueue\(/);
+  assert.match(source.background, /buildQuickNoteRequest\(/);
+  assert.match(source.background, /buildNoteToastText\(/);
+  assert.match(source.background, /case MSG\.CAPTURE_NOTE:/);
+  assert.match(source.background, /case MSG\.EXPORT_NOTES:/);
+  assert.match(source.background, /command === 'capture-note'/);
+  assert.match(source.background, /noteStats/);
+  assert.match(source.background, /noteQueueCount/);
+});
+
+test('content.js v0.4：字幕上下文/记笔记按钮/toast', () => {
+  assert.match(source.content, /CAPTURE_NOTE: 'livedub:capture-note'/);
+  assert.match(source.content, /NOTE_CONTEXT: 'livedub:note-context'/);
+  assert.match(source.content, /NOTE_RESULT: 'livedub:note-result'/);
+  assert.match(source.content, /case M\.NOTE_CONTEXT:/);
+  assert.match(source.content, /case M\.NOTE_RESULT:/);
+  assert.match(source.content, /function buildNoteContext\(/);
+  assert.match(source.content, /function trackCaption\(/);
+  assert.match(source.content, /runtime\.lastCaption/);
+  assert.match(source.content, /function showToast\(/);
+  assert.match(source.content, /data-part="toast"/);
+  assert.match(source.content, /data-set="noteScreenshot"/);
+  assert.match(source.content, /data-act="note"/);
+  assert.match(source.content, /Alt\+Shift\+N/);
+});
+
+test('popup v0.4：今日笔记/打开笔记本/导出 Markdown', () => {
+  assert.match(source.popup, /MSG\.CAPTURE_NOTE/);
+  assert.match(source.popup, /MSG\.EXPORT_NOTES/);
+  for (const id of ['note-stats', 'capture-note', 'open-notebook', 'export-notes', 'note-screenshot', 'note-hint']) {
+    assert.match(source.popupHtml, new RegExp(`id="${id}"`), `popup.html 缺少 #${id}`);
+  }
+  assert.match(source.popupHtml, /Alt\+Shift\+N/);
+  assert.match(source.popup, /notes=1/);
+  assert.match(source.popup, /今日 \$\{todayCount\} 条/);
+});
+
 
 // ===========================================================================
 // 7. 线协议冒烟（与 engine/ws.mjs 联调；纯本地回环，不依赖真实浏览器）

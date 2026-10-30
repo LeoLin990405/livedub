@@ -3,6 +3,8 @@
 浏览器之外的「同传耳机」：**抓取系统 / 任意 App 的音频**（Zoom、腾讯会议、本地播放器、浏览器……）
 → 发送给本机 livedub 引擎 → 桌面**置顶双语字幕浮层 + 中文配音**。
 
+- **v0.4 新能力**：全局快捷键 **⌥N**「边看边实现」——把当前双语字幕 + 时间戳 +（可选）屏幕截图
+  一键记进本地引擎的学习笔记（`POST /api/notes/quick`），失败自动离线排队、引擎恢复后补发。
 - 和 Chrome 扩展（只抓网页标签页）、本地工作台（只处理本地文件）互补，三端共用同一套线协议：
   [`docs/CONTRACTS.md`](../../docs/CONTRACTS.md) §3 / [`engine/protocol.mjs`](../../engine/protocol.mjs)。
 - 原生 Swift，零第三方依赖：只用系统框架 `ScreenCaptureKit` / `AVFoundation` / `AppKit` / `Foundation`。
@@ -14,13 +16,16 @@
 ```text
 apps/macos/
 ├── Sources/
-│   ├── main.swift                 # 入口：参数解析、NSApplication、菜单栏、会话编排、--simulate
+│   ├── main.swift                 # 入口：参数解析、NSApplication、菜单栏、会话编排、--simulate、⌥N 笔记
 │   ├── ScreenAudioCapture.swift   # ScreenCaptureKit 只抓音频：CMSampleBuffer -> mono float -> 16k s16le -> 100ms 分帧
 │   ├── EngineClient.swift         # URLSessionWebSocketTask：hello / 二进制帧 / 事件解析 / 指数退避重连 / ping
 │   ├── OverlayWindow.swift        # NSPanel 透明置顶浮层：译文+原文+状态/延迟，可拖动、可选点击穿透
 │   ├── DubPlayer.swift            # AVAudioEngine + AVAudioPlayerNode：24k PCM 按 startMs 排序播放
-│   ├── Settings.swift             # UserDefaults：引擎地址 / 字号 / 浮层位置 / 点击穿透 / 配音开关
+│   ├── Settings.swift             # UserDefaults：引擎地址 / 字号 / 浮层位置 / 点击穿透 / 配音 / 笔记开关
 │   ├── Protocol.swift             # 线协议 Swift 镜像（帧编解码、hello、事件解析、字幕折行、重采样）
+│   ├── NotesClient.swift          # Notes API 客户端 + 离线队列（≤50 条）+ 笔记文本/视频标题纯函数
+│   ├── Screenshot.swift           # SCScreenshotManager 截图（PNG ≤4MB）+ 截图降级决策
+│   ├── HotKey.swift               # Carbon RegisterEventHotKey 全局 ⌥N（无第三方依赖）
 │   └── SelfTest.swift             # --self-test headless 自检 + --simulate 演示语料
 ├── Info.plist                     # LSUIElement=true（菜单栏 App）、NSScreenCaptureUsageDescription 等
 ├── README.md                      # 本文件
@@ -60,7 +65,8 @@ bash scripts/build-macos.sh --clean
 - 可覆盖环境变量：`SWIFTC=/path/to/swiftc`、`MACOS_TARGET=arm64-apple-macos14.0`。
 - 脚本只显式链接系统框架：`AppKit` / `AVFoundation` / `CoreMedia` / `CoreGraphics` / `ScreenCaptureKit`。
 - 构建末尾会做 **ad-hoc 签名**（`codesign --force --sign -`），便于 `open` 正常启动；App 未公证。
-- 本机实测（Swift 5.10 / macOS 14.8.9，Apple Silicon）：编译约 **6s**、可执行文件 **403 KB**、bundle **416 KB**。
+- 本机实测（Swift 5.10 / macOS 14.8.9，Apple Silicon）：增量编译约 **6–15s**（clean 全量约 36s）、
+  可执行文件 **653 KB**、bundle **668 KB**（v0.4 增加笔记模块）。
 
 ## 运行
 
@@ -88,6 +94,7 @@ BIN=apps/macos/build/livedub.app/Contents/MacOS/livedub
 "$BIN" --self-test                 # headless 自检，退出码 0/1（不建窗口、不请求权限）
 "$BIN" --simulate --duration 10    # 无权限/无引擎演示 UI（自动退出便于冒烟）
 "$BIN" --autostart --duration 15   # 自动开始同传，15s 后自动退出
+"$BIN" --autostart --note-once --duration 10   # 自动开始 + 2.5s 后记一条测试笔记（截图/队列全链路）
 "$BIN" --engine-url ws://127.0.0.1:8787/ws --autostart
 "$BIN" --help
 ```
@@ -96,6 +103,7 @@ BIN=apps/macos/build/livedub.app/Contents/MacOS/livedub
 |---|---|
 | `--simulate` | 不抓音频、不连引擎，循环演示中英字幕/状态/延迟（无权限环境验证 UI） |
 | `--autostart` | 启动后自动点一次「开始同传」（适合登录项 / 自动化冒烟） |
+| `--note-once` | 启动 2.5s 后自动记一条测试笔记；未显式给 `--duration` 时记录完自动退出（冒烟用） |
 | `--duration <秒>` | N 秒后自动退出（调试用） |
 | `--engine-url <url>` | 覆盖引擎地址并持久化 |
 | `--self-test` | headless 自检：协议字节布局 / hello / 事件解析 / 字幕排版 / 重采样 / 分帧 |
@@ -107,11 +115,17 @@ BIN=apps/macos/build/livedub.app/Contents/MacOS/livedub
 |---|---|
 | 状态：… | 当前状态 + 引擎地址（只读展示） |
 | 开始 / 停止同传 | 连接引擎 + 开始系统音频捕获；再次点击停止 |
+| **记笔记（⌥N）** | 把当前双语字幕 + 时间戳 +（可选）截图记进学习笔记；全局快捷键 ⌥N 等效 |
+| **打开笔记** | 打开工作台学习笔记面板（`/studio/?notes=1`） |
+| **打开工作台** | 打开工作台首页 |
 | 显示 / 隐藏字幕浮层 | 浮层显隐 |
 | 字幕点击穿透 | 开启后鼠标事件穿透浮层（可点下面的窗口），此时浮层不能拖动 |
 | 播放中文配音 | 配音开关（关闭后只看字幕；原声不受影响） |
 | 显示原文行 | 原文行显隐 |
 | 增大 / 减小字幕字号 | 即时生效并持久化 |
+| **记笔记时附截图** | 开关（默认开）：按 ⌥N 时用 SCScreenshotManager 截当前屏幕作为笔记附件 |
+| **暂停时仍可笔记** | 开关（默认开）：同传暂停（引擎 status=paused）时仍允许 ⌥N 记录当前字幕 |
+| 笔记队列：… | 离线待同步条数（引擎重连后自动补发） |
 | 设置引擎地址… | 修改 WS 地址，保存后自动重连 |
 | 打开屏幕录制权限设置… | 直达 系统设置 → 隐私与安全性 → 屏幕录制 |
 | 重置字幕位置 | 回到屏幕底部居中 |
@@ -123,8 +137,9 @@ BIN=apps/macos/build/livedub.app/Contents/MacOS/livedub
 
 ## 权限设置（第一次必做）
 
-macOS 用**「屏幕录制」权限**管控系统音频捕获——系统弹窗文案是「录制屏幕」，但 **livedub 只读取音频流，
-不截屏、不保存画面**（Info.plist 的 `NSScreenCaptureUsageDescription` 有同样说明）。
+macOS 用**「屏幕录制」权限**管控系统音频捕获——系统弹窗文案是「录制屏幕」。默认情况下
+**livedub 只读取音频流，不截屏、不保存画面**；只有你开启「记笔记时附截图」并按 ⌥N 时，
+才会截取当前屏幕作为该条笔记的本地附件（同一 TCC 权限，不需要额外授权）。
 
 1. 菜单栏 livedub → 开始同传；
 2. 系统弹窗 / 或菜单「打开屏幕录制权限设置…」→
@@ -132,7 +147,8 @@ macOS 用**「屏幕录制」权限**管控系统音频捕获——系统弹窗�
    （从终端直接运行二进制时，勾选的是启动它的**终端 App**）；
 3. 回到 App。若系统要求重启 App，退出再 `open` 一次；App 会每秒轮询权限，授权后自动开始捕获。
 
-实现：`CGPreflightScreenCaptureAccess()` 查询 + `CGRequestScreenCaptureAccess()` 触发系统弹窗。
+实现：`CGPreflightScreenCaptureAccess()` 查询 + `CGRequestScreenCaptureAccess()` 触发系统弹窗；
+截图复用同一权限（`SCScreenshotManager`），失败自动降级纯文字笔记。
 注意：**重新构建后 ad-hoc 签名 cdhash 变化，屏幕录制权限可能需要重新勾选**（开发期正常现象）。
 
 ## 与引擎配合（协议细节）
@@ -143,12 +159,11 @@ macOS 用**「屏幕录制」权限**管控系统音频捕获——系统弹窗�
 
   ```json
   {"type":"hello","protocol":1,
-   "session":{"source":"studio","title":"macOS 系统音频 · livedub app",
+   "session":{"source":"macos","title":"macOS 系统音频 · livedub app",
               "url":"","langFrom":"en","langTo":"zh","tMsBase":null,"overrides":{}}}
   ```
 
-  契约 §3.1 的 `source` 枚举暂为 `extension|studio|batch|test`，因此 macOS App 复用 `studio`
-  （引擎 `normalizeHello` 会回落到 studio）；协议扩展后可直接改成 `macos`。
+  `source` 枚举已是 `extension|studio|batch|test|macos`（v0.3 收尾时加入），桌面端用 `macos`。
 - 音频（二进制帧，与 `engine/protocol.mjs#encodeAudioFrame` **字节级一致**）：
 
   ```text
@@ -177,10 +192,70 @@ macOS 用**「屏幕录制」权限**管控系统音频捕获——系统弹窗�
 - `ping`：连接后每 15s 发 `{"type":"ping","t":...}` + WebSocket 协议级 ping。
 - `pause/resume` control 消息已在 `EngineClient.sendControl(_:)` 封装（菜单暂未暴露）。
 
+## 边看边实现：⌥N 全局快捷笔记（v0.4）
+
+典型场景：一边听 Zoom / 网课 / 播放器（livedub 浮层显示双语字幕），一边在 **VSCode / IDE 里写代码**，
+听到关键点按 **⌥N**，当前这句双语字幕 + 会话时间戳（+ 可选截图）就会记进本地学习笔记库；
+之后在菜单「打开笔记」的 `/studio/?notes=1` 面板里复习 / 编辑 / 导出。
+
+```text
+系统音频 -> 引擎（字幕/翻译） -> 浮层双语字幕
+                                   │  按 ⌥N（全局，任何 App 前台都生效）
+                                   ▼
+                    NoteComposer（原文/译文/时间/状态/前台 App/截图链接）
+                                   │
+             ┌─────────────────────┴──────────────────────┐
+             ▼                                            ▼
+  POST /api/notes/quick 成功                    引擎未启动 / 请求失败
+  toast「已记录笔记 · HH:MM:SS」                 UserDefaults 离线队列（≤50 条）
+                                                  引擎重连 / 每 60s 自动补发
+```
+
+- 全局热键：**Carbon `RegisterEventHotKey`**（系统自带，不需要「辅助功能 / 输入监控」授权，
+  也不依赖第三方库）。若组合被其它 App 占用，日志会提示，菜单「记笔记（⌥N）」仍可用。
+- 记录内容（`POST /api/notes/quick`，与 T4 Notes API 契约一致）：
+  - `video`：`{id, title}`。id 优先用「媒体类前台 App（Zoom/播放器/浏览器）」→ `macos-zoom-us`，
+    否则用引擎会话 id → `macos-s-xxxx`，再兜底 `macos-live`；标题同理推导（不满足则用会话标题/日期）。
+  - `tMs`：会话时间轴毫秒（取最近一帧音频的时间，暂停时仍是最后一次音频位置）。
+  - `text`：Markdown 片段，含 `**视频**`、`**原文**`、`**译文**`、`**记录**（会话时间/状态/延迟/前台 App）、
+    `**来源**`（时间戳）、截图 Markdown 链接；无字幕时写 `（无字幕）`。
+  - `quotes`：`[{t0Ms, src, dst}]` 双语引用；`source: "macos"`；
+  - 字段与校验与 T4 `engine/server.mjs` 的 quick 白名单完全一致（未知字段会被 400，本客户端严格发送契约内字段）。
+  - 截图：先 `POST /api/notes/assets`（raw PNG，≤4MB，content-type `image/png`）拿 `{ok,url}`；
+    **text 里用绝对 URL 写 Markdown 图片**（便于渲染），**quick 的 `imageUrl` 字段按服务端契约用
+    相对路径** `/api/notes/assets/<file>.png`（T4 会校验，绝对 URL 会 400）；若旧版引擎仍拒绝
+    `imageUrl`，自动去掉该字段重试（截图链接仍在 text 里，不丢笔记）。
+- 截图（默认开，菜单可关）：`SCScreenshotManager.captureImage`（macOS 14+）抓当前显示器，
+  **复用屏幕录制权限**（与音频捕获同一个 TCC 授权），并**排除 livedub 自己的浮层/窗口**；
+  PNG > 4MB 时自动降采样（1.0 → 0.75 → 0.55 → 0.4），仍超限或截图失败 → **降级为纯文字笔记**（日志说明原因）。
+- 离线队列：引擎没启动 / Notes API 404 / 网络失败 → 笔记进 `UserDefaults` 队列（最多 50 条，丢最旧）；
+  WS 重连成功或每 60s 自动 flush，逐条补发；菜单「笔记队列：N 条待同步」可见。
+- 浮层 toast：成功「已记录笔记 · 14:20:33」；离线「引擎未连接，笔记已排队 · 14:20:33」。
+- 权限：无需新增权限——截图复用「屏幕录制」；不开启附截图时，笔记只含文本。
+
+### 手动验证 ⌥N（不依赖真实引擎）
+
+```bash
+# 假引擎（HTTP Notes API + WS ready/字幕事件，只在本机 18788 端口，不联网）
+node /tmp/mock-notes-engine.mjs        # 脚本样例见验收记录；或直接连真实引擎
+BIN=apps/macos/build/livedub.app/Contents/MacOS/livedub
+
+# A. 引擎在线：自动开始同传 -> 2.5s 后记一条（含截图上传）-> 日志出现 sent
+"$BIN" --engine-url ws://127.0.0.1:18788/ws --autostart --note-once --duration 10
+
+# B. 引擎离线再恢复：先离线排队，再启动引擎 -> 自动补发
+"$BIN" --engine-url ws://127.0.0.1:18788/ws --autostart --note-once --duration 25 &
+sleep 6 && node /tmp/mock-notes-engine.mjs
+```
+
+真实使用：引擎跑着并播放任意英文音源 → 打开 VSCode → 需要记录时按 **⌥N**（任何 App 在前台都生效；
+系统设置里不需要给 livedub 辅助功能权限）。若没反应：先用菜单「记笔记」确认链路，再检查日志中的
+「全局快捷键 ⌥N 已就绪 / 注册失败」。
+
 ## 自检 / 测试
 
 ```bash
-# 1) 编译 + 自检（76 项，退出码 0/1）
+# 1) 编译 + 自检（139 项，退出码 0/1）
 bash scripts/build-macos.sh --check
 
 # 2) 静态契约测试（默认跨平台、离线、不跑 swiftc —— CI 在 ubuntu 也能跑）
@@ -199,7 +274,12 @@ LIVEDUB_MACOS_BUILD=1 node --test tests/macos.test.mjs
 - 事件解析：`ready/status/partial/segment/translation/dub(base64)/metrics/voice/error/pong/bye/unknown`；
 - 字幕折行（ASCII / CJK 双列宽 / 超长 token 硬切 / 最多 2 行省略）、延迟格式（`1.8s` / `—`）、状态文案；
 - 16k 100ms 分帧（不足不出帧、tMs 递增、reset）、48k/44.1k → 16k 重采样（长度 / RMS / 静音）；
-- 引擎地址清洗（补 scheme/端口/`/ws`、http→ws、非法回落默认）。
+- 引擎地址清洗（补 scheme/端口/`/ws`、http→ws、非法回落默认）；
+- **v0.4 笔记**：Notes HTTP 基址换算（ws→http/wss→https）、`/studio/?notes=1` URL、assets 相对/绝对 URL；
+  会话时间格式（`01:23.4` / `1:02:03.4`）、墙钟 `HH:MM:SS`、日期；视频标题/ID 推导（媒体 App / 会话 / 兜底 /
+  清洗 / slug）；quick note 文本（原文/译文/时间/来源/截图 markdown/无字幕）与 JSON 字段编解码往返；
+  离线队列（≤50 丢最旧、FIFO、enqueueFront、clear、损坏数据安全丢弃、注入内存存储不写用户偏好）；
+  截图降级决策（关闭/无权限/失败/超 4MB/正常）与降采样序列；⌥N 热键常量（`kVK_ANSI_N=45`、Carbon optionKey）。
 
 ## 手动测试清单
 
@@ -218,6 +298,14 @@ LIVEDUB_MACOS_BUILD=1 node --test tests/macos.test.mjs
 - [ ] **字号**：增大/减小即时生效，重启后保持
 - [ ] **权限**：系统设置取消勾选 livedub → 开始同传 → 出现权限提示；重新授权后自动恢复捕获
 - [ ] **断线重连**：`kill` 引擎 → 状态重连；重启引擎 → 自动恢复（不重启 App）
+- [ ] **⌥N 记笔记（真实链路）**：同传中按 ⌥N → 浮层顶部 toast「已记录笔记 · HH:MM:SS」；
+      引擎 `data/notes/quick-YYYY-MM-DD.md` 里出现原文/译文/时间戳（菜单「打开笔记」可见）
+- [ ] **⌥N 在其它 App 前台**：切到 VSCode / 浏览器后再按 ⌥N 仍能记录（全局热键；不需要辅助功能授权）
+- [ ] **附截图开关**：菜单关闭「记笔记时附截图」→ 再按 ⌥N，笔记无截图（纯文字）；开启后恢复，
+      截图不含 livedub 浮层，PNG 附件出现在笔记里（服务端 assets）
+- [ ] **离线队列**：先停掉引擎 → 按 ⌥N → toast「引擎未连接，笔记已排队」、菜单「笔记队列：1 条待同步」；
+      启动引擎后 60s 内（或重连后立即）自动补发，队列清零
+- [ ] **暂停时仍可笔记**：暂停同传（或关闭该开关）验证：开=可记录最后一句；关=toast 提示被禁用
 - [ ] **退出**：菜单退出后 `pgrep -fl livedub` 无残留；无 Dock 图标（菜单栏 App 正常形态）
 
 ### 验收记录（本机实测，2026-10-29，Swift 5.10 / macOS 14.8.9 / Apple Silicon）
@@ -231,6 +319,24 @@ LIVEDUB_MACOS_BUILD=1 node --test tests/macos.test.mjs
   （用 `engine/protocol.mjs#decodeAudioFrame` 权威解析校验）。
 - **重连**：假引擎每 2.5s 断开一次 → App 自动重连 3 次、每次重新 hello，期间音频帧持续发送。
 - **模拟模式 UI**：真实创建菜单栏图标 + 置顶浮层，截图确认译文/原文/状态/延迟渲染正确。
+
+### v0.4 验收记录（2026-10-30，Swift 5.10 / macOS 14.8.9 / Apple Silicon）
+
+- `bash scripts/build-macos.sh --check`：**self-test 139/139 通过**，退出码 0，0 warning；
+  可执行文件 653 KB，bundle 668 KB。
+- **⌥N 端到端（假引擎 18788，HTTP + WS，全部本机）**：
+  - App 日志：`全局快捷键 ⌥N 已就绪` → 自动开始同传 → 2.5s 后 `已记录（sent）· 截图 已上传 943KB` → exit 0；
+  - 假引擎收到：`POST /api/notes/assets` → **PNG 966,515 字节、签名正确、content-type=image/png**；
+    `POST /api/notes/quick` → `source=macos`、`tMs=2000`、`video={id:"macos-s-mock-1",title:"macOS 系统音频 · livedub app"}`、
+    `text` 含 `**原文**/**译文**/**记录**（时间 00:02.0 · 状态 聆听中 · 延迟 1.8s · 前台 App）`、
+    `quotes=[{t0Ms,src,dst}]`、`imageUrl` 为**相对路径** `/api/notes/assets/img_xxx.png`（严格契约校验 0 拒绝）；
+  - 浮层 toast 截图确认「已记录笔记 · 14:25:13」渲染正确；
+  - 截图附件实测 1440×900 PNG、1.13MB、仅当前屏幕内容——**不含 livedub 浮层/菜单栏图标**
+    （`SCContentFilter` 排除自身进程 `SCRunningApplication`，人工查看产物确认）。
+- **离线队列 → 重连补发**：引擎离线时按 ⌥N → `已离线排队（queued 1）`（截图上传失败自动降级纯文字）；
+  6s 后启动引擎 → 应用指数退避重连成功 → `离线笔记补发完成：成功 1 条，剩余 0 条` → exit 0；
+  假引擎收到 text 含 `（无字幕）`（离线时无引擎事件，符合预期）、无 imageUrl。
+- 自动化：`node --test tests/macos.test.mjs` 全绿（含 v0.4 静态契约断言）。
 
 ## 已知限制
 
@@ -253,6 +359,15 @@ LIVEDUB_MACOS_BUILD=1 node --test tests/macos.test.mjs
 9. 停止同传即结束引擎会话；`pause/resume` control 已封装但菜单未暴露。
 10. 识别 / 翻译 / TTS 都在引擎侧：需要本地引擎已启动、whisper 模型就绪、provider 配置可用
     （见根目录 README 与 `docs/PROVIDERS.md`）；App 本身不含模型。
+11. **⌥N 是全局热键，会占用该组合键**：在编辑器里按 Option+N 会被 livedub 截获（不会输入字符）；
+    若与其他 App 冲突，注册会失败并提示，此时用菜单「记笔记」。改键需要改源码常量后重新构建。
+12. **截图内容 = 当前整个屏幕**（排除 livedub 浮层）：可能包含 IDE/聊天/其他窗口内容，
+    但只作为附件发送给**本机引擎**、落在本地 `data/notes/assets/`，不上传云端；介意隐私可关闭「记笔记时附截图」。
+13. **笔记同步依赖引擎 Notes API（v0.4 引擎侧）**：旧版引擎会 404 → 笔记进离线队列一直待同步；
+    升级引擎后自动补发。离线队列上限 50 条，超出丢最旧。
+14. 笔记里的 `tMs` 是**会话音频时间轴**（不是视频平台的播放时间），暂停时是最后一次音频位置；
+    直播/会议场景没有可回跳的 URL，`video.url` 为空，标题靠推导。
+15. 截图功能需要 macOS 14+（`SCScreenshotManager`）；音频捕获与笔记文本在 macOS 14+ 全部可用。
 
 ## 故障排查
 
@@ -265,11 +380,17 @@ LIVEDUB_MACOS_BUILD=1 node --test tests/macos.test.mjs
 | 浮层挡住操作 | 开「字幕点击穿透」或隐藏浮层；「重置字幕位置」 |
 | 某个 App 没声音被识别 | 确认它确实在当前显示器输出、没有静音；DRM 内容抓不到属已知限制 |
 | 编译报 `swiftc not found` | `xcode-select --install`；或 `SWIFTC=/path/to/swiftc bash scripts/build-macos.sh` |
+| 按 ⌥N 没反应 | 看日志「全局快捷键 ⌥N 已就绪 / 注册失败」；被占用时用菜单「记笔记」；确认 App 在运行（非退出） |
+| 笔记一直「待同步」 | 引擎是否运行 / 是否 v0.4（Notes API 404 会排队）；菜单「打开笔记」确认工作台可用；看引擎日志 |
+| 笔记没有截图 | 菜单「记笔记时附截图」是否开；屏幕录制权限；截图/上传失败会降级纯文字（日志有原因） |
+| 笔记时间/标题怪 | `tMs` 是会话音频轴；标题由前台媒体 App/会话推导，可在工作台里改名/编辑 |
 | 编译报 SDK/availability 错 | 需要 macOS 14+ SDK；`swiftc --version` 应为 5.10+，`MACOS_TARGET` 默认 `<arch>-apple-macos14.0` |
 
 ## 隐私与安全
 
-- 音频只在内存中：系统采集 → `ws://127.0.0.1` 本地引擎，**不落盘、不上传**；App 不截屏、不保存画面。
+- 音频只在内存中：系统采集 → `ws://127.0.0.1` 本地引擎，**不落盘、不上传**；
+- 快捷笔记：文本/截图只发给**本机引擎**（`127.0.0.1`），落在本地 `data/notes/`；默认不截屏，
+  只有开启「记笔记时附截图」并按 ⌥N 时才截当前屏幕作为该条笔记附件（不含 livedub 浮层）。
 - 引擎会把**文本**发给配置的云翻译 / TTS provider（与其他端一致，取决于用户配置）。
 - 日志只打印状态与计数，不打印 API Key；`--simulate` / `--self-test` 完全离线。
 
@@ -277,5 +398,6 @@ LIVEDUB_MACOS_BUILD=1 node --test tests/macos.test.mjs
 
 - 线协议与事件字段：[`docs/CONTRACTS.md`](../../docs/CONTRACTS.md) §3；权威实现 [`engine/protocol.mjs`](../../engine/protocol.mjs)
 - 浏览器端：[`extension/README.md`](../../extension/README.md)；本地工作台：根目录 README
-- 路线图：[`docs/ROADMAP.md`](../../docs/ROADMAP.md)（v0.3 桌面悬浮窗）
+- Notes API 契约与工作台笔记面板（T4）：`engine/server.mjs` 的 `/api/notes/*`、`studio/`（v0.4）
+- 路线图：[`docs/ROADMAP.md`](../../docs/ROADMAP.md)（v0.3 桌面悬浮窗 / v0.4 边看边写笔记）
 - 构建脚本：[`scripts/build-macos.sh`](../../scripts/build-macos.sh)；静态测试：[`tests/macos.test.mjs`](../../tests/macos.test.mjs)

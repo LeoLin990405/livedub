@@ -29,6 +29,10 @@ const SWIFT_FILES = [
   'OverlayWindow.swift',
   'DubPlayer.swift',
   'Settings.swift',
+  // v0.4 快捷笔记
+  'NotesClient.swift',
+  'HotKey.swift',
+  'Screenshot.swift',
 ];
 
 test('macos: 构建脚本存在，bash -n 语法检查通过', () => {
@@ -115,6 +119,8 @@ test('macos: Swift 只用系统框架（零第三方 Swift 依赖）', () => {
     'CoreMedia',
     'Foundation',
     'ScreenCaptureKit',
+    // v0.4：Carbon RegisterEventHotKey（系统框架，非第三方）
+    'Carbon',
   ]);
   for (const file of SWIFT_FILES) {
     const source = readSource(file);
@@ -193,6 +199,83 @@ test('macos: 引擎地址 / 事件名与 docs+protocol.mjs 对齐', () => {
   assert.match(main, /sendAudioFrame/);
 });
 
+test('macos: v0.4 ⌥N 快捷笔记（NotesClient / 全局热键 / 截图 / 离线队列 / 菜单）', () => {
+  // Notes API 客户端：quick + assets + 离线队列 + macos source
+  const notes = readSource('NotesClient.swift');
+  assert.match(notes, /api.*notes.*quick|api\/notes\/quick|QuickNoteRequest/, '缺少 quick note 请求');
+  assert.match(notes, /assetsURL|api\/notes\/assets/, '缺少 assets 上传');
+  assert.match(notes, /NoteVideoRef/);
+  assert.match(notes, /NoteQuote/);
+  assert.match(notes, /static let source = "macos"/);
+  assert.match(notes, /UserDefaultsNotesStore/);
+  assert.match(notes, /NotesOfflineQueue/);
+  assert.match(notes, /static let maxItems = 50/);
+  assert.match(notes, /flushOfflineQueue/);
+  assert.match(notes, /imageUrl/);
+  assert.match(notes, /relativeAssetPath|isValidAssetPath/, 'imageUrl 必须按服务端契约用相对路径');
+  assert.match(notes, /formatSessionTime/, '缺少会话时间格式化');
+  assert.match(notes, /formatClock/, '缺少墙钟时间格式化');
+  assert.match(notes, /deriveVideoTitle/, '缺少视频标题推导');
+  assert.match(notes, /deriveVideoID/, '缺少视频 id 推导');
+
+  // 全局热键：Carbon（不依赖第三方 / 不需要辅助功能）
+  const hotkey = readSource('HotKey.swift');
+  assert.match(hotkey, /RegisterEventHotKey/);
+  assert.match(hotkey, /kVK_ANSI_N/);
+  assert.match(hotkey, /optionKey/);
+  assert.match(hotkey, /⌥N/);
+  assert.doesNotMatch(hotkey, /import (?!Carbon|Foundation)/, '热键只允许系统框架');
+
+  // 截图：SCScreenshotManager + 4MB 上限 + 降级决策
+  const screenshot = readSource('Screenshot.swift');
+  assert.match(screenshot, /SCScreenshotManager\.captureImage/);
+  assert.match(screenshot, /maxAssetBytes = 4 \* 1024 \* 1024/);
+  assert.match(screenshot, /ScreenshotPlanner/);
+  assert.match(screenshot, /textOnly/);
+  assert.match(screenshot, /CGPreflightScreenCaptureAccess/, '截图应复用屏幕录制权限');
+
+  // 浮层 toast + 菜单/设置接入
+  const overlay = readSource('OverlayWindow.swift');
+  assert.match(overlay, /showToast/);
+  assert.match(overlay, /已记录/);
+  const main = readSource('main.swift');
+  assert.match(main, /GlobalHotKey\.shared/);
+  assert.match(main, /takeNote/);
+  assert.match(main, /--note-once/);
+  assert.match(main, /openNotesPanel|studioNotesURL/);
+  assert.match(main, /打开笔记/);
+  assert.match(main, /打开工作台/);
+  const settings = readSource('Settings.swift');
+  assert.match(settings, /notesIncludeScreenshot/);
+  assert.match(settings, /notesWhenPaused/);
+});
+
+test('macos: Notes API 端点在引擎侧存在（与 T4 契约对齐）', () => {
+  const server = read('engine/server.mjs');
+  assert.match(server, /\/api\/notes\/quick/, '引擎缺少 POST /api/notes/quick');
+  assert.match(server, /\/api\/notes\/assets/, '引擎缺少 POST /api/notes/assets');
+  assert.match(server, /NOTE_SOURCES[^;]*'macos'/, 'Notes source 枚举应包含 macos');
+});
+
+test('macos: v0.4 笔记文案/队列常量在 self-test 中覆盖', () => {
+  const selfTest = readSource('SelfTest.swift');
+  for (const must of [
+    'checkNotes()',
+    'Notes HTTP',
+    'formatSessionTime',
+    'deriveVideoTitle',
+    'NotesOfflineQueue',
+    'InMemoryNotesStore',
+    'ScreenshotPlanner',
+    'GlobalHotKey.displayName',
+    '（无字幕）',
+    'quick note',
+    '离线队列',
+  ]) {
+    assert.ok(selfTest.includes(must), `SelfTest.swift 缺少 v0.4 检查：${must}`);
+  }
+});
+
 test('macos: Info.plist 关键键（LSUIElement / 屏幕录制权限说明 / bundle 元数据）', () => {
   const plist = readFileSync(path.join(APP_DIR, 'Info.plist'), 'utf8');
   assert.match(plist, /LSUIElement<\/key>\s*<true\/>/, '菜单栏 App 必须 LSUIElement=true');
@@ -229,6 +312,12 @@ test('macos: apps/macos/README.md 覆盖构建/权限/运行/已知限制/手动
     '原声',
     '虚拟声卡',
     '手动测试',
+    // v0.4 快捷笔记工作流
+    '⌥N',
+    '笔记',
+    'data/notes',
+    '离线',
+    '按 ⌥N',
   ]) {
     assert.ok(readme.includes(must), `README 缺少关键说明：${must}`);
   }
@@ -250,7 +339,9 @@ test(
       encoding: 'utf8',
       timeout: 180_000,
     });
-    assert.match(output, /self-test: \d+ checks passed/);
+    const match = output.match(/self-test: (\d+) checks passed/);
+    assert.ok(match, '构建输出缺少 self-test 统计');
+    assert.ok(Number(match[1]) >= 100, `self-test 项数应 >= 100（v0.4 含笔记检查），实际 ${match[1]}`);
     assert.ok(existsSync(path.join(APP_DIR, 'build', 'livedub.app', 'Contents', 'MacOS', 'livedub')));
   },
 );

@@ -46,6 +46,7 @@ YouTube / B站 / 网课页面       本地引擎 (127.0.0.1)               输�
 | TTS | MiniMax `speech-2.8-hd` 流式（PCM），默认男声讲师音色 | 短句首包 **≈1.1–1.5s** |
 | 音色克隆 | 火山声音复刻 v3 / MiniMax / 自动降级 preset | 协议已实现（火山需豆包语音 UUID Key，目前本机无此 Key，真机验证了 401→降级路径）；MiniMax Token Plan 返回 2061 自动降级 |
 | 云端 ASR | MiniMax `asr-1.0`（`npm run start:cloud`） | 4s≈0.79s / 12s≈1.0-1.2s；**云端档 e2e ≈2.2–2.4s**，音频会上传、失败自动降级本地 |
+| 学习笔记 | 时间戳 + 双语引用 + 截图 + 代码块 + 大纲；三端快捷记录（工作台 `N`、扩展 `Alt+Shift+N`、桌面 `⌥N`、CLI） | 笔记只落本机 `data/notes/`，导出 Markdown 可直接进 Obsidian（见 [docs/NOTES.md](docs/NOTES.md)） |
 | 桌面端 | macOS 原生悬浮窗（ScreenCaptureKit） | `apps/macos/` 源码 + `scripts/build-macos.sh`（见 [apps/macos/README.md](apps/macos/README.md)） |
 | 管线 | Node 零依赖引擎，VAD 切分 + 子句级 TTS + 调度压音 | 52.7s 示例课实测：**质量档 e2e 3.0s** / **快速档 2.4s**（ASR 1.8s→0.9s、翻译首字 0.8s、TTS 首包 0.25s；[完整数据](docs/MEASUREMENTS.md)） |
 
@@ -152,6 +153,31 @@ open apps/macos/build/livedub.app
 
 完整实测数字、逐句延迟、模型对比见 [docs/MEASUREMENTS.md](docs/MEASUREMENTS.md)。
 
+## 边看边实现 + 学习笔记（v0.4）
+
+看视频 → 跟着敲代码 → 随时记笔记，互不打断：
+
+```bash
+# 1) 工作台里：画中画播放视频 + 右侧「学习笔记」面板（N 新建，插入当前句/截图/代码块，导出 Markdown）
+npm start            # http://127.0.0.1:8787/studio/
+
+# 2) 在 VSCode 里边看边实现：全局快捷键记录「当前这句字幕 + 时间戳」
+#    Chrome 扩展：Alt+Shift+N     macOS App：⌥N
+
+# 3) 终端/快捷键工具：一句话记进笔记库（引擎没启动会自动写本地 Markdown）
+npm run note -- "反向传播 = 链式法则 + 计算图"
+npm run note -- "这里为什么要 detach？" --video "MIT 6.S191" --time 12:34 --tag todo
+```
+
+- 笔记带**视频时间戳**，列表点击直接跳回对应画面；
+- 自动附带**中英双语原句**、可插**视频截图**与**代码块**；
+- 一键生成按时间轴的**课程大纲**，导出 Markdown（YAML front matter）到 `data/exports/`，可直接放进 Obsidian；
+- 详细用法与隐私说明：[docs/NOTES.md](docs/NOTES.md)。
+
+| 工作台笔记抽屉（真实会话 + 截图/大纲/快捷摘录） | Markdown 预览 |
+|---|---|
+| ![notes](docs/assets/studio-notes.png) | ![notes-preview](docs/assets/studio-notes-preview.png) |
+
 ## 目录结构
 
 ```text
@@ -175,7 +201,7 @@ livedub/
 ├── scripts/                doctor / batch / make-demo / 图层渲染
 ├── tests/                  node:test（含 mock 端到端）
 ├── config/                 livedub.config.json + fast/cloud 档位覆盖
-└── docs/                   CONTRACTS / ARCHITECTURE / PROVIDERS / ROADMAP / MEASUREMENTS
+└── docs/                   CONTRACTS / ARCHITECTURE / PROVIDERS / NOTES / ROADMAP / MEASUREMENTS
 ```
 
 ## 设计要点（为什么能做到「像原声」）

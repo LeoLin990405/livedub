@@ -52,6 +52,12 @@ const ui = {
   showOverlay: $('show-overlay'),
   exportSrt: $('export-srt'),
   captionCount: $('caption-count'),
+  noteStats: $('note-stats'),
+  captureNote: $('capture-note'),
+  openNotebook: $('open-notebook'),
+  exportNotes: $('export-notes'),
+  noteScreenshot: $('note-screenshot'),
+  noteHint: $('note-hint'),
 };
 
 const runtime = {
@@ -233,6 +239,14 @@ function render() {
   ui.captionCount.textContent = `本次会话字幕 ${captionCount} 条`;
   ui.exportSrt.disabled = captionCount === 0;
   ui.exportSrt.title = captionCount === 0 ? '先开始同传并让视频说几句话，才有字幕可导出' : `导出 ${captionCount} 条字幕（SRT）`;
+
+  // v0.4 笔记状态
+  const noteStats = (runtime.bgState && runtime.bgState.noteStats) || null;
+  const todayCount = noteStats && typeof noteStats.count === 'number' ? noteStats.count : 0;
+  const queueCount = (runtime.bgState && runtime.bgState.noteQueueCount) || 0;
+  ui.noteStats.textContent = `今日 ${todayCount} 条 · 待同步 ${queueCount}`;
+  ui.noteScreenshot.checked = runtime.settings.noteScreenshot !== false;
+  ui.noteHint.textContent = '快捷键 Alt+Shift+N 记笔记 · Alt+Shift+L 开始/停止。截图与笔记只存本机 data/notes/。';
 
   renderHealth();
   renderGuidance();
@@ -539,6 +553,65 @@ function bindEvents() {
     } catch (err) {
       showError(`打开工作台失败：${String((err && err.message) || err)}`);
     }
+  });
+
+  ui.captureNote.addEventListener('click', async () => {
+    hideError();
+    try {
+      const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
+      const tab = tabs && tabs[0];
+      if (!tab || typeof tab.id !== 'number') {
+        showError('没有找到当前标签页，请切换到视频页面后重试。');
+        return;
+      }
+      const response = await chrome.runtime.sendMessage({
+        type: MSG.CAPTURE_NOTE,
+        tabId: tab.id,
+        withScreenshot: runtime.settings.noteScreenshot !== false,
+        trigger: 'popup',
+      });
+      if (response && response.ok) {
+        showError(response.toast || '已记笔记', response.queued ? 'info' : 'info');
+        await refreshState();
+      } else {
+        showError((response && response.error && response.error.message) || '记笔记失败，请重试');
+      }
+    } catch (err) {
+      showError(`记笔记失败：${String((err && err.message) || err)}`);
+    }
+  });
+
+  ui.openNotebook.addEventListener('click', async () => {
+    const studioUrl = deriveStudioUrl(runtime.settings.engineUrl || ui.engineUrl.value);
+    if (!studioUrl) {
+      showError('无法从引擎地址推导工作台地址，请检查引擎地址');
+      return;
+    }
+    try {
+      await chrome.tabs.create({ url: `${studioUrl}?notes=1` });
+    } catch (err) {
+      showError(`打开笔记本失败：${String((err && err.message) || err)}`);
+    }
+  });
+
+  ui.exportNotes.addEventListener('click', async () => {
+    hideError();
+    try {
+      const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
+      const tab = tabs && tabs[0];
+      const response = await chrome.runtime.sendMessage({ type: MSG.EXPORT_NOTES, tabId: tab && tab.id });
+      if (response && response.ok) {
+        showError(`已导出 Markdown：${response.path || '（路径未返回）'}`, 'info');
+      } else {
+        showError((response && response.error && response.error.message) || '导出失败：引擎未连接？');
+      }
+    } catch (err) {
+      showError(`导出失败：${String((err && err.message) || err)}。请确认引擎已启动（npm start）。`);
+    }
+  });
+
+  ui.noteScreenshot.addEventListener('change', async () => {
+    await saveSettings({ noteScreenshot: ui.noteScreenshot.checked });
   });
 
   ui.voiceMode.addEventListener('change', async () => {

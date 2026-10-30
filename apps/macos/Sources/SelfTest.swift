@@ -12,6 +12,7 @@
 //  退出码：0 全部通过；1 有失败（便于 CI 与 scripts/build-macos.sh --check）。
 //
 
+import CoreGraphics
 import Foundation
 
 // MARK: - --simulate 演示数据
@@ -65,6 +66,7 @@ enum SelfTest {
         checkResampler()
         checkChunker()
         checkSettings()
+        checkNotes()
         checkSimulationData()
 
         if failures.isEmpty {
@@ -406,6 +408,223 @@ enum SelfTest {
         check("simulate 演示语料 >= 4 轮", SimulatedSession.turns.count >= 4)
         check("simulate 语料均为中英双语",
               SimulatedSession.turns.allSatisfy { !$0.en.isEmpty && !$0.zh.isEmpty })
+    }
+
+
+    // MARK: 快捷笔记（v0.4 ⌥N）
+
+    private static func checkNotes() {
+        let utc = TimeZone(identifier: "UTC") ?? .current
+        var components = DateComponents()
+        components.year = 2026
+        components.month = 10
+        components.day = 30
+        components.hour = 14
+        components.minute = 20
+        components.second = 33
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = utc
+        let referenceDate = calendar.date(from: components) ?? Date(timeIntervalSince1970: 0)
+
+        // Notes HTTP 基址/URL
+        check("Notes HTTP：ws -> http", NotesHTTP.baseURLString(fromEngineURL: "ws://127.0.0.1:8787/ws") == "http://127.0.0.1:8787",
+              detail: NotesHTTP.baseURLString(fromEngineURL: "ws://127.0.0.1:8787/ws"))
+        check("Notes HTTP：保留自定义端口",
+              NotesHTTP.baseURLString(fromEngineURL: "ws://127.0.0.1:19999/ws") == "http://127.0.0.1:19999")
+        check("Notes HTTP：wss -> https（不强制 8787 端口）",
+              NotesHTTP.baseURLString(fromEngineURL: "wss://notes.example.com/ws") == "https://notes.example.com")
+        check("Notes HTTP：非法地址回落默认",
+              NotesHTTP.baseURLString(fromEngineURL: "") == "http://127.0.0.1:8787")
+        check("Notes HTTP：打开笔记面板 URL（?notes=1）",
+              NotesHTTP.studioURL(fromEngineURL: "ws://127.0.0.1:8787/ws", notes: true)?.absoluteString
+                  == "http://127.0.0.1:8787/studio/?notes=1")
+        check("Notes HTTP：工作台 URL",
+              NotesHTTP.studioURL(fromEngineURL: "ws://127.0.0.1:8787/ws", notes: false)?.absoluteString
+                  == "http://127.0.0.1:8787/studio/")
+        check("Notes HTTP：相对 assets 路径转绝对",
+              NotesHTTP.absoluteAssetURLString(base: "http://127.0.0.1:8787", assetPath: "/api/notes/assets/a.png")
+                  == "http://127.0.0.1:8787/api/notes/assets/a.png")
+        check("Notes HTTP：绝对 URL 原样返回",
+              NotesHTTP.absoluteAssetURLString(base: "http://127.0.0.1:8787", assetPath: "https://cdn.example.com/a.png")
+                  == "https://cdn.example.com/a.png")
+        check("Notes HTTP：assets 相对路径补 /",
+              NotesHTTP.absoluteAssetURLString(base: "http://127.0.0.1:8787/", assetPath: "api/notes/assets/a.png")
+                  == "http://127.0.0.1:8787/api/notes/assets/a.png")
+
+        // 时间格式
+        check("会话时间 0 -> 00:00.0", NoteComposer.formatSessionTime(0) == "00:00.0")
+        check("会话时间 83400 -> 01:23.4", NoteComposer.formatSessionTime(83_400) == "01:23.4",
+              detail: NoteComposer.formatSessionTime(83_400))
+        check("会话时间 3723456 -> 1:02:03.4", NoteComposer.formatSessionTime(3_723_456) == "1:02:03.4",
+              detail: NoteComposer.formatSessionTime(3_723_456))
+        check("会话时间 负数/NaN -> 00:00.0",
+              NoteComposer.formatSessionTime(-100) == "00:00.0" && NoteComposer.formatSessionTime(Double.nan) == "00:00.0")
+        check("时钟格式 HH:MM:SS", NoteComposer.formatClock(referenceDate, timeZone: utc) == "14:20:33",
+              detail: NoteComposer.formatClock(referenceDate, timeZone: utc))
+        check("日期格式 yyyy-MM-dd", NoteComposer.formatDateStamp(referenceDate, timeZone: utc) == "2026-10-30")
+        check("时钟格式 epoch 0（UTC）", NoteComposer.formatClock(Date(timeIntervalSince1970: 0), timeZone: utc) == "00:00:00")
+
+        // 视频标题 / ID 推导
+        check("标题：媒体 App 就是声音来源",
+              NoteComposer.deriveVideoTitle(sessionTitle: "macOS 系统音频 · livedub app", frontmostApp: "zoom.us", date: referenceDate, timeZone: utc)
+                  == "zoom.us · 系统音频同传")
+        check("标题：普通前台 App 用会话标题",
+              NoteComposer.deriveVideoTitle(sessionTitle: "macOS 系统音频 · livedub app", frontmostApp: "Visual Studio Code", date: referenceDate, timeZone: utc)
+                  == "macOS 系统音频 · livedub app")
+        check("标题：无标题回落日期",
+              NoteComposer.deriveVideoTitle(sessionTitle: "", frontmostApp: nil, date: referenceDate, timeZone: utc)
+                  == "macOS 系统音频同传 · 2026-10-30")
+        check("标题：换行/空白清洗",
+              NoteComposer.deriveVideoTitle(sessionTitle: "  hello\nworld  ", frontmostApp: nil, date: referenceDate, timeZone: utc)
+                  == "hello world")
+        check("视频 ID：媒体 App 分组", NoteComposer.deriveVideoID(sessionId: "s_abc", frontmostApp: "zoom.us") == "macos-zoom-us")
+        check("视频 ID：会话 id 分组", NoteComposer.deriveVideoID(sessionId: "s_abc", frontmostApp: "Visual Studio Code") == "macos-s-abc")
+        check("视频 ID：无信息兜底", NoteComposer.deriveVideoID(sessionId: nil, frontmostApp: nil) == "macos-live")
+        check("视频 ID：slug 只保留 [a-z0-9-]", NoteComposer.slug(" Visual Studio Code! ") == "visual-studio-code")
+        check("媒体 App 识别（大小写/包含）",
+              NoteComposer.isMediaApp("zoom.us") && NoteComposer.isMediaApp("Google Chrome") && !NoteComposer.isMediaApp("Visual Studio Code"))
+
+        // quick note 文本 / JSON 构造
+        let context = NoteContext(
+            sessionId: "s_test",
+            sessionTitle: "macOS 系统音频 · livedub app",
+            tMs: 83_400,
+            statusText: "聆听中",
+            translation: "今天我们来聊聊梯度下降到底是怎么工作的。",
+            source: "Today we're going to talk about how gradient descent actually works.",
+            latencyMs: 1_834,
+            frontmostApp: "Visual Studio Code",
+            frontmostBundleId: "com.microsoft.VSCode",
+            capturedAt: referenceDate,
+            timeZone: utc
+        )
+        let assetURL = "http://127.0.0.1:8787/api/notes/assets/a.png"
+        let assetPath = "/api/notes/assets/a.png"
+        let assetRef = NoteAssetRef(absoluteURL: assetURL, relativePath: assetPath)
+        let request = NoteComposer.makeQuickRequest(context: context, image: assetRef)
+        check("quick note：source=macos", request.source == "macos")
+        check("quick note：tMs 使用会话时间轴", request.tMs == 83_400)
+        check("quick note：text 含原文/译文/时间/来源/截图",
+              request.text.contains("**原文**") && request.text.contains("**译文**")
+                  && request.text.contains("时间 01:23.4") && request.text.contains("**来源**")
+                  && request.text.contains("![截图](\(assetURL))"))
+        check("quick note：quotes 双语引用",
+              request.quotes?.first?.src?.contains("gradient") == true
+                  && request.quotes?.first?.dst == "今天我们来聊聊梯度下降到底是怎么工作的。"
+                  && request.quotes?.first?.t0Ms == 83_400)
+        check("quick note：imageUrl 用服务端相对路径（contract）", request.imageUrl == assetPath,
+              detail: request.imageUrl ?? "nil")
+        check("quick note：text 截图用绝对 URL（便于渲染）", request.text.contains("![截图](\(assetURL))"))
+        check("Notes assets：相对路径严格校验",
+              NoteComposer.isValidAssetPath(assetPath)
+                  && !NoteComposer.isValidAssetPath(assetURL)
+                  && !NoteComposer.isValidAssetPath("/api/notes/assets/../x.png")
+                  && !NoteComposer.isValidAssetPath("/api/notes/assets/a.jpg"))
+        check("Notes assets：绝对 URL 可提取相对路径",
+              NoteComposer.relativeAssetPath(from: assetURL) == assetPath
+                  && NoteComposer.relativeAssetPath(from: assetPath) == assetPath
+                  && NoteComposer.relativeAssetPath(from: "") == nil
+                  && NoteComposer.relativeAssetPath(from: "not-a-url") == nil)
+        check("quick note：视频 ID / 标题",
+              request.video.id == "macos-s-test" && request.video.title == "macOS 系统音频 · livedub app")
+        check("quick note：文本长度上限", request.text.count <= NoteComposer.maxTextChars)
+
+        var emptyContext = context
+        emptyContext.translation = ""
+        emptyContext.source = ""
+        emptyContext.latencyMs = nil
+        emptyContext.statusText = "已停止"
+        let emptyRequest = NoteComposer.makeQuickRequest(context: emptyContext)
+        check("quick note：无字幕 -> （无字幕）",
+              emptyRequest.text.contains(NoteComposer.emptyCaption) && !emptyRequest.text.contains("**原文**"))
+        check("quick note：无字幕不带 quotes", emptyRequest.quotes == nil)
+        check("quick note：无截图时 imageUrl 为空", emptyRequest.imageUrl == nil)
+        var negativeContext = emptyContext
+        negativeContext.tMs = -500
+        check("quick note：tMs 负数归零", NoteComposer.makeQuickRequest(context: negativeContext).tMs == 0)
+
+        do {
+            let data = try JSONEncoder().encode(request)
+            let decoded = try JSONDecoder().decode(QuickNoteRequest.self, from: data)
+            let json = String(data: data, encoding: .utf8) ?? ""
+            check("quick note：JSON 编解码往返", decoded == request)
+            check("quick note：JSON 字段名与契约一致",
+                  json.contains("\"video\"") && json.contains("\"tMs\"") && json.contains("\"text\"")
+                      && json.contains("\"quotes\"") && json.contains("\"source\":\"macos\""))
+        } catch {
+            check("quick note：JSON 编解码往返", false, detail: "\(error)")
+            check("quick note：JSON 字段名与契约一致", false, detail: "\(error)")
+        }
+
+        // 文本清洗
+        check("文本清洗：折叠换行/空白", NoteComposer.normalizeInline("  a \n\n b\tc  ", maxLength: 100) == "a b c")
+        check("文本清洗：截断", NoteComposer.normalizeInline(String(repeating: "x", count: 100), maxLength: 10).count == 10)
+
+        // 离线队列（注入内存存储，不写用户偏好）
+        func makeNoteRequest(_ text: String) -> QuickNoteRequest {
+            var ctx = emptyContext
+            ctx.source = text
+            return NoteComposer.makeQuickRequest(context: ctx)
+        }
+
+        let store = InMemoryNotesStore()
+        let queue = NotesOfflineQueue(store: store)
+        for index in 0..<55 {
+            queue.enqueue(makeNoteRequest("note-\(index)"))
+        }
+        check("离线队列：上限 50", queue.count == 50 && NotesOfflineQueue.maxItems == 50)
+        check("离线队列：丢最旧、保最新",
+              queue.items.first?.request.text.contains("**原文**：note-5\n") == true
+                  && queue.items.last?.request.text.contains("**原文**：note-54\n") == true
+                  && queue.items.count == 50)
+        check("离线队列：持久化到注入存储",
+              store.loadNotesQueueData(NotesOfflineQueue.storageKey) != nil)
+        let removed = queue.removeFirst()
+        check("离线队列：removeFirst 按 FIFO",
+              removed?.request.text.contains("**原文**：note-5\n") == true
+                  && queue.count == 49
+                  && queue.peekFirst()?.request.text.contains("**原文**：note-6\n") == true)
+        let frontStore = InMemoryNotesStore()
+        let frontQueue = NotesOfflineQueue(store: frontStore)
+        frontQueue.enqueue(makeNoteRequest("a"))
+        frontQueue.enqueue(makeNoteRequest("b"))
+        frontQueue.enqueueFront(makeNoteRequest("z"), queuedAt: 0)
+        check("离线队列：enqueueFront 插回队首",
+              frontQueue.items.count == 3
+                  && frontQueue.items[0].request.text.contains("**原文**：z")
+                  && frontQueue.items[1].request.text.contains("**原文**：a")
+                  && frontQueue.items[2].request.text.contains("**原文**：b"))
+        frontQueue.clear()
+        check("离线队列：clear 清空并清存储",
+              frontQueue.count == 0 && frontStore.loadNotesQueueData(NotesOfflineQueue.storageKey) == nil)
+        let corruptStore = InMemoryNotesStore()
+        corruptStore.saveNotesQueueData(NotesOfflineQueue.storageKey, data: Data("not-json".utf8))
+        check("离线队列：损坏数据安全丢弃", NotesOfflineQueue(store: corruptStore).count == 0)
+        check("离线队列：存储 key 命名", NotesOfflineQueue.storageKey.contains("livedub.macos.notes"))
+
+        // 截图降级决策（不真截图）
+        check("截图决策：关闭 -> 纯文字",
+              ScreenshotPlanner.decide(includeScreenshot: false, permissionGranted: true, capturedBytes: 1024) == .textOnly(reason: "disabled"))
+        check("截图决策：无权限 -> 纯文字",
+              ScreenshotPlanner.decide(includeScreenshot: true, permissionGranted: false, capturedBytes: nil) == .textOnly(reason: "permission"))
+        check("截图决策：截图失败 -> 纯文字",
+              ScreenshotPlanner.decide(includeScreenshot: true, permissionGranted: true, capturedBytes: nil) == .textOnly(reason: "captureFailed"))
+        check("截图决策：超 4MB -> 纯文字",
+              ScreenshotPlanner.decide(includeScreenshot: true, permissionGranted: true, capturedBytes: 5 * 1024 * 1024) == .textOnly(reason: "tooLarge"))
+        check("截图决策：正常 -> 附加",
+              ScreenshotPlanner.decide(includeScreenshot: true, permissionGranted: true, capturedBytes: 1_500_000) == .attach)
+        check("截图上限 = 4MB", ScreenshotPlanner.maxAssetBytes == 4 * 1024 * 1024 && NotesClient.maxAssetBytes == 4 * 1024 * 1024)
+        check("截图降采样序列递减",
+              ScreenshotPlanner.scaleSteps.first == 1.0
+                  && ScreenshotPlanner.scaleSteps.count >= 3
+                  && zip(ScreenshotPlanner.scaleSteps, ScreenshotPlanner.scaleSteps.dropFirst()).allSatisfy { $0 > $1 })
+        check("截图降级文案含原因", ScreenshotPlanner.reasonText("tooLarge").contains("4MB"))
+
+        // 热键/网络常量
+        check("热键文案 = ⌥N", GlobalHotKey.displayName == "⌥N")
+        check("热键 keyCode = kVK_ANSI_N(45)", GlobalHotKey.keyCode == 45)
+        check("热键修饰键 = Carbon optionKey(2048)", GlobalHotKey.modifiers == 2_048)
+        check("Notes 请求超时 8s", NotesClient.requestTimeout == 8)
     }
 
     // MARK: - 断言帮手

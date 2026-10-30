@@ -25,6 +25,10 @@ final class OverlayContentView: NSView {
     let statusLabel = NSTextField(wrappingLabelWithString: "")
     let latencyLabel = NSTextField(wrappingLabelWithString: "")
 
+    private let toastContainer = NSView()
+    private let toastLabel = NSTextField(labelWithString: "")
+    private var toastHideWorkItem: DispatchWorkItem?
+
     private let contentInsets = NSEdgeInsets(top: 12, left: 16, bottom: 10, right: 16)
     private let cornerRadius: CGFloat = 14
     private let translationSourceSpacing: CGFloat = 4
@@ -43,6 +47,7 @@ final class OverlayContentView: NSView {
         super.init(frame: frameRect)
         wantsLayer = true
         configureLabels()
+        configureToast()
     }
 
     @available(*, unavailable)
@@ -124,6 +129,82 @@ final class OverlayContentView: NSView {
         return ceil(max(72, height))
     }
 
+    // MARK: Toast（⌥N 记笔记反馈）
+
+    private func configureToast() {
+        toastContainer.wantsLayer = true
+        toastContainer.layer?.backgroundColor = NSColor.black.withAlphaComponent(0.82).cgColor
+        toastContainer.layer?.cornerRadius = 9
+        toastContainer.layer?.borderWidth = 1
+        toastContainer.layer?.borderColor = NSColor.white.withAlphaComponent(0.16).cgColor
+        toastContainer.isHidden = true
+        addSubview(toastContainer)
+
+        toastLabel.isEditable = false
+        toastLabel.isSelectable = false
+        toastLabel.isBordered = false
+        toastLabel.drawsBackground = false
+        toastLabel.refusesFirstResponder = true
+        toastLabel.font = NSFont.systemFont(ofSize: 12, weight: .semibold)
+        toastLabel.textColor = .white
+        toastLabel.alignment = .center
+        toastLabel.lineBreakMode = .byTruncatingTail
+        toastContainer.addSubview(toastLabel)
+    }
+
+    /// 在浮层顶部弹一个短暂 toast（如「已记录笔记 · 14:20:33」）
+    func showToast(_ text: String, isError: Bool = false) {
+        toastLabel.stringValue = text
+        toastLabel.textColor = isError ? NSColor.systemRed : .white
+        toastContainer.isHidden = false
+        toastContainer.alphaValue = 1
+        toastHideWorkItem?.cancel()
+        needsLayout = true
+        layoutSubtreeIfNeeded()
+        layoutToast()
+
+        let work = DispatchWorkItem { [weak self] in
+            self?.hideToast(animated: true)
+        }
+        toastHideWorkItem = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2.6, execute: work)
+    }
+
+    func hideToast(animated: Bool) {
+        toastHideWorkItem?.cancel()
+        toastHideWorkItem = nil
+        guard !toastContainer.isHidden else { return }
+        if animated {
+            NSAnimationContext.runAnimationGroup { context in
+                context.duration = 0.25
+                toastContainer.animator().alphaValue = 0
+            } completionHandler: { [weak self] in
+                self?.toastContainer.isHidden = true
+                self?.toastContainer.alphaValue = 1
+            }
+        } else {
+            toastContainer.isHidden = true
+            toastContainer.alphaValue = 1
+        }
+    }
+
+    private func layoutToast() {
+        guard !toastContainer.isHidden else { return }
+        let horizontalPadding: CGFloat = 14
+        let intrinsic = toastLabel.sizeThatFits(
+            NSSize(width: max(40, bounds.width - 32 - horizontalPadding * 2), height: 40)
+        )
+        let width = max(80, min(bounds.width - 24, ceil(intrinsic.width) + horizontalPadding * 2 + 4))
+        let height: CGFloat = 26
+        toastContainer.frame = NSRect(x: (bounds.width - width) / 2, y: 8, width: width, height: height)
+        toastLabel.frame = NSRect(
+            x: horizontalPadding,
+            y: (height - ceil(intrinsic.height)) / 2,
+            width: max(20, width - horizontalPadding * 2),
+            height: ceil(intrinsic.height)
+        )
+    }
+
     override func layout() {
         super.layout()
         let available = max(80, bounds.width - contentInsets.left - contentInsets.right)
@@ -152,6 +233,7 @@ final class OverlayContentView: NSView {
             width: max(40, available - statusWidth - 8),
             height: statusRowHeight
         )
+        layoutToast()
     }
 
     private func labelHeight(_ label: NSTextField, width: CGFloat, maxLines: Int) -> CGFloat {
@@ -219,6 +301,7 @@ final class OverlayController: NSObject, NSWindowDelegate {
     }
 
     func hide() {
+        content?.hideToast(animated: false)
         panel?.orderOut(nil)
         onVisibilityChanged?(false)
     }
@@ -244,6 +327,15 @@ final class OverlayController: NSObject, NSWindowDelegate {
     }
 
     // MARK: 内容更新
+
+    /// 顶部 toast（记笔记成功/失败提示）。浮层隐藏时只写日志，不强行弹窗打扰用户。
+    func showToast(_ text: String, isError: Bool = false) {
+        guard let content, isVisible else {
+            onLog?("[overlay] \(text)")
+            return
+        }
+        content.showToast(text, isError: isError)
+    }
 
     func setCaption(translation: String, source: String) {
         currentTranslation = translation

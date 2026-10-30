@@ -116,6 +116,7 @@
       .guidance-body { white-space: pre-line; color: #b9cbe4; }
       .guidance-actions { display: flex; gap: 6px; margin-top: 8px; }
       .guidance-actions button { flex: 1; font-size: 11.5px; padding: 6px 8px; }
+      .inline { display: flex; align-items: center; gap: 5px; color: var(--muted); font-size: 11.5px; flex: 1; }
     </style>
   </head>
   <body>
@@ -186,6 +187,19 @@
         <button id="export-srt" class="ghost" type="button">导出本次 SRT</button>
       </div>
       <p class="hint" id="caption-count">本次会话字幕 0 条</p>
+    </section>
+
+    <section class="card" id="notes-card">
+      <div class="kv"><span>笔记</span><b id="note-stats">今日 0 条 · 待同步 0</b></div>
+      <div class="actions">
+        <button id="capture-note" class="ghost" type="button">记当前句</button>
+        <button id="open-notebook" class="ghost" type="button">打开笔记本</button>
+      </div>
+      <div class="actions">
+        <button id="export-notes" class="ghost" type="button">导出 Markdown</button>
+        <label class="inline"><input type="checkbox" id="note-screenshot" /> 附页面截图</label>
+      </div>
+      <p class="hint" id="note-hint">快捷键 Alt+Shift+N 记笔记 · Alt+Shift+L 开始/停止。截图与笔记只存本机 data/notes/。</p>
     </section>
 
     <p class="hint footer">

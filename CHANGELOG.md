@@ -3,6 +3,29 @@
 All notable changes to livedub are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/), versioning: [SemVer](https://semver.org/).
 
+## [0.4.0] - 2026-10-30
+
+看视频边实现边写笔记。
+
+### Added
+
+- **学习笔记 / Notes API**（`engine/server.mjs`）：笔记 CRUD、`/api/notes/quick` 快捷追加、
+  PNG 资产、Markdown 导出到 `data/exports/`；数据只落本机 `data/notes/`（gitignore）。
+- **工作台学习笔记面板**：按 `N` 在当前时间新建、Markdown 编辑+预览、插入当前双语字幕/时间戳/
+  代码块/视频截图、自动保存、搜索、点击笔记 seek 回放、生成课程大纲、复制/下载/写文件导出、
+  **画中画（PiP）** 边看边写。
+- **Chrome 扩展快捷笔记**：`Alt+Shift+N` 记录当前句双语字幕 + 时间戳 +（可选）页面截图，
+  离线队列、popup 今日笔记数/打开笔记本/导出 Markdown。
+- **macOS App 全局笔记**：`⌥N` 全局热键（无第三方依赖）、可选屏幕截图（SCScreenshotManager）、
+  离线队列、菜单栏入口。
+- **CLI**：`npm run note -- "..."`（`scripts/note.mjs`），支持视频/时间/标签/截图，
+  引擎离线时自动写 `data/notes/quick-YYYY-MM-DD.md`。
+- 文档：[docs/NOTES.md](docs/NOTES.md)（三种工作流 / Obsidian 集成 / 隐私）。
+
+### Changed
+
+- 版本 0.4.0；package scripts 增加 `note`。
+
 ## [0.3.0] - 2026-10-29
 
 「全部补齐」版本：云端 ASR、火山声音复刻、macOS 桌面悬浮窗、全局限定压音、裸视频全屏。

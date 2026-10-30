@@ -53,6 +53,15 @@
     <symbol id="i-desktop" viewBox="0 0 24 24"><rect x="3" y="4.5" width="18" height="12" rx="2.5"/><path d="M8 20.5h8M12 16.5v4"/></symbol>
     <symbol id="i-copy" viewBox="0 0 24 24"><rect x="8.5" y="8.5" width="11" height="11" rx="2.5"/><path d="M15.5 8.5V6a2 2 0 0 0-2-2h-7a2 2 0 0 0-2 2v7a2 2 0 0 0 2 2h2.5"/></symbol>
     <symbol id="i-check" viewBox="0 0 24 24"><path d="m5 12.5 4.5 4.5L19 7.5"/></symbol>
+    <symbol id="i-note" viewBox="0 0 24 24"><path d="M6 3.5h9.5L20 8v12.5H6z"/><path d="M15 3.5V8h4.5M9 12h6M9 15.5h6M9 19h3.5"/></symbol>
+    <symbol id="i-camera" viewBox="0 0 24 24"><path d="M4 8.5h3l1.6-2.5h6.8L17 8.5h3v10H4z"/><circle cx="12" cy="13.5" r="3.2"/></symbol>
+    <symbol id="i-trash" viewBox="0 0 24 24"><path d="M5 7h14M9.5 7V4.5h5V7M7 7l1 13h8l1-13"/></symbol>
+    <symbol id="i-tag" viewBox="0 0 24 24"><path d="M3.5 12.5 12.5 3.5H20v7.5l-9 9z"/><circle cx="16.5" cy="7.5" r="1.2"/></symbol>
+    <symbol id="i-pip" viewBox="0 0 24 24"><rect x="2.5" y="4.5" width="19" height="15" rx="2.5"/><rect x="12" y="11.5" width="7" height="5.5" rx="1"/></symbol>
+    <symbol id="i-clock" viewBox="0 0 24 24"><circle cx="12" cy="12" r="8.5"/><path d="M12 7.5V12l3 2"/></symbol>
+    <symbol id="i-list" viewBox="0 0 24 24"><path d="M8.5 6.5h12M8.5 12h12M8.5 17.5h12M4 6.5h.5M4 12h.5M4 17.5h.5"/></symbol>
+    <symbol id="i-close" viewBox="0 0 24 24"><path d="m6 6 12 12M18 6 6 18"/></symbol>
+    <symbol id="i-search" viewBox="0 0 24 24"><circle cx="11" cy="11" r="6.5"/><path d="m16 16 4.5 4.5"/></symbol>
   </svg>
 
   <div class="app">
@@ -82,6 +91,10 @@
       </div>
 
       <div class="topbar-actions">
+        <button id="btnNotes" class="btn btn-ghost notes-toggle" title="学习笔记（N）" aria-label="打开学习笔记" aria-expanded="false" aria-controls="notesDrawer">
+          <svg class="icon"><use href="#i-note"/></svg><span>笔记</span>
+          <i class="notes-count" id="notesCountBadge" hidden>0</i>
+        </button>
         <button id="btnTheme" class="icon-btn theme-toggle" title="切换暗色 / 亮色主题" aria-label="切换亮色或暗色主题" aria-pressed="false">
           <svg class="icon theme-icon theme-icon-moon"><use href="#i-moon"/></svg>
           <svg class="icon theme-icon theme-icon-sun"><use href="#i-sun"/></svg>
@@ -131,6 +144,7 @@
                 <span><kbd>S</kbd> 字幕</span>
                 <span><kbd>D</kbd> 配音</span>
                 <span><kbd>Esc</kbd> 面板</span>
+                <span><kbd>N</kbd> 笔记</span>
               </div>
             </div>
           </div>
@@ -161,6 +175,9 @@
             </button>
             <button id="btnStopVideo" class="icon-btn" title="停止播放" aria-label="停止播放并回到开头" disabled>
               <svg class="icon"><use href="#i-stop"/></svg>
+            </button>
+            <button id="btnPip" class="icon-btn" title="画中画（边看边写笔记）" aria-label="切换画中画" aria-pressed="false" disabled>
+              <svg class="icon"><use href="#i-pip"/></svg>
             </button>
             <span class="time" id="timeCurrent">00:00</span>
             <input id="seek" class="seek" type="range" min="0" max="1000" step="1" value="0" aria-label="播放进度" disabled />
@@ -345,7 +362,7 @@
             </button>
             <button id="btnSubsReset" class="link">重置位置</button>
           </div>
-          <p class="panel-hint"><svg class="icon hint-icon"><use href="#i-keyboard"/></svg>Space 播放 · S 字幕 · D 配音 · Esc 面板</p>
+          <p class="panel-hint"><svg class="icon hint-icon"><use href="#i-keyboard"/></svg>Space 播放 · S 字幕 · D 配音 · N 笔记 · Esc 面板</p>
         </section>
 
         <section class="card panel panel-glossary">
@@ -402,6 +419,102 @@
       <span class="status-item privacy" id="footerPrivacy">音频不离开本机 · 字幕不写入磁盘</span>
     </footer>
   </div>
+
+  <aside id="notesDrawer" class="notes-drawer" aria-label="学习笔记" aria-hidden="true">
+    <header class="notes-head">
+      <div class="notes-head-title">
+        <span class="notes-head-icon"><svg class="icon"><use href="#i-note"/></svg></span>
+        <div>
+          <strong>学习笔记</strong>
+          <span id="notesVideoTitle">未加载视频</span>
+        </div>
+      </div>
+      <span class="tag" id="notesCount">0 条</span>
+      <span class="spacer"></span>
+      <button id="btnNotesNew" class="btn btn-primary btn-sm" type="button" title="在当前时间点新建笔记（N）">
+        <svg class="icon"><use href="#i-plus"/></svg><span>新建</span>
+      </button>
+      <button id="btnNotesOutline" class="btn btn-ghost btn-sm" type="button" title="用本次会话字幕生成课程大纲">
+        <svg class="icon"><use href="#i-list"/></svg><span>大纲</span>
+      </button>
+      <details id="notesExportMenu" class="notes-export">
+        <summary class="btn btn-ghost btn-sm" title="导出 Markdown">
+          <svg class="icon"><use href="#i-download"/></svg><span>导出</span>
+        </summary>
+        <div class="notes-menu" role="menu">
+          <button type="button" data-export="copy" role="menuitem">复制 Markdown</button>
+          <button type="button" data-export="download" role="menuitem">下载 .md</button>
+          <button type="button" data-export="write" role="menuitem">写入 data/exports</button>
+        </div>
+      </details>
+      <button id="btnNotesClose" class="icon-btn" type="button" title="关闭笔记面板（Esc）" aria-label="关闭学习笔记">
+        <svg class="icon"><use href="#i-close"/></svg>
+      </button>
+    </header>
+    <div id="notesOfflineBanner" class="notes-offline" hidden>
+      <svg class="icon"><use href="#i-alert"/></svg>
+      <span>引擎不可用：笔记暂存在浏览器 localStorage，不会丢失。</span>
+      <button id="btnNotesRetry" class="link" type="button">重试同步</button>
+    </div>
+    <div class="notes-toolbar">
+      <div class="notes-search">
+        <svg class="icon"><use href="#i-search"/></svg>
+        <input id="notesSearch" type="search" placeholder="搜索笔记正文 / 引用 / 标签…" aria-label="搜索笔记" spellcheck="false" />
+      </div>
+      <span class="spacer"></span>
+      <span id="notesSaveStatus" class="notes-status" aria-live="polite">—</span>
+    </div>
+    <div class="notes-body">
+      <section class="notes-editor-pane" aria-label="笔记编辑器">
+        <div class="notes-tabs" role="tablist" aria-label="编辑或预览">
+          <button id="notesTabEdit" class="notes-tab" type="button" role="tab" aria-selected="true" data-tab="edit">编辑</button>
+          <button id="notesTabPreview" class="notes-tab" type="button" role="tab" aria-selected="false" data-tab="preview">预览</button>
+          <span class="spacer"></span>
+          <span id="notesNoteTime" class="notes-note-time">—</span>
+        </div>
+        <div class="notes-insertbar">
+          <button id="btnInsertQuote" class="btn btn-ghost btn-sm" type="button" title="插入当前双语字幕（含 quote）">
+            <svg class="icon"><use href="#i-subtitles"/></svg><span>当前句</span>
+          </button>
+          <button id="btnInsertTimestamp" class="btn btn-ghost btn-sm" type="button" title="插入当前时间戳锚点">
+            <svg class="icon"><use href="#i-clock"/></svg><span>时间戳</span>
+          </button>
+          <button id="btnInsertCode" class="btn btn-ghost btn-sm" type="button" title="插入代码块（Ctrl/Cmd+Shift+C）">
+            <svg class="icon"><use href="#i-code"/></svg><span>代码块</span>
+          </button>
+          <button id="btnInsertScreenshot" class="btn btn-ghost btn-sm" type="button" title="截取当前视频帧并保存到笔记">
+            <svg class="icon"><use href="#i-camera"/></svg><span>截图</span>
+          </button>
+          <span class="spacer"></span>
+          <label class="notes-tags">
+            <svg class="icon"><use href="#i-tag"/></svg>
+            <input id="notesTagsInput" type="text" placeholder="标签：ml, 优化" aria-label="笔记标签（逗号分隔）" spellcheck="false" />
+          </label>
+        </div>
+        <textarea id="notesEditor" class="notes-editor" spellcheck="false" aria-label="笔记 Markdown 编辑器" placeholder="用 Markdown 记录：&#10;# 本节要点&#10;- 反方向走一小步&#10;&#10;快捷键：Ctrl/Cmd+Enter 保存、Ctrl/Cmd+Shift+C 插入代码块"></textarea>
+        <div id="notesPreview" class="notes-preview markdown-body" role="tabpanel" hidden></div>
+        <div class="notes-editor-foot">
+          <span id="notesEditorHint">Markdown · 自动保存</span>
+          <span class="spacer"></span>
+          <span id="notesTagsValue">无标签</span>
+        </div>
+      </section>
+      <section class="notes-list-pane" aria-label="笔记时间线">
+        <div class="notes-list-head">
+          <h3><svg class="icon"><use href="#i-list"/></svg>笔记时间线</h3>
+          <span id="notesListCount" class="muted">0 条</span>
+        </div>
+        <div id="notesList" class="notes-list">
+          <div class="notes-empty">载入视频后按 <kbd>N</kbd> 新建第一条笔记</div>
+        </div>
+      </section>
+    </div>
+    <footer class="notes-foot">
+      <span>笔记只保存在本机 <code class="inline-code">data/notes/</code></span>
+      <span class="spacer"></span>
+      <span class="muted">N 新建 · Ctrl/Cmd+Enter 保存 · Esc 关闭</span>
+    </footer>
+  </aside>
 
   <button id="btnSubsOnlyExit" class="float-btn" type="button" hidden>退出仅字幕 <kbd>Esc</kbd></button>
   <button id="btnPanelsShow" class="float-btn" type="button" hidden>显示面板 <kbd>Esc</kbd></button>

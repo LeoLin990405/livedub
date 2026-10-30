@@ -18,6 +18,10 @@ export const STORAGE_KEYS = Object.freeze({
   bgState: 'livedub:bg-state',
   /** chrome.storage.session：本次会话的 segment+translation 累积（用于导出 SRT 跨 SW 回收） */
   captions: 'livedub:captions',
+  /** chrome.storage.local：笔记离线队列（POST 失败时排队，引擎重连后 flush） */
+  noteQueue: 'livedub:note-queue',
+  /** chrome.storage.local：今日笔记计数（本地统计，离线可用） */
+  noteStats: 'livedub:note-stats',
 });
 
 /** 跨上下文消息类型（popup/content <-> background <-> offscreen） */
@@ -42,6 +46,16 @@ export const MSG = Object.freeze({
   ENGINE_EVENT: 'livedub:event',
   CONTENT_SETTINGS: 'livedub:settings',
   PING: 'livedub:ping',
+
+  // ---- v0.4 笔记（background <-> content / popup） ----
+  /** popup / content -> background：记录当前句为笔记（快捷键 Alt+Shift+N 走 commands） */
+  CAPTURE_NOTE: 'livedub:capture-note',
+  /** background -> content：请求当前视频/字幕上下文（返回 {ok,context}） */
+  NOTE_CONTEXT: 'livedub:note-context',
+  /** background -> content：记录结果（成功/排队 toast） */
+  NOTE_RESULT: 'livedub:note-result',
+  /** popup -> background：导出当前视频笔记 Markdown（POST /api/notes/export） */
+  EXPORT_NOTES: 'livedub:export-notes',
 
   // ---- background <-> offscreen ----
   OFFSCREEN_HELLO: 'livedub:offscreen-hello',
@@ -93,6 +107,8 @@ export const DEFAULT_SETTINGS = Object.freeze({
   duckRecoverMs: 800,
   /** v0.3：裸 <video> 全屏兼容（拦截站点 requestFullscreen 包一层容器） */
   fullscreenWorkaround: true,
+  /** v0.4：记笔记时是否附带页面截图（captureVisibleTab） */
+  noteScreenshot: true,
   langFrom: 'en',
   langTo: 'zh',
   /** 是否隐藏浮层（从 popup 可重新打开） */

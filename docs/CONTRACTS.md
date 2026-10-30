@@ -209,6 +209,27 @@ v0.3 新增 provider（均按 §4 契约）：ASR `minimax-cloud`（`asr.minimax
 TTS `volcengine`（`providers.volcengine`、`tts.volcengine.*`、`tts.clone.chain`，含 `cloneVoice`/`voiceCloneStatus`）。
 macOS 桌面 App（`apps/macos/`）是线协议 §3 的另一个客户端，行为与浏览器端一致。
 
+## 7.6 笔记 API（v0.4，HTTP，三端共用）
+
+```
+VideoRef = { id, title, url?, durationMs? }         // id 由客户端生成且稳定
+Note    = { id, video, tMs, body(Markdown<=200KB), quotes?, tags?, imageUrl?, kind?, source, createdAt, updatedAt }
+
+GET    /api/notes?videoId=&q=&limit=200             -> {ok,videos[],notes[]}
+POST   /api/notes                                    -> {ok,note}
+PUT    /api/notes/:id                                -> {ok,note}
+DELETE /api/notes/:id                                -> {ok,deleted:true}
+POST   /api/notes/quick     {video,tMs,text,quotes?,tags?,source,imageUrl?} -> {ok,path,markdown,note}
+                                // 同时写入笔记库（kind:'quick'，GET/导出可见）并追加 data/notes/quick-YYYY-MM-DD.md
+POST   /api/notes/assets    raw PNG(<=4MB)           -> {ok,url}
+GET    /api/notes/assets/:file                       -> image/png
+GET    /api/notes/export.md?videoId=                 -> text/markdown
+POST   /api/notes/export    {videoId}                -> {ok,path}  // data/exports/<slug>-<date>.md
+```
+
+约束：笔记只落本机 `data/notes/`（gitignore）、不上传；字段白名单/大小限制；文件名仅 `[A-Za-z0-9._-]`；不写密钥；`imageUrl` 只接受 `POST /api/notes/assets` 返回的相对路径（绝对 URL 400）。
+客户端：工作台（Markdown 编辑/截图/大纲/导出/画中画）、Chrome 扩展（`Alt+Shift+N`）、macOS App（`⌥N`）、`scripts/note.mjs` CLI。
+
 ## 8. 已知坑（别重复踩）
 
 - `~/.sayless/models/` 目录在本机曾消失，`ggml-large-v3-turbo.bin` 已不可用；用项目内 `models/ggml-large-v3-turbo-q5_0.bin`。

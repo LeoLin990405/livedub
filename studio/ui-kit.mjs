@@ -56,8 +56,8 @@ export function isEditableTarget(target) {
 
 /**
  * 解析键盘事件为工作台动作；不满足条件返回 null。
- * 支持：Space 播放/暂停、S 字幕、D 配音、Escape 隐藏面板。
- * @returns {'toggle-play'|'toggle-subs'|'toggle-dub'|'escape'|null}
+ * 支持：Space 播放/暂停、S 字幕、D 配音、N 新建笔记、Escape 隐藏面板/关闭面板。
+ * @returns {'toggle-play'|'toggle-subs'|'toggle-dub'|'new-note'|'escape'|null}
  */
 export function resolveShortcut(event, { editable = false } = {}) {
   if (!event || editable) return null;
@@ -69,6 +69,7 @@ export function resolveShortcut(event, { editable = false } = {}) {
   if (code === 'Space' || key === ' ') return 'toggle-play';
   if (code === 'KeyS' || key === 's') return 'toggle-subs';
   if (code === 'KeyD' || key === 'd') return 'toggle-dub';
+  if (code === 'KeyN' || key === 'n') return 'new-note';
   if (code === 'Escape' || key === 'escape') return 'escape';
   return null;
 }

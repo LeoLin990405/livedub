@@ -6,9 +6,13 @@
 //        -> 本地 livedub 引擎（ws://127.0.0.1:8787/ws）
 //        -> 置顶双语字幕浮层 + 中文配音。
 //
+//  v0.4：全局 ⌥N「快捷笔记」——把当前双语字幕 + 时间戳 +（可选）屏幕截图
+//        记进本地引擎 Notes API（失败进离线队列，重连后自动补发）。
+//
 //  入口参数：
 //    --self-test             headless 自检（不建窗口、不请求权限、不联网），退出码 0/1
 //    --simulate              不抓音频/不连引擎，循环演示字幕/状态/延迟（无权限环境验证 UI）
+//    --note-once             启动后 2.5s 自动触发一条测试笔记，记录完退出（冒烟用）
 //    --duration <秒>         自动退出（调试/冒烟用）
 //    --engine-url <url>      覆盖引擎地址
 //    -h, --help              帮助
@@ -25,6 +29,7 @@ struct LaunchOptions {
     var autoStart = false
     var duration: Double?
     var engineURL: String?
+    var noteOnce = false
     var help = false
 
     static let helpText = """
@@ -34,6 +39,8 @@ struct LaunchOptions {
 
       --simulate            不抓音频/不连引擎，循环演示双语字幕、状态与延迟（无权限环境验证 UI）
       --autostart           启动后自动点一次「开始同传」（适合登录项 / 自动化冒烟）
+      --note-once           调试/冒烟：启动 2.5s 后自动记一条笔记（截图/离线队列全链路），
+                            记录完成后退出（配合 --engine-url 指向测试引擎）
       --duration <秒>       调试用：N 秒后自动退出（配合 --simulate 可做冒烟）
       --engine-url <url>    覆盖引擎地址（默认 ws://127.0.0.1:8787/ws）
       --self-test           headless 自检（协议字节布局 / hello / 事件解析 / 字幕排版），退出码 0/1
@@ -55,6 +62,8 @@ struct LaunchOptions {
                 options.simulate = true
             case "--autostart":
                 options.autoStart = true
+            case "--note-once":
+                options.noteOnce = true
             case "-h", "--help":
                 options.help = true
             case "--duration":
@@ -101,6 +110,30 @@ let delegate = AppDelegate(options: launchOptions)
 application.delegate = delegate
 application.run()
 
+// MARK: - 线程安全的音频时钟
+
+/// 音频回调（采集线程）写、⌥N（主线程）读的会话时间轴毫秒
+final class AtomicDouble {
+    private let lock = NSLock()
+    private var value: Double
+
+    init(_ value: Double) {
+        self.value = value
+    }
+
+    func set(_ newValue: Double) {
+        lock.lock()
+        value = newValue
+        lock.unlock()
+    }
+
+    func get() -> Double {
+        lock.lock()
+        defer { lock.unlock() }
+        return value
+    }
+}
+
 // MARK: - AppDelegate
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
@@ -142,6 +175,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var fontSizeUpMenuItem: NSMenuItem?
     private var fontSizeDownMenuItem: NSMenuItem?
 
+    // v0.4 快捷笔记
+    private var notesClient: NotesClient?
+    private var notesFlushTimer: Timer?
+    private var noteOnceTimer: Timer?
+    private var noteMenuItem: NSMenuItem?
+    private var openNotesMenuItem: NSMenuItem?
+    private var openWorkbenchMenuItem: NSMenuItem?
+    private var notesScreenshotMenuItem: NSMenuItem?
+    private var notesWhenPausedMenuItem: NSMenuItem?
+    private var notesQueueMenuItem: NSMenuItem?
+    private let lastAudioTMs = AtomicDouble(0)
+    private var isEnginePaused = false
+    private var lastEngineSessionId: String?
+    private var lastEngineProviders: [String: String] = [:]
+    private var notesInFlight = false
+    private var exitAfterNote = false
+    private var lastNoteClock = ""
+
     init(options: LaunchOptions) {
         self.options = options
         super.init()
@@ -161,7 +212,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             settings.engineURL = override
         }
 
+        setupNotes()
         setupAutoQuit()
+
+        if options.noteOnce {
+            // 只给 --note-once 时：记录完成即退出（冒烟）；若同时显式给 --duration，则保持运行到时长
+            exitAfterNote = (options.duration == nil)
+            noteOnceTimer = Timer.scheduledTimer(withTimeInterval: 2.5, repeats: false) { [weak self] _ in
+                self?.log("[notes] --note-once：触发一条测试笔记")
+                self?.takeNote(trigger: "--note-once")
+            }
+        }
 
         if options.simulate {
             startSimulation()
@@ -175,6 +236,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         permissionTimer?.invalidate()
         simulateTimer?.invalidate()
         autoQuitTimer?.invalidate()
+        notesFlushTimer?.invalidate()
+        noteOnceTimer?.invalidate()
+        GlobalHotKey.shared.unregister()
         capture?.stop()
         engine?.stop()
         dubPlayer?.stop()
@@ -206,6 +270,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(.separator())
 
         toggleMenuItem = addMenuItem(to: menu, title: "开始同传", action: #selector(toggleSession))
+        noteMenuItem = addMenuItem(
+            to: menu,
+            title: "记笔记（\(GlobalHotKey.displayName)）",
+            action: #selector(takeNoteFromMenu),
+            keyEquivalent: "n",
+            modifiers: [.option]
+        )
+        noteMenuItem?.toolTip = "把当前双语字幕 + 时间戳（+ 可选截图）记进本地笔记库；全局快捷键 \(GlobalHotKey.displayName)"
+        openNotesMenuItem = addMenuItem(to: menu, title: "打开笔记（工作台学习笔记）", action: #selector(openNotesPanel))
+        openWorkbenchMenuItem = addMenuItem(to: menu, title: "打开工作台", action: #selector(openWorkbench))
+        menu.addItem(.separator())
+
         overlayMenuItem = addMenuItem(to: menu, title: "显示字幕浮层", action: #selector(toggleOverlay))
         clickThroughMenuItem = addMenuItem(to: menu, title: "字幕点击穿透", action: #selector(toggleClickThrough))
         clickThroughMenuItem?.toolTip = "开启后鼠标事件穿透浮层（可点击下方窗口/播放器），但浮层不能拖动"
@@ -216,6 +292,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         fontSizeDownMenuItem = addMenuItem(to: menu, title: "减小字幕字号", action: #selector(decreaseFontSize))
 
         menu.addItem(.separator())
+        notesScreenshotMenuItem = addMenuItem(to: menu, title: "记笔记时附截图", action: #selector(toggleNotesScreenshot))
+        notesScreenshotMenuItem?.toolTip = "开启后用 SCScreenshotManager 截当前屏幕作为笔记附件（复用屏幕录制权限，不含 livedub 浮层）"
+        notesWhenPausedMenuItem = addMenuItem(to: menu, title: "暂停时仍可笔记", action: #selector(toggleNotesWhenPaused))
+        notesWhenPausedMenuItem?.toolTip = "同传暂停时仍允许 \(GlobalHotKey.displayName) 记录当前字幕"
+        notesQueueMenuItem = addMenuItem(to: menu, title: "笔记队列：空", action: nil)
+        menu.addItem(.separator())
+
         _ = addMenuItem(to: menu, title: "设置引擎地址…", action: #selector(editEngineURL))
         _ = addMenuItem(to: menu, title: "打开屏幕录制权限设置…", action: #selector(openPermissionSettings))
         _ = addMenuItem(to: menu, title: "重置字幕位置", action: #selector(resetOverlayPosition))
@@ -233,13 +316,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         to menu: NSMenu,
         title: String,
         action: Selector?,
-        keyEquivalent: String = ""
+        keyEquivalent: String = "",
+        modifiers: NSEvent.ModifierFlags = [.command]
     ) -> NSMenuItem {
         let item = NSMenuItem(title: title, action: action, keyEquivalent: keyEquivalent)
         item.target = action == nil ? nil : self
         item.isEnabled = action != nil
         if !keyEquivalent.isEmpty {
-            item.keyEquivalentModifierMask = [.command]
+            item.keyEquivalentModifierMask = modifiers
         }
         menu.addItem(item)
         return item
@@ -257,6 +341,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         sourceLineMenuItem?.state = settings.showSourceLine ? .on : .off
         fontSizeUpMenuItem?.isEnabled = settings.fontSize < 40
         fontSizeDownMenuItem?.isEnabled = settings.fontSize > 11
+        notesScreenshotMenuItem?.state = settings.notesIncludeScreenshot ? .on : .off
+        notesWhenPausedMenuItem?.state = settings.notesWhenPaused ? .on : .off
+        refreshNotesQueueMenu()
     }
 
     // MARK: 开始/停止
@@ -356,6 +443,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         let capture = ScreenAudioCapture()
         capture.onAudioFrame = { [weak self] tMs, samples in
+            self?.lastAudioTMs.set(tMs)
             self?.engine?.sendAudioFrame(tMs: tMs, samples: samples)
         }
         capture.onLog = { [weak self] message in self?.log(message) }
@@ -396,6 +484,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         currentLatencyMs = nil
         currentTranslation = ""
         currentSource = ""
+        isEnginePaused = false
         overlay?.setPlaceholder("已停止 · 从菜单栏「开始同传」继续")
         overlay?.setStatus("已停止", latencyMs: nil)
         refreshMenu()
@@ -415,7 +504,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             overlay?.setStatus("引擎重连中…", latencyMs: nil)
         case .connected:
             currentStatus = "已连接 · 等待音频"
+            isEnginePaused = false
             overlay?.setStatus("已连接 · 聆听中", latencyMs: currentLatencyMs)
+            flushNotesQueue(reason: "引擎已连接")
         case .disconnected:
             if isRunning {
                 currentStatus = "引擎未连接"
@@ -434,6 +525,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard !isSimulating else { return }
         switch event {
         case let .ready(sessionId, _, providers, voiceMode, voiceId):
+            lastEngineSessionId = sessionId
+            lastEngineProviders = providers
             lastEngineDetail = "session=\(sessionId.prefix(8)) asr=\(providers["asr"] ?? "?") mt=\(providers["translate"] ?? "?") tts=\(providers["tts"] ?? "?") voice=\(voiceMode)/\(voiceId)"
             log("[engine] ready \(lastEngineDetail)")
             currentStatus = "聆听中"
@@ -444,6 +537,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 currentStatus = "引擎错误"
                 overlay?.setStatus("引擎错误\(detail.map { "：\($0)" } ?? "")", latencyMs: currentLatencyMs, isError: true)
             } else {
+                isEnginePaused = (state == "paused")
                 currentStatus = CaptionLayout.statusLabel(state)
                 if let detail, !detail.isEmpty { lastEngineDetail = detail }
                 overlay?.setStatus(currentStatus, latencyMs: currentLatencyMs)
@@ -557,6 +651,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         currentLatencyMs = nil
         currentTranslation = ""
         currentSource = ""
+        isEnginePaused = false
         overlay?.setPlaceholder("已停止 · 从菜单栏「开始同传」继续")
         overlay?.setStatus("已停止", latencyMs: nil)
         refreshMenu()
@@ -564,7 +659,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func setupAutoQuit() {
-        guard let duration = options.duration, duration > 0 else { return }
+        // --note-once 没显式给 --duration 时给一个兜底，避免记录链路异常时 App 挂住
+        let fallback = options.noteOnce ? 20.0 : nil
+        guard let duration = options.duration ?? fallback, duration > 0 else { return }
         autoQuitTimer = Timer.scheduledTimer(withTimeInterval: duration, repeats: false) { _ in
             NSApp.terminate(nil)
         }
@@ -655,6 +752,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard alert.runModal() == .alertFirstButtonReturn else { return }
 
         settings.engineURL = field.stringValue
+        notesClient?.updateEngineURL(settings.engineURL)
         log("[app] 引擎地址改为 \(settings.engineURL)")
         refreshMenu()
         if isRunning {
@@ -667,7 +765,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     @objc private func showDiagnostics() {
         NSApp.activate(ignoringOtherApps: true)
         var lines: [String] = []
-        lines.append("livedub macOS app（v0.3）")
+        lines.append("livedub macOS app（v0.4）")
         lines.append("状态：\(currentStatus)")
         lines.append("引擎地址：\(settings.engineURL)")
         if let engine {
@@ -687,6 +785,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             if let error = dubPlayer.lastError { lines.append("配音错误：\(error)") }
         }
         if !lastEngineDetail.isEmpty { lines.append("引擎详情：\(lastEngineDetail)") }
+        if let notesClient {
+            lines.append(
+                "笔记：队列 \(notesClient.queueCount) 条 · 快捷键 \(GlobalHotKey.displayName) "
+                    + "\(GlobalHotKey.shared.isRegistered ? "已注册" : "未注册")"
+                    + " · 附截图 \(settings.notesIncludeScreenshot ? "开" : "关")"
+                    + " · 暂停可笔记 \(settings.notesWhenPaused ? "开" : "关")"
+            )
+            lines.append("Notes API：\(notesClient.baseURLString)")
+            if let error = notesClient.lastErrorText { lines.append("笔记最近错误：\(error)") }
+        }
+        if !lastNoteClock.isEmpty { lines.append("最近一条笔记：\(lastNoteClock)") }
         lines.append("")
         lines.append("最近日志：")
         lines.append(contentsOf: logLines.suffix(12))
@@ -703,6 +812,217 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             NSPasteboard.general.setString(text, forType: .string)
             log("[app] 诊断信息已复制到剪贴板")
         }
+    }
+
+    // MARK: - 快捷笔记（v0.4 · ⌥N）
+
+    private func setupNotes() {
+        let client = NotesClient(engineURL: settings.engineURL)
+        client.onLog = { [weak self] message in self?.log(message) }
+        notesClient = client
+
+        GlobalHotKey.shared.onLog = { [weak self] message in self?.log(message) }
+        let registered = GlobalHotKey.shared.register { [weak self] in
+            self?.takeNote(trigger: "快捷键 \(GlobalHotKey.displayName)")
+        }
+        if registered {
+            log("[notes] 全局快捷键 \(GlobalHotKey.displayName) 已就绪（记笔记）")
+        } else {
+            log("[notes] ⚠️ 全局快捷键 \(GlobalHotKey.displayName) 注册失败（可能被其它 App 占用），可用菜单栏「记笔记」")
+        }
+
+        notesFlushTimer?.invalidate()
+        notesFlushTimer = Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { [weak self] _ in
+            self?.flushNotesQueue(reason: "定时器")
+        }
+        refreshNotesQueueMenu()
+    }
+
+    private func refreshNotesQueueMenu() {
+        guard let item = notesQueueMenuItem else { return }
+        let count = notesClient?.queueCount ?? 0
+        item.title = count > 0
+            ? "笔记队列：\(count) 条待同步（引擎重连后自动补发）"
+            : "笔记队列：空"
+    }
+
+    @objc private func takeNoteFromMenu() {
+        takeNote(trigger: "菜单")
+    }
+
+    /// ⌥N / 菜单「记笔记」：收集当前上下文 ->（可选）截图上传 -> POST /api/notes/quick。
+    /// 失败自动写入离线队列（UserDefaults ≤50 条），引擎重连后补发。
+    private func takeNote(trigger: String) {
+        guard let notesClient else {
+            log("[notes] NotesClient 未初始化，忽略记笔记")
+            return
+        }
+        if notesInFlight {
+            overlay?.showToast("上一条笔记还在记录中…")
+            return
+        }
+        if isRunning && isEnginePaused && !settings.notesWhenPaused {
+            overlay?.showToast("同传已暂停：可在菜单打开「暂停时仍可笔记」", isError: true)
+            log("[notes] 已暂停且「暂停时仍可笔记」关闭，忽略")
+            return
+        }
+
+        notesInFlight = true
+        let context = captureNoteContext()
+        let includeScreenshot = settings.notesIncludeScreenshot
+        let permission = ScreenAudioCapture.hasPermission()
+        log(
+            "[notes] 触发（\(trigger)）tMs=\(Int(context.tMs)) 字幕=\(context.source.isEmpty && context.translation.isEmpty ? "无" : "有")"
+                + " 截图=\(includeScreenshot ? "开" : "关") 附截图权限=\(permission ? "有" : "无")"
+        )
+
+        Task { [weak self, notesClient] in
+            var imageRef: NoteAssetRef?
+            var screenshotNote = "未请求"
+            var screenshotLog = ""
+            if !includeScreenshot {
+                screenshotNote = "跳过：" + ScreenshotPlanner.reasonText("disabled")
+            } else if !permission {
+                screenshotNote = "跳过：" + ScreenshotPlanner.reasonText("permission")
+            } else {
+                do {
+                    let png = try await ScreenshotService.captureDisplayPNG()
+                    switch ScreenshotPlanner.decide(
+                        includeScreenshot: true,
+                        permissionGranted: true,
+                        capturedBytes: png.count
+                    ) {
+                    case .attach:
+                        imageRef = try await notesClient.uploadPNG(png)
+                        screenshotNote = "已上传 \(png.count / 1024)KB"
+                    case .textOnly(let reason):
+                        screenshotNote = "降级：" + ScreenshotPlanner.reasonText(reason)
+                    }
+                } catch {
+                    screenshotNote = "降级：" + error.localizedDescription
+                    screenshotLog = "[notes] 截图/上传失败，降级纯文字：\(error.localizedDescription)"
+                }
+            }
+
+            let note = NoteComposer.makeQuickRequest(context: context, image: imageRef)
+            let delivery = await notesClient.record(note)
+            let finalScreenshotLog = screenshotLog
+            let finalScreenshotNote = screenshotNote
+            let owner = self
+            DispatchQueue.main.async {
+                guard let owner else { return }
+                owner.notesInFlight = false
+                if !finalScreenshotLog.isEmpty { owner.log(finalScreenshotLog) }
+                owner.handleNoteDelivery(delivery, context: context, screenshotNote: finalScreenshotNote)
+            }
+        }
+    }
+
+    /// 当前字幕/时间轴/前台 App 快照（必须在主线程调用）
+    private func captureNoteContext() -> NoteContext {
+        let frontApp = NSWorkspace.shared.frontmostApplication
+        return NoteContext(
+            sessionId: lastEngineSessionId,
+            sessionTitle: "macOS 系统音频 · livedub app",
+            tMs: lastAudioTMs.get(),
+            statusText: currentStatus,
+            translation: currentTranslation,
+            source: currentSource,
+            latencyMs: currentLatencyMs,
+            frontmostApp: frontApp?.localizedName,
+            frontmostBundleId: frontApp?.bundleIdentifier,
+            capturedAt: Date()
+        )
+    }
+
+    private func handleNoteDelivery(_ delivery: QuickNoteDelivery, context: NoteContext, screenshotNote: String) {
+        let clock = NoteComposer.formatClock(context.capturedAt)
+        switch delivery {
+        case let .sent(result):
+            lastNoteClock = clock
+            let path = result.path ?? "(服务端未返回 path)"
+            log("[notes] 已记录（sent）· \(clock) · \(path) · 截图 \(screenshotNote)")
+            overlay?.showToast("已记录笔记 · \(clock)")
+            if exitAfterNote { finishNoteOnce(exitCode: 0) }
+        case let .queued(count):
+            lastNoteClock = clock
+            log("[notes] 已离线排队（queued \(count)）· \(clock) · 截图 \(screenshotNote)")
+            overlay?.showToast("引擎未连接，笔记已排队 · \(clock)", isError: true)
+            if exitAfterNote {
+                // --note-once 不立即退出：等引擎重连后自动补发（由 flushNotesQueue 收尾），避免测不到队列链路
+                log("[notes] --note-once：等待引擎重连补发，或由 --duration/兜底计时自动退出")
+            }
+        case let .failed(message):
+            log("[notes] 记录失败：\(message)")
+            overlay?.showToast("记笔记失败：\(String(message.prefix(30)))", isError: true)
+            if exitAfterNote { finishNoteOnce(exitCode: 1) }
+        }
+        refreshNotesQueueMenu()
+        refreshMenu()
+    }
+
+    private func finishNoteOnce(exitCode: Int32) {
+        exitAfterNote = false
+        log("[notes] --note-once 结束（exit \(exitCode)）")
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) {
+            if exitCode == 0 {
+                NSApp.terminate(nil)
+            } else {
+                exit(exitCode)
+            }
+        }
+    }
+
+    private func flushNotesQueue(reason: String) {
+        guard let notesClient else { return }
+        let pending = notesClient.queueCount
+        guard pending > 0 else { return }
+        log("[notes] 开始补发离线笔记（\(reason)，\(pending) 条）")
+        Task { [weak self, notesClient] in
+            let outcome = await notesClient.flushOfflineQueue()
+            let owner = self
+            DispatchQueue.main.async {
+                guard let owner else { return }
+                if case let .done(sent, remaining) = outcome {
+                    if sent > 0 {
+                        owner.log("[notes] 离线笔记补发完成：成功 \(sent) 条，剩余 \(remaining) 条")
+                    }
+                    if sent > 0 && owner.exitAfterNote {
+                        owner.finishNoteOnce(exitCode: 0)
+                    }
+                    owner.refreshNotesQueueMenu()
+                }
+            }
+        }
+    }
+
+    @objc private func openNotesPanel() {
+        openNotesURL(notes: true)
+    }
+
+    @objc private func openWorkbench() {
+        openNotesURL(notes: false)
+    }
+
+    private func openNotesURL(notes: Bool) {
+        let url = notes
+            ? (notesClient?.studioNotesURL ?? URL(string: "http://127.0.0.1:8787/studio/?notes=1"))
+            : (notesClient?.workbenchURL ?? URL(string: "http://127.0.0.1:8787/studio/"))
+        guard let url else { return }
+        NSWorkspace.shared.open(url)
+        log("[notes] 打开 \(url.absoluteString)")
+    }
+
+    @objc private func toggleNotesScreenshot() {
+        settings.notesIncludeScreenshot.toggle()
+        log("[notes] 记笔记附截图 = \(settings.notesIncludeScreenshot ? "开" : "关")")
+        refreshMenu()
+    }
+
+    @objc private func toggleNotesWhenPaused() {
+        settings.notesWhenPaused.toggle()
+        log("[notes] 暂停时仍可笔记 = \(settings.notesWhenPaused ? "开" : "关")")
+        refreshMenu()
     }
 
     // MARK: 提示 / 日志

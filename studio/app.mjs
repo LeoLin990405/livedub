@@ -9,6 +9,27 @@
  * 用会话 JSONL 驱动同一套 UI，用于离线演示与无头截图。
  */
 import {
+  buildNoteExportFilename,
+  buildNotesMarkdown,
+  buildOutlineMarkdown,
+  buildQuoteMarkdown,
+  buildVideoRef,
+  filterNotes,
+  formatNoteTimestamp,
+  formatShortTimestamp,
+  insertAtCursor,
+  localNotesKey,
+  makeQuote,
+  makeVideoId,
+  noteExcerpt,
+  parseTags,
+  renderMarkdown,
+  resolveEditorShortcut,
+  sortNotesByTime,
+  timestampAnchor,
+  videoTitleFrom,
+} from './notes-kit.mjs';
+import {
   buildEventJsonl,
   buildSessionMeta,
   buildSrt,
@@ -52,6 +73,33 @@ const els = {
   btnStart: $('btnStart'),
   btnStop: $('btnStop'),
   btnTheme: $('btnTheme'),
+  btnNotes: $('btnNotes'),
+  notesCountBadge: $('notesCountBadge'),
+  btnPip: $('btnPip'),
+  notesDrawer: $('notesDrawer'),
+  notesVideoTitle: $('notesVideoTitle'),
+  notesCount: $('notesCount'),
+  btnNotesNew: $('btnNotesNew'),
+  btnNotesOutline: $('btnNotesOutline'),
+  btnNotesClose: $('btnNotesClose'),
+  notesExportMenu: $('notesExportMenu'),
+  notesOfflineBanner: $('notesOfflineBanner'),
+  btnNotesRetry: $('btnNotesRetry'),
+  notesSearch: $('notesSearch'),
+  notesSaveStatus: $('notesSaveStatus'),
+  notesTabEdit: $('notesTabEdit'),
+  notesTabPreview: $('notesTabPreview'),
+  notesNoteTime: $('notesNoteTime'),
+  notesEditor: $('notesEditor'),
+  notesPreview: $('notesPreview'),
+  notesTagsInput: $('notesTagsInput'),
+  notesTagsValue: $('notesTagsValue'),
+  notesList: $('notesList'),
+  notesListCount: $('notesListCount'),
+  btnInsertQuote: $('btnInsertQuote'),
+  btnInsertTimestamp: $('btnInsertTimestamp'),
+  btnInsertCode: $('btnInsertCode'),
+  btnInsertScreenshot: $('btnInsertScreenshot'),
   privacyChip: $('privacyChip'),
   privacyChipText: $('privacyChipText'),
 
@@ -214,7 +262,33 @@ const state = {
   status: 'idle',
   metrics: null,
 
-  media: { name: '', url: '', objectUrl: null, isFile: false },
+  media: { name: '', url: '', objectUrl: null, isFile: false, size: null },
+  // v0.4：当前视频身份（Notes API 的 VideoRef 基础）+ 学习笔记状态
+  video: null,
+  notes: {
+    open: false,
+    loadedFor: null,
+    items: [],
+    currentId: null,
+    draft: '',
+    noteKind: 'note',
+    quotes: [],
+    tags: [],
+    imageUrl: '',
+    dirty: false,
+    saving: false,
+    saveTimer: null,
+    status: '',
+    lastSavedAt: null,
+    offline: false,
+    offlineToastShown: false,
+    apiAvailable: null,
+    loading: false,
+    query: '',
+    tab: 'edit',
+    localOnlyCount: 0,
+    syncing: false,
+  },
   audioSeconds: 0,
   lastAudioStatAt: 0,
   lastSentTMs: -100,
@@ -857,7 +931,7 @@ function resetMediaState() {
   clearTranscriptActive();
 }
 
-function setMedia(src, label, { isFile = false, objectUrl = null } = {}) {
+function setMedia(src, label, { isFile = false, objectUrl = null, size = null } = {}) {
   if (state.media.objectUrl) {
     try {
       URL.revokeObjectURL(state.media.objectUrl);
@@ -865,7 +939,7 @@ function setMedia(src, label, { isFile = false, objectUrl = null } = {}) {
       /* ignore */
     }
   }
-  state.media = { name: label || filenameFromUrl(src), url: src, objectUrl, isFile };
+  state.media = { name: label || filenameFromUrl(src), url: src, objectUrl, isFile, size };
   els.stage.classList.add('has-media');
   els.stage.classList.remove('sim-stage');
   els.videoLabel.lastElementChild.textContent = shorten(state.media.name, 40);
@@ -880,6 +954,7 @@ function setMedia(src, label, { isFile = false, objectUrl = null } = {}) {
   els.urlInput.value = isFile ? '' : src;
   els.emptyUrl.value = isFile ? '' : src;
   resetMediaState();
+  onVideoChanged();
   updatePlayButton();
   logEvent('player', `载入媒体：${state.media.name}`, 'ok');
   toast(`已载入：${state.media.name}`, 'ok');
@@ -889,7 +964,7 @@ function setMedia(src, label, { isFile = false, objectUrl = null } = {}) {
 function loadMediaFromFile(file) {
   if (!file) return;
   const url = URL.createObjectURL(file);
-  setMedia(url, file.name, { isFile: true, objectUrl: url });
+  setMedia(url, file.name, { isFile: true, objectUrl: url, size: file.size });
 }
 
 function loadVideoUrl(url) {
@@ -1971,7 +2046,10 @@ function applyParsedSession(parsed) {
     els.glossaryInput.value = state.settings.glossaryText;
     updateGlossaryCount();
   }
-  if (meta.title) els.videoLabel.lastElementChild.textContent = shorten(String(meta.title), 40);
+  if (meta.title) {
+    els.videoLabel.lastElementChild.textContent = shorten(String(meta.title), 40);
+    if (state.video) state.video.title = String(meta.title).slice(0, 300);
+  }
   if (meta.langFrom) updateSessionLangs(meta.langFrom, meta.langTo ?? 'zh');
   let end = Number(meta.durationMs) || 0;
   for (const segment of parsed.segments.values()) end = Math.max(end, segment.t1Ms);
@@ -2063,6 +2141,850 @@ function playSimDubsUpTo(tMs) {
   }
 }
 
+// =============================================================== v0.4 学习笔记
+
+/** 把相对/绝对 URL 归一成绝对地址，保证同一视频的 video.id / url 稳定 */
+function resolvedMediaUrl() {
+  if (state.media.isFile || !state.media.url) return '';
+  try {
+    return new URL(state.media.url, location.href).href;
+  } catch {
+    return state.media.url;
+  }
+}
+
+function currentVideoRef() {
+  if (!state.video) return null;
+  return buildVideoRef({
+    id: state.video.id,
+    title: state.video.title,
+    url: state.media.isFile ? '' : resolvedMediaUrl(),
+    durationMs: state.video.durationMs,
+  });
+}
+
+/** 载入新媒体后重建视频身份（同一视频重开 -> 相同 video.id -> 历史笔记可见） */
+function onVideoChanged() {
+  clearTimeout(state.notes.saveTimer);
+  const mediaUrl = resolvedMediaUrl();
+  const videoId = makeVideoId({
+    name: state.media.isFile ? state.media.name : '',
+    size: state.media.size,
+    url: mediaUrl,
+  });
+  const title = state.media.isFile
+    ? videoTitleFrom({ name: state.media.name })
+    : videoTitleFrom({ url: mediaUrl });
+  state.video = { id: videoId, title, url: mediaUrl, durationMs: 0 };
+  Object.assign(state.notes, {
+    loadedFor: null,
+    items: [],
+    currentId: null,
+    draft: '',
+    noteKind: 'note',
+    quotes: [],
+    tags: [],
+    imageUrl: '',
+    dirty: false,
+    saving: false,
+    saveTimer: null,
+    status: '',
+    lastSavedAt: null,
+    offline: false,
+    offlineToastShown: false,
+    apiAvailable: null,
+    loading: false,
+    query: '',
+    tab: 'edit',
+    localOnlyCount: 0,
+  });
+  els.notesSearch.value = '';
+  els.notesTagsInput.value = '';
+  els.notesEditor.value = '';
+  els.btnPip.disabled = false;
+  setNotesTab('edit');
+  renderNotesAll();
+  updateNotesBadge(0);
+  if (videoId) void refreshNotes({ silent: true });
+}
+
+function setNotesStatus(text, tone = '') {
+  state.notes.status = text;
+  els.notesSaveStatus.textContent = text;
+  els.notesSaveStatus.className = `notes-status ${tone}`.trim();
+}
+
+function updateNotesBadge(count) {
+  const total = Math.max(0, Number(count) || 0);
+  els.notesCountBadge.hidden = total === 0;
+  els.notesCountBadge.textContent = total > 99 ? '99+' : String(total);
+}
+
+function currentNote() {
+  return state.notes.items.find((note) => note.id === state.notes.currentId) ?? null;
+}
+
+function isLocalNoteId(id) {
+  return String(id ?? '').startsWith('local_');
+}
+
+// ------------------------------------------------------------ Notes API client
+
+async function notesFetch(pathname, { method = 'GET', body, rawBody = null, headers = {} } = {}) {
+  const requestHeaders = { ...headers };
+  let requestBody;
+  if (rawBody !== null) {
+    requestBody = rawBody;
+  } else if (body !== undefined) {
+    requestHeaders['Content-Type'] = 'application/json';
+    requestBody = JSON.stringify(body);
+  }
+  const response = await fetch(pathname, { method, headers: requestHeaders, body: requestBody, cache: 'no-store' });
+  const contentType = String(response.headers.get('content-type') ?? '');
+  const data = contentType.includes('application/json') ? await response.json() : await response.text();
+  if (!response.ok) {
+    const error = new Error(data?.message ?? data?.error ?? `HTTP ${response.status}`);
+    error.status = response.status;
+    error.payload = data;
+    throw error;
+  }
+  return data;
+}
+
+// --------------------------------------------------------- localStorage 回退
+
+function loadLocalNotes(videoId) {
+  if (!videoId) return [];
+  try {
+    const raw = localStorage.getItem(localNotesKey(videoId));
+    const parsed = raw ? JSON.parse(raw) : [];
+    return Array.isArray(parsed) ? parsed.filter((note) => note && typeof note.id === 'string') : [];
+  } catch {
+    return [];
+  }
+}
+
+function saveLocalNotes(videoId, notes) {
+  if (!videoId) return;
+  try {
+    localStorage.setItem(localNotesKey(videoId), JSON.stringify(Array.isArray(notes) ? notes : []));
+  } catch {
+    /* localStorage 不可用时忽略 */
+  }
+}
+
+function persistLocalNote(note) {
+  if (!note || !state.video) return;
+  const local = loadLocalNotes(state.video.id).filter((item) => item.id !== note.id);
+  local.push(note);
+  saveLocalNotes(state.video.id, local);
+  state.notes.localOnlyCount = local.length;
+}
+
+function markNotesOffline(error, { toastOnce = true } = {}) {
+  state.notes.offline = true;
+  state.notes.apiAvailable = false;
+  els.notesOfflineBanner.hidden = false;
+  setNotesStatus('离线 · localStorage 暂存', 'offline');
+  if (toastOnce && !state.notes.offlineToastShown) {
+    state.notes.offlineToastShown = true;
+    toast(`笔记 API 不可用，已回退到浏览器 localStorage 暂存${error?.message ? `：${error.message}` : ''}`, 'warn', 6000);
+    logEvent('notes', `API 不可用，localStorage 回退：${error?.message ?? 'unknown'}`, 'warn');
+  }
+}
+
+// ------------------------------------------------------------------ 加载/刷新
+
+async function refreshNotes({ silent = false } = {}) {
+  const video = state.video;
+  if (!video) return;
+  const videoId = video.id;
+  state.notes.loading = true;
+  renderNotesAll();
+  try {
+    const payload = await notesFetch(`/api/notes?videoId=${encodeURIComponent(videoId)}&limit=500`);
+    if (state.video?.id !== videoId) return;
+    state.notes.apiAvailable = true;
+    state.notes.offline = false;
+    els.notesOfflineBanner.hidden = true;
+    const local = loadLocalNotes(videoId);
+    state.notes.localOnlyCount = local.length;
+    const items = Array.isArray(payload.notes) ? [...payload.notes] : [];
+    for (const localNote of local) {
+      if (!items.some((note) => note.id === localNote.id)) items.push(localNote);
+    }
+    state.notes.items = items;
+    state.notes.loadedFor = videoId;
+    if (state.notes.offlineToastShown) {
+      state.notes.offlineToastShown = false;
+      toast('笔记 API 已恢复，本地暂存可点「重试同步」', 'ok', 5000);
+    }
+    if (!silent) logEvent('notes', `已加载 ${items.length} 条笔记（${videoId}）`, 'ok');
+  } catch (error) {
+    if (state.video?.id !== videoId) return;
+    state.notes.items = loadLocalNotes(videoId);
+    state.notes.loadedFor = videoId;
+    markNotesOffline(error, { toastOnce: !silent });
+  } finally {
+    state.notes.loading = false;
+    renderNotesAll();
+  }
+}
+
+// -------------------------------------------------------------- 抽屉开关
+
+async function openNotesDrawer({ create = false, allowNoVideo = false } = {}) {
+  if (!state.video && !allowNoVideo) {
+    toast('请先载入视频，再写学习笔记', 'warn');
+    return;
+  }
+  state.notes.open = true;
+  els.notesDrawer.classList.add('open');
+  els.notesDrawer.setAttribute('aria-hidden', 'false');
+  els.btnNotes.setAttribute('aria-expanded', 'true');
+  if (!state.video) {
+    renderNotesAll();
+    setNotesStatus('等待视频…');
+    return;
+  }
+  if (state.notes.loadedFor !== state.video.id) await refreshNotes({ silent: true });
+  renderNotesAll();
+  if (create) {
+    await createNoteAtCurrentTime();
+  } else if (!currentNote()) {
+    const ordered = sortNotesByTime(state.notes.items);
+    if (ordered.length > 0) selectNote(ordered[ordered.length - 1].id);
+    else focusNotesEditor();
+  } else {
+    focusNotesEditor();
+  }
+}
+
+function closeNotesDrawer() {
+  void flushNotesSave();
+  state.notes.open = false;
+  els.notesDrawer.classList.remove('open');
+  els.notesDrawer.setAttribute('aria-hidden', 'true');
+  els.btnNotes.setAttribute('aria-expanded', 'false');
+}
+
+function focusNotesEditor() {
+  setNotesTab('edit');
+  requestAnimationFrame(() => els.notesEditor.focus({ preventScroll: false }));
+}
+
+// -------------------------------------------------------------- 新建/选择
+
+function makeLocalNote({ video, tMs, body = '', kind = 'note', quotes = [], tags = [], imageUrl = '' }) {
+  const now = new Date().toISOString();
+  return {
+    id: `local_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`,
+    video,
+    tMs,
+    body,
+    kind,
+    source: 'studio',
+    createdAt: now,
+    updatedAt: now,
+    ...(quotes.length > 0 ? { quotes } : {}),
+    ...(tags.length > 0 ? { tags } : {}),
+    ...(imageUrl ? { imageUrl } : {}),
+  };
+}
+
+async function createNoteAtCurrentTime({ body = '', kind = 'note' } = {}) {
+  const video = currentVideoRef();
+  if (!video) {
+    toast('请先载入视频', 'warn');
+    return null;
+  }
+  await flushNotesSave();
+  const tMs = Math.max(0, Math.round((els.video.currentTime || 0) * 1000));
+  if (state.notes.apiAvailable === false) {
+    const note = makeLocalNote({ video, tMs, body, kind });
+    state.notes.items.push(note);
+    persistLocalNote(note);
+    selectNote(note.id);
+    renderNotesAll();
+    setNotesStatus('已保存到 localStorage', 'offline');
+    return note;
+  }
+  try {
+    const payload = await notesFetch('/api/notes', { method: 'POST', body: { video, tMs, body, kind, source: 'studio' } });
+    if (!payload?.note) throw new Error('响应缺少 note');
+    state.notes.items.push(payload.note);
+    state.notes.apiAvailable = true;
+    state.notes.offline = false;
+    els.notesOfflineBanner.hidden = true;
+    selectNote(payload.note.id);
+    renderNotesAll();
+    logEvent('notes', `新建笔记 @ ${formatNoteTimestamp(tMs)}`, 'ok');
+    return payload.note;
+  } catch (error) {
+    markNotesOffline(error, { toastOnce: false });
+    toast(`笔记 API 不可用，已在本地暂存：${error.message}`, 'warn', 6000);
+    const note = makeLocalNote({ video, tMs, body, kind });
+    state.notes.items.push(note);
+    persistLocalNote(note);
+    selectNote(note.id);
+    renderNotesAll();
+    return note;
+  }
+}
+
+function selectNote(id) {
+  if (!id) return;
+  void flushNotesSave();
+  const note = state.notes.items.find((item) => item.id === id);
+  if (!note) return;
+  state.notes.currentId = note.id;
+  state.notes.draft = String(note.body ?? '');
+  state.notes.noteKind = note.kind ?? 'note';
+  state.notes.quotes = Array.isArray(note.quotes) ? [...note.quotes] : [];
+  state.notes.tags = Array.isArray(note.tags) ? [...note.tags] : [];
+  state.notes.imageUrl = String(note.imageUrl ?? '');
+  state.notes.dirty = false;
+  els.notesEditor.value = state.notes.draft;
+  els.notesTagsInput.value = state.notes.tags.join(', ');
+  setNotesStatus(note.updatedAt ? `已保存 · ${formatShortTimestamp(note.tMs)}` : '—');
+  renderNotesAll();
+}
+
+function seekToNote(note) {
+  if (!note) return;
+  const tMs = Math.max(0, Math.round(Number(note.tMs) || 0));
+  if (state.sim.active) {
+    state.sim.clock = tMs;
+    if (Number.isFinite(els.video.duration) && els.video.duration > 0) {
+      try {
+        els.video.currentTime = Math.min(els.video.duration, tMs / 1000);
+      } catch {
+        /* ignore */
+      }
+    }
+    applySimAt(tMs);
+  } else {
+    if (Number.isFinite(els.video.duration) && els.video.duration > 0) {
+      els.video.currentTime = Math.min(els.video.duration, tMs / 1000);
+    }
+    if (state.sessionActive && state.sessionReady) sendJson({ type: 'control', action: 'seek', tMs });
+  }
+  logEvent('notes', `跳转到笔记 ${formatNoteTimestamp(tMs)}`, 'mt');
+}
+
+async function deleteNoteById(id) {
+  const note = state.notes.items.find((item) => item.id === id);
+  if (!note) return;
+  const label = noteExcerpt(note, 36);
+  if (!window.confirm(`删除这条笔记？\n\n${formatShortTimestamp(note.tMs)} · ${label}`)) return;
+  const previousItems = [...state.notes.items];
+  // 乐观删除
+  state.notes.items = state.notes.items.filter((item) => item.id !== id);
+  if (state.notes.currentId === id) {
+    state.notes.currentId = null;
+    state.notes.draft = '';
+    els.notesEditor.value = '';
+  }
+  renderNotesAll();
+  const local = loadLocalNotes(state.video?.id ?? '');
+  saveLocalNotes(state.video?.id ?? '', local.filter((item) => item.id !== id));
+  if (isLocalNoteId(id) || state.notes.apiAvailable === false) {
+    toast('笔记已删除', 'ok', 1800);
+    return;
+  }
+  try {
+    await notesFetch(`/api/notes/${encodeURIComponent(id)}`, { method: 'DELETE' });
+    toast('笔记已删除', 'ok', 1800);
+    logEvent('notes', `删除笔记 ${id}`, 'warn');
+  } catch (error) {
+    state.notes.items = previousItems;
+    renderNotesAll();
+    toast(`删除失败：${error.message}`, 'err');
+  }
+}
+
+// ---------------------------------------------------------------- 自动保存
+
+function scheduleNotesSave() {
+  if (!state.notes.currentId) return;
+  state.notes.dirty = true;
+  setNotesStatus('编辑中…');
+  clearTimeout(state.notes.saveTimer);
+  state.notes.saveTimer = setTimeout(() => void flushNotesSave(), 600);
+}
+
+function collectNotePatch(note) {
+  const patch = {
+    body: state.notes.draft,
+    tMs: Math.max(0, Math.round(Number(note?.tMs) || 0)),
+    tags: state.notes.tags,
+    quotes: state.notes.quotes,
+    kind: state.notes.noteKind,
+  };
+  if (state.notes.imageUrl) patch.imageUrl = state.notes.imageUrl;
+  return patch;
+}
+
+async function flushNotesSave() {
+  clearTimeout(state.notes.saveTimer);
+  state.notes.saveTimer = null;
+  const note = currentNote();
+  if (!note) return;
+  if (!state.notes.dirty) return;
+  const patch = collectNotePatch(note);
+  Object.assign(note, {
+    body: patch.body,
+    tMs: patch.tMs,
+    tags: patch.tags,
+    quotes: patch.quotes,
+    kind: patch.kind,
+    updatedAt: new Date().toISOString(),
+    ...(patch.imageUrl ? { imageUrl: patch.imageUrl } : {}),
+  });
+  state.notes.dirty = false;
+  renderNotesList();
+  if (isLocalNoteId(note.id) || state.notes.apiAvailable === false) {
+    persistLocalNote(note);
+    setNotesStatus('已保存到 localStorage', 'offline');
+    els.notesOfflineBanner.hidden = false;
+    return;
+  }
+  state.notes.saving = true;
+  setNotesStatus('保存中…', 'saving');
+  try {
+    const payload = await notesFetch(`/api/notes/${encodeURIComponent(note.id)}`, { method: 'PUT', body: patch });
+    if (payload?.note) Object.assign(note, payload.note);
+    state.notes.lastSavedAt = Date.now();
+    setNotesStatus(`已保存 ${new Date().toLocaleTimeString('zh-CN', { hour12: false })}`, 'saved');
+  } catch (error) {
+    markNotesOffline(error, { toastOnce: false });
+    persistLocalNote(note);
+    setNotesStatus('离线暂存（localStorage）', 'offline');
+    toast(`保存失败，已暂存到 localStorage：${error.message}`, 'warn', 6000);
+  } finally {
+    state.notes.saving = false;
+    renderNotesEditorChrome();
+  }
+}
+
+async function syncLocalNotes() {
+  if (!state.video || state.notes.syncing) return;
+  state.notes.syncing = true;
+  setNotesStatus('同步中…', 'saving');
+  try {
+    await notesFetch(`/api/notes?videoId=${encodeURIComponent(state.video.id)}&limit=1`);
+    const local = loadLocalNotes(state.video.id);
+    let synced = 0;
+    for (const note of local) {
+      try {
+        if (isLocalNoteId(note.id)) {
+          await notesFetch('/api/notes', {
+            method: 'POST',
+            body: { video: note.video, tMs: note.tMs, body: note.body, kind: note.kind, source: note.source ?? 'studio', quotes: note.quotes, tags: note.tags, imageUrl: note.imageUrl },
+          });
+        } else {
+          await notesFetch(`/api/notes/${encodeURIComponent(note.id)}`, {
+            method: 'PUT',
+            body: { body: note.body, tMs: note.tMs, tags: note.tags, quotes: note.quotes, kind: note.kind, imageUrl: note.imageUrl },
+          });
+        }
+        synced += 1;
+      } catch {
+        /* 单条失败保留在 localStorage */
+      }
+    }
+    if (synced >= local.length) saveLocalNotes(state.video.id, []);
+    state.notes.localOnlyCount = Math.max(0, local.length - synced);
+    state.notes.offline = state.notes.localOnlyCount > 0;
+    els.notesOfflineBanner.hidden = !state.notes.offline;
+    await refreshNotes({ silent: true });
+    toast(`已同步 ${synced} 条本地笔记到引擎`, 'ok');
+    logEvent('notes', `localStorage 同步：${synced}/${local.length} 条`, 'ok');
+  } catch (error) {
+    markNotesOffline(error, { toastOnce: true });
+  } finally {
+    state.notes.syncing = false;
+    renderNotesAll();
+  }
+}
+
+// ------------------------------------------------------------ 编辑器插入
+
+function insertIntoNotesEditor(insertion) {
+  const textarea = els.notesEditor;
+  const result = insertAtCursor(state.notes.draft, insertion, textarea.selectionStart, textarea.selectionEnd);
+  state.notes.draft = result.value;
+  textarea.value = result.value;
+  textarea.focus();
+  try {
+    textarea.setSelectionRange(result.selectionStart, result.selectionEnd);
+  } catch {
+    /* ignore */
+  }
+  scheduleNotesSave();
+  if (state.notes.tab === 'preview') renderNotesPreview();
+}
+
+function getCurrentBilingual() {
+  if (state.sim.active && state.sim.parsed) {
+    const snapshot = stateAt(state.sim.parsed, state.sim.clock || 0);
+    const current = snapshot.current;
+    if (current) return makeQuote({ src: current.src, dst: current.dst, t0Ms: current.t0Ms, t1Ms: current.t1Ms });
+  }
+  if (state.currentSegmentId) {
+    const segment = state.segments.get(state.currentSegmentId);
+    if (segment) return makeQuote({ src: segment.text, dst: segment.translation, t0Ms: segment.t0Ms, t1Ms: segment.t1Ms });
+  }
+  const segments = [...state.segments.values()].sort((a, b) => a.t0Ms - b.t0Ms);
+  const last = segments[segments.length - 1];
+  if (last) return makeQuote({ src: last.text, dst: last.translation, t0Ms: last.t0Ms, t1Ms: last.t1Ms });
+  return null;
+}
+
+function insertCurrentQuote() {
+  const quote = getCurrentBilingual();
+  if (!quote) {
+    toast('当前没有可插入的字幕：先播放视频并开启同传（演示回放模式也可）', 'warn');
+    return;
+  }
+  const key = `${quote.t0Ms ?? ''}:${quote.src ?? ''}`;
+  if (!state.notes.quotes.some((item) => `${item.t0Ms ?? ''}:${item.src ?? ''}` === key)) {
+    state.notes.quotes.push(quote);
+  }
+  const block = `${buildQuoteMarkdown(quote)}\n`;
+  insertIntoNotesEditor(block);
+  renderNotesEditorChrome();
+  toast('已插入当前双语字幕', 'ok', 1800);
+}
+
+function insertCurrentTimestamp() {
+  const tMs = state.sim.active && state.sim.frozen ? state.sim.clock : Math.round((els.video.currentTime || 0) * 1000);
+  insertIntoNotesEditor(`${timestampAnchor(tMs)} `);
+}
+
+function insertCodeBlock() {
+  const textarea = els.notesEditor;
+  const selected = state.notes.draft.slice(textarea.selectionStart, textarea.selectionEnd);
+  insertIntoNotesEditor(`\`\`\`\n${selected}\n\`\`\`\n`);
+}
+
+async function captureVideoFrame() {
+  const width = els.video.videoWidth;
+  const height = els.video.videoHeight;
+  if (!width || !height) throw new Error('视频还没有可截取的画面');
+  const canvas = document.createElement('canvas');
+  canvas.width = width;
+  canvas.height = height;
+  const context = canvas.getContext('2d');
+  context.drawImage(els.video, 0, 0, width, height);
+  return await new Promise((resolve, reject) => {
+    try {
+      canvas.toBlob((blob) => (blob ? resolve(blob) : reject(new Error('生成 PNG 失败'))), 'image/png');
+    } catch (error) {
+      reject(error);
+    }
+  });
+}
+
+async function insertScreenshot() {
+  try {
+    const blob = await captureVideoFrame();
+    const response = await fetch('/api/notes/assets', {
+      method: 'POST',
+      headers: { 'Content-Type': 'image/png' },
+      body: blob,
+    });
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok || !data.url) throw new Error(data.message ?? data.error ?? `HTTP ${response.status}`);
+    state.notes.imageUrl = data.url;
+    insertIntoNotesEditor(`![截图 @ ${formatNoteTimestamp(els.video.currentTime * 1000)}](${data.url})\n`);
+    toast('截图已保存到笔记 assets 并插入正文', 'ok', 3200);
+    logEvent('notes', `截图已上传 ${data.url}`, 'ok');
+  } catch (error) {
+    toast(`截图失败：${error.message}（跨域视频无法读取画面；本地文件/同源视频可用）`, 'err', 7000);
+    logEvent('notes', `截图失败：${error.message}`, 'err');
+  }
+}
+
+function applyNotesTagsFromInput() {
+  state.notes.tags = parseTags(els.notesTagsInput.value);
+  els.notesTagsInput.value = state.notes.tags.join(', ');
+  els.notesTagsValue.textContent = state.notes.tags.length > 0 ? `标签：${state.notes.tags.join('、')}` : '无标签';
+  scheduleNotesSave();
+}
+
+/** 写入当前笔记正文并立即保存（供调试/自动化使用） */
+async function writeCurrentNoteBody(body) {
+  if (!currentNote()) await createNoteAtCurrentTime();
+  state.notes.draft = String(body ?? '');
+  els.notesEditor.value = state.notes.draft;
+  state.notes.dirty = true;
+  await flushNotesSave();
+  renderNotesAll();
+}
+
+// ---------------------------------------------------------------- 大纲/导出
+
+function getSessionSegments() {
+  if (state.sim.active && state.sim.parsed) {
+    return [...state.sim.parsed.segments.values()].map((segment) => ({
+      t0Ms: segment.t0Ms,
+      t1Ms: segment.t1Ms,
+      text: segment.text,
+      translation: segment.translation,
+    }));
+  }
+  return [...state.segments.values()]
+    .sort((a, b) => a.t0Ms - b.t0Ms)
+    .map((segment) => ({ t0Ms: segment.t0Ms, t1Ms: segment.t1Ms, text: segment.text, translation: segment.translation }));
+}
+
+async function generateOutlineNote() {
+  const video = currentVideoRef();
+  if (!video) {
+    toast('请先载入视频', 'warn');
+    return;
+  }
+  const segments = getSessionSegments().filter((segment) => segment.text || segment.translation);
+  if (segments.length === 0) {
+    toast('还没有字幕可生成大纲：先播放视频并开启同传（或载入演示回放）', 'warn', 5200);
+    return;
+  }
+  const body = buildOutlineMarkdown({ video, segments, langFrom: 'en', langTo: 'zh' });
+  const note = await createNoteAtCurrentTime({ body, kind: 'outline' });
+  if (note) {
+    toast(`已生成课程大纲（${segments.length} 段字幕），可直接编辑`, 'ok', 4200);
+    logEvent('notes', `生成课程大纲笔记（${segments.length} 段）`, 'ok');
+    focusNotesEditor();
+  }
+}
+
+async function getNotesExportMarkdown() {
+  const video = currentVideoRef();
+  if (!video) return '';
+  if (state.notes.apiAvailable) {
+    try {
+      const response = await fetch(`/api/notes/export.md?videoId=${encodeURIComponent(video.id)}`, { cache: 'no-store' });
+      if (response.ok) return await response.text();
+    } catch {
+      /* fall through */
+    }
+  }
+  return buildNotesMarkdown({ video, notes: state.notes.items, langFrom: 'en', langTo: 'zh' });
+}
+
+async function exportNotes(kind) {
+  const video = currentVideoRef();
+  if (!video) {
+    toast('请先载入视频', 'warn');
+    return;
+  }
+  await flushNotesSave();
+  try {
+    if (kind === 'write') {
+      const payload = await notesFetch('/api/notes/export', { method: 'POST', body: { videoId: video.id } });
+      toast(`已写入 ${payload.path}`, 'ok', 6500);
+      logEvent('notes', `导出到 ${payload.path}`, 'ok');
+      return;
+    }
+    const markdown = await getNotesExportMarkdown();
+    if (!markdown.trim()) {
+      toast('导出内容为空', 'warn');
+      return;
+    }
+    if (kind === 'copy') {
+      await copyText(markdown, 'Markdown 已复制到剪贴板');
+    } else {
+      downloadTextFile(buildNoteExportFilename(video.title), markdown, 'text/markdown;charset=utf-8');
+      toast('Markdown 已下载', 'ok');
+    }
+  } catch (error) {
+    toast(`导出失败：${error.message}`, 'err', 5200);
+    logEvent('notes', `导出失败：${error.message}`, 'err');
+  } finally {
+    els.notesExportMenu.open = false;
+  }
+}
+
+// ---------------------------------------------------------------- 画中画
+
+async function togglePip() {
+  if (!state.video) {
+    toast('请先载入视频', 'warn');
+    return;
+  }
+  if (!document.pictureInPictureEnabled || typeof els.video.requestPictureInPicture !== 'function') {
+    toast('当前浏览器不支持画中画（需要 Chrome/Edge 等桌面浏览器）', 'warn', 5000);
+    return;
+  }
+  try {
+    if (document.pictureInPictureElement === els.video) {
+      await document.exitPictureInPicture();
+    } else {
+      await els.video.requestPictureInPicture();
+      logEvent('player', '已进入画中画（可边看边在外部编辑器写代码）', 'ok');
+    }
+  } catch (error) {
+    toast(`画中画失败：${error.message}`, 'err', 5000);
+  }
+}
+
+// ---------------------------------------------------------------- 渲染
+
+function renderNotesAll() {
+  els.notesVideoTitle.textContent = state.video ? state.video.title : '未加载视频';
+  els.notesCount.textContent = `${state.notes.items.length} 条`;
+  updateNotesBadge(state.notes.items.length);
+  els.btnNotesNew.disabled = !state.video;
+  els.btnNotesOutline.disabled = !state.video;
+  els.notesOfflineBanner.hidden = !state.notes.offline;
+  renderNotesList();
+  renderNotesEditorChrome();
+}
+
+function noteKindLabel(kind) {
+  return { note: '笔记', outline: '大纲', quick: '摘录', marker: '标记' }[kind] ?? '笔记';
+}
+
+function renderNotesList() {
+  const query = state.notes.query;
+  const items = filterNotes(sortNotesByTime(state.notes.items), query);
+  els.notesList.textContent = '';
+  els.notesListCount.textContent = `${items.length} 条`;
+  if (items.length === 0) {
+    const empty = document.createElement('div');
+    empty.className = 'notes-empty';
+    empty.innerHTML = query
+      ? '没有匹配的笔记，换个关键词试试'
+      : '载入视频后按 <kbd>N</kbd> 新建第一条笔记';
+    els.notesList.appendChild(empty);
+    return;
+  }
+  for (const note of items) {
+    const item = document.createElement('div');
+    item.className = `notes-item${note.id === state.notes.currentId ? ' active' : ''}`;
+    item.dataset.noteId = note.id;
+    item.setAttribute('role', 'button');
+    item.tabIndex = 0;
+
+    const time = document.createElement('span');
+    time.className = 'notes-item-time';
+    time.textContent = formatShortTimestamp(note.tMs);
+    item.appendChild(time);
+
+    const body = document.createElement('div');
+    body.className = 'notes-item-body';
+    const excerpt = document.createElement('span');
+    excerpt.className = 'notes-item-excerpt';
+    excerpt.textContent = noteExcerpt(note, 90);
+    body.appendChild(excerpt);
+    const meta = document.createElement('div');
+    meta.className = 'notes-item-meta';
+    const kind = document.createElement('span');
+    kind.className = `notes-kind ${note.kind ?? 'note'}`;
+    kind.textContent = noteKindLabel(note.kind);
+    meta.appendChild(kind);
+    if (Array.isArray(note.quotes) && note.quotes.length > 0) {
+      const quoteBadge = document.createElement('span');
+      quoteBadge.textContent = `${note.quotes.length} 条引用`;
+      meta.appendChild(quoteBadge);
+    }
+    if (Array.isArray(note.tags) && note.tags.length > 0) {
+      const tags = document.createElement('span');
+      tags.textContent = note.tags.slice(0, 3).join(' · ');
+      meta.appendChild(tags);
+    }
+    if (isLocalNoteId(note.id)) {
+      const localBadge = document.createElement('span');
+      localBadge.className = 'notes-kind marker';
+      localBadge.textContent = '本地';
+      meta.appendChild(localBadge);
+    }
+    body.appendChild(meta);
+    item.appendChild(body);
+
+    if (note.imageUrl) {
+      const thumb = document.createElement('img');
+      thumb.className = 'notes-thumb';
+      thumb.src = note.imageUrl;
+      thumb.alt = '笔记截图';
+      thumb.loading = 'lazy';
+      item.appendChild(thumb);
+    } else {
+      const spacer = document.createElement('span');
+      item.appendChild(spacer);
+    }
+
+    const del = document.createElement('button');
+    del.type = 'button';
+    del.className = 'notes-item-del';
+    del.title = '删除这条笔记';
+    del.setAttribute('aria-label', `删除 ${formatShortTimestamp(note.tMs)} 的笔记`);
+    del.innerHTML = '<svg class="icon"><use href="#i-trash"/></svg>';
+    del.addEventListener('click', (event) => {
+      event.stopPropagation();
+      void deleteNoteById(note.id);
+    });
+    item.appendChild(del);
+
+    item.addEventListener('click', () => {
+      selectNote(note.id);
+      seekToNote(note);
+    });
+    item.addEventListener('keydown', (event) => {
+      if (event.key === 'Enter' || event.key === ' ') {
+        event.preventDefault();
+        selectNote(note.id);
+        seekToNote(note);
+      }
+    });
+    els.notesList.appendChild(item);
+  }
+}
+
+function renderNotesPreview() {
+  els.notesPreview.innerHTML = renderMarkdown(state.notes.draft);
+}
+
+function renderNotesPreviewIfVisible() {
+  if (state.notes.tab === 'preview') renderNotesPreview();
+}
+
+function renderNotesEditorChrome() {
+  const note = currentNote();
+  const hasNote = Boolean(note);
+  els.notesEditor.disabled = !hasNote;
+  els.notesEditor.placeholder = hasNote
+    ? '用 Markdown 记录：\n# 本节要点\n- 反方向走一小步'
+    : '按 N 或点「新建」创建第一条笔记';
+  if (!hasNote) {
+    if (state.notes.draft !== '') state.notes.draft = '';
+    els.notesEditor.value = '';
+    els.notesNoteTime.textContent = '—';
+    els.notesTagsValue.textContent = '无标签';
+    els.notesTagsInput.value = '';
+    if (state.notes.tab === 'preview') renderNotesPreview();
+    return;
+  }
+  if (document.activeElement !== els.notesEditor) {
+    els.notesEditor.value = state.notes.draft;
+  }
+  els.notesNoteTime.textContent = `${formatNoteTimestamp(note.tMs)} · ${noteKindLabel(state.notes.noteKind)}`;
+  els.notesTagsValue.textContent = state.notes.tags.length > 0 ? `标签：${state.notes.tags.join('、')}` : '无标签';
+  if (state.notes.tab === 'preview') renderNotesPreview();
+}
+
+function setNotesTab(tab) {
+  state.notes.tab = tab === 'preview' ? 'preview' : 'edit';
+  const preview = state.notes.tab === 'preview';
+  els.notesEditor.hidden = preview;
+  els.notesPreview.hidden = !preview;
+  els.notesTabEdit.setAttribute('aria-selected', String(!preview));
+  els.notesTabPreview.setAttribute('aria-selected', String(preview));
+  if (preview) renderNotesPreview();
+  else els.notesEditor.focus({ preventScroll: true });
+}
+
 // ---------------------------------------------------------------- 事件绑定
 
 /** 键盘快捷键动作分发（纯函数 resolveShortcut 决定动作，这里只做副作用） */
@@ -2089,7 +3011,14 @@ function handleShortcut(action) {
     case 'toggle-dub':
       setDubEnabled(!state.settings.dubEnabled, { announce: true });
       return;
+    case 'new-note':
+      void openNotesDrawer({ create: true });
+      return;
     case 'escape':
+      if (state.notes.open) {
+        closeNotesDrawer();
+        return;
+      }
       if (state.subsOnly.active) exitSubsOnly();
       else {
         setPanelsHidden(!state.panelsHidden);
@@ -2188,6 +3117,10 @@ function bindEvents() {
   // 视频事件
   els.video.addEventListener('loadedmetadata', () => {
     updateTimeUi();
+    if (state.video && Number.isFinite(els.video.duration) && els.video.duration > 0) {
+      state.video.durationMs = Math.round(els.video.duration * 1000);
+      if (state.notes.open) renderNotesAll();
+    }
     if (state.sim.frozen && state.sim.clock > 0) {
       try {
         els.video.currentTime = Math.min(els.video.duration, state.sim.clock / 1000);
@@ -2294,6 +3227,64 @@ function bindEvents() {
     els.glossaryHint.textContent = '未应用的修改';
   });
 
+  // 学习笔记（v0.4）
+  els.btnNotes.addEventListener('click', () => {
+    if (state.notes.open) closeNotesDrawer();
+    else void openNotesDrawer();
+  });
+  els.btnNotesClose.addEventListener('click', closeNotesDrawer);
+  els.btnNotesNew.addEventListener('click', () => void openNotesDrawer({ create: true }));
+  els.btnNotesOutline.addEventListener('click', () => void generateOutlineNote());
+  els.btnNotesRetry.addEventListener('click', () => void syncLocalNotes());
+  els.notesSearch.addEventListener('input', () => {
+    state.notes.query = els.notesSearch.value;
+    renderNotesList();
+  });
+  for (const tab of [els.notesTabEdit, els.notesTabPreview]) {
+    tab.addEventListener('click', () => setNotesTab(tab.dataset.tab));
+  }
+  els.notesEditor.addEventListener('input', () => {
+    state.notes.draft = els.notesEditor.value;
+    state.notes.dirty = true;
+    scheduleNotesSave();
+    renderNotesPreviewIfVisible();
+  });
+  els.notesEditor.addEventListener('blur', () => void flushNotesSave());
+  els.notesEditor.addEventListener('keydown', (event) => {
+    const action = resolveEditorShortcut(event);
+    if (!action) return;
+    event.preventDefault();
+    if (action === 'save') {
+      void flushNotesSave().then(() => toast('笔记已保存', 'ok', 1600));
+    } else if (action === 'codeblock') {
+      insertCodeBlock();
+    }
+  });
+  els.notesTagsInput.addEventListener('change', applyNotesTagsFromInput);
+  els.notesTagsInput.addEventListener('keydown', (event) => {
+    if (event.key === 'Enter') {
+      event.preventDefault();
+      applyNotesTagsFromInput();
+      els.notesTagsInput.blur();
+    }
+  });
+  els.btnInsertQuote.addEventListener('click', insertCurrentQuote);
+  els.btnInsertTimestamp.addEventListener('click', insertCurrentTimestamp);
+  els.btnInsertCode.addEventListener('click', insertCodeBlock);
+  els.btnInsertScreenshot.addEventListener('click', () => void insertScreenshot());
+  for (const button of els.notesExportMenu.querySelectorAll('button[data-export]')) {
+    button.addEventListener('click', () => void exportNotes(button.dataset.export));
+  }
+  els.btnPip.addEventListener('click', () => void togglePip());
+  els.video.addEventListener('enterpictureinpicture', () => {
+    els.btnPip.setAttribute('aria-pressed', 'true');
+    els.btnPip.title = '退出画中画';
+  });
+  els.video.addEventListener('leavepictureinpicture', () => {
+    els.btnPip.setAttribute('aria-pressed', 'false');
+    els.btnPip.title = '画中画（边看边写笔记）';
+  });
+
   // 导出 / 日志
   els.btnExportSrt.addEventListener('click', exportSrt);
   els.btnExportEvents.addEventListener('click', exportEventsJsonl);
@@ -2307,6 +3298,10 @@ function bindEvents() {
     if (!action) return;
     event.preventDefault();
     handleShortcut(action);
+  });
+
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'hidden' && state.notes.dirty) void flushNotesSave();
   });
 
   // 离开页面：优雅关闭会话
@@ -2348,7 +3343,25 @@ async function bootstrap() {
     renderAsrEngine,
     renderDesktopApp,
     selectAsrEngine,
-    version: '0.3.0',
+    version: '0.4.0',
+    notes: {
+      state: state.notes,
+      open: (options) => openNotesDrawer(options ?? {}),
+      close: closeNotesDrawer,
+      create: (options) => createNoteAtCurrentTime(options ?? {}),
+      write: writeCurrentNoteBody,
+      select: selectNote,
+      seek: seekToNote,
+      insertQuote: insertCurrentQuote,
+      insertTimestamp: insertCurrentTimestamp,
+      insertCode: insertCodeBlock,
+      screenshot: insertScreenshot,
+      refresh: refreshNotes,
+      outline: generateOutlineNote,
+      exportNotes,
+      syncLocal: syncLocalNotes,
+      delete: deleteNoteById,
+    },
   };
   if (!simMode) {
     await loadEngineInfo();
@@ -2367,6 +3380,11 @@ async function bootstrap() {
     syncSettingsUi();
     renderAsrEngine();
     renderDesktopApp();
+  }
+
+  // 扩展 / macOS App 的「打开笔记本」会链到 /studio/?notes=1
+  if (params.get('notes') === '1') {
+    await openNotesDrawer({ allowNoVideo: true });
   }
 }
 

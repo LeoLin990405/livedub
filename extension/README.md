@@ -1,6 +1,6 @@
 # livedub Chrome 扩展（MV3）
 
-看教学视频（B 站 / YouTube / 网课平台）时的**本地实时同传**扩展：
+看教学视频（B 站 / YouTube / 网课平台）时的**本地实时同传**扩展（v0.4：还支持边看边按 `Alt+Shift+N` 记笔记）：
 
 1. 抓取当前标签页的声音（`tabCapture`）；
 2. 通过 WebSocket 推给本机 livedub 引擎（默认 `ws://127.0.0.1:8787/ws`）；
@@ -29,6 +29,21 @@ v0.3 迭代（消除两个已知限制）：
   `<div data-livedub-fullscreen-wrapper>` 再对容器全屏，content script 的浮层迁移逻辑因此可见；
   退出全屏/失败自动回滚 DOM 并回退原生全屏。设置项 `fullscreenWorkaround` 默认开。
 
+v0.4 迭代（**边看边写笔记**）：
+- 在任意网页视频上按 **Alt+Shift+N**（或浮层面板「记笔记」/ popup「记当前句」），把
+  「当前视频 + 时间戳 + 最近一句双语字幕」写入本地引擎笔记库（`POST /api/notes`，kind=quick；
+  引擎只有 quick 路由时自动回退 `POST /api/notes/quick` 写每日摘录 `quick-YYYY-MM-DD.md`）；
+- 可选**页面截图**：background `chrome.tabs.captureVisibleTab` → `POST /api/notes/assets`（raw PNG）→
+  `imageUrl` 随笔记保存（截图只在有 activeTab/用户手势时可用；失败自动降级为无图笔记）；
+- **离线队列**：引擎未启动/请求失败时笔记进入本地队列（最多 50 条，`chrome.storage.local` 持久化），
+  引擎 ready / 下次打开 popup / 下次记笔记时自动 flush；浮层 toast 显示「已记笔记 @ mm:ss」或「已排队」；
+- 停止抓音后仍可记笔记（用缓存的最后一句字幕）；全屏容器内快捷键同样有效；
+- popup 显示**今日笔记数 / 待同步数**，一键「打开笔记本」（引擎工作台 `/studio/?notes=1`）、
+  「导出 Markdown」（`POST /api/notes/export`，显示落盘路径）、附截图开关与快捷键说明；
+- 与 VSCode/Typora 的工作流：边看边按 `Alt+Shift+N` 打点，结束后在笔记库编辑/导出 Markdown
+  （`data/exports/<slug>-<date>.md`，可直接放进 Obsidian vault 目录）。
+  注意：Chrome 扩展快捷键只在 **Chrome 窗口聚焦**时生效；若当前焦点在 VSCode，先点回浏览器（或点浮层面板/popup 的按钮）。
+
 > 协议、时间轴、事件定义见 `docs/CONTRACTS.md` §3；引擎入口 `engine/server.mjs`。
 > 本目录零 npm 依赖、无远程代码 / CDN / 内联脚本，所有资源随扩展本地打包。
 
@@ -45,8 +60,9 @@ extension/
 ├── lib/
 │   ├── constants.js       # 共享常量：默认地址 / storage key / 消息类型 / 设置默认值 / URL 规范化
 │   ├── pcm.js             # 纯函数：PCM 编解码、重采样、base64、hello、文本清洗、duck 状态机、dub 排期
-│   ├── ui.js              # v0.2 纯函数：全屏宿主选择/迁移、字幕停靠/避让布局、展示设置规范化
-│   └── srt.js             # v0.2 纯函数：caption -> SRT（时间戳/双语/文件名）
+│   ├── ui.js              # v0.2/v0.3 纯函数：全屏宿主/包裹决策、字幕停靠/避让、原声总线增益
+│   ├── srt.js             # v0.2 纯函数：caption -> SRT（时间戳/双语/文件名）
+│   └── notes.js           # v0.4 纯函数：videoId/quick note markdown/离线队列/今日计数/时间格式
 ├── worklet/pcm-worklet.js # AudioWorklet：100ms 分片 + 兜底重采样到 16kHz + float32→s16
 └── README.md
 tests/extension.test.mjs   # manifest / 静态检查 / 纯函数单测（node --test）
@@ -110,6 +126,12 @@ offscreen: getUserMedia(tab) ─▶ 16k AudioContext + AudioWorklet（100ms）
 - 全屏兼容包裹：page-hook（MAIN world）与 content 通过 `window.postMessage`（source `livedub-content` /
   `livedub-page-hook`）同步 `fullscreenWorkaround` 开关；包裹层是 `<div>`，属于「可承载子节点」元素，
   content 的 `fullscreenchange` 迁移会把浮层放进包裹层内。
+- 笔记：background 收到快捷键/按钮/命令后向 content 要 `{url,title,durationMs,tMs,text,quotes}` 上下文，
+  用 `lib/notes.js` 计算稳定 videoId、构造笔记请求体；主写入 `POST /api/notes`（笔记库存档，工作台「笔记本」
+  与导出 Markdown 都基于它，支持 `kind=quick`/`quotes`/`tags`/`imageUrl`），引擎无该路由时回退
+  `POST /api/notes/quick`（不支持 imageUrl，截图降级）；可选截图（`captureVisibleTab` → raw PNG →
+  `POST /api/notes/assets`）拿相对 `imageUrl`；失败时 payload 进 `lib/notes.js` 的离线队列
+  （`chrome.storage.local`），引擎 ready / popup 打开 / 下次记录时 flush。今日计数与最近一条结果广播给 popup/浮层。
 
 ## 排障（按顺序排查）
 
@@ -170,10 +192,27 @@ offscreen: getUserMedia(tab) ─▶ 16k AudioContext + AudioWorklet（100ms）
 | 28 | 设置里关闭「原声重放」 | 标签页原声完全静音（Chrome 抓音已静音），只听到中文配音；字幕仍正常 |
 | 29 | 调节「恢复延迟」300/800/3000ms | 说话结束后原声恢复的延迟随之变化，duck/恢复是渐变（约 160ms），无爆音 |
 | 30 | 对比：未开始同传时页面声音 vs 开始后 | 开始后声音只来自扩展的 offscreen 重放（音质不变），**不会出现双声**；若听到双声/无原声见排障 |
+| 31 | 播放视频，在 Chrome 聚焦时按 **Alt+Shift+N** | 浮层 toast「已记笔记 @ mm:ss」；`data/notes/<video>.json` 新增一条（含双语引用/视频链接，工作台笔记本可见）；popup 今日笔记 +1 |
+| 32 | 浮层面板勾选「附页面截图」→ 点「记笔记」 | 笔记带截图：`data/notes/assets/` 出现 PNG，笔记数据含 imageUrl；页面不可截时降级无图并提示 |
+| 33 | 关闭引擎（kill `npm start`）后按 Alt+Shift+N 两次 | toast「引擎未连接，已排队（N）」；popup 显示待同步数；重启引擎后回到 popup 或再记一条 → 自动 flush，待同步归 0 |
+| 34 | 原生全屏（容器型或裸 video+兼容）中按 Alt+Shift+N | 仍能记笔记并看到 toast（快捷键是浏览器级，不受全屏影响） |
+| 35 | 停止同传后（未关闭页面）按 Alt+Shift+N | 仍可用缓存的最后一句字幕记笔记；无字幕时记「（无字幕）」 |
+| 36 | popup →「打开笔记本」 | 打开 `http://127.0.0.1:8787/studio/?notes=1`，工作台切到笔记视图（若工作台尚未实现 notes 面板则显示主界面） |
+| 37 | popup →「导出 Markdown」 | 调用 `POST /api/notes/export`，显示落盘路径 `data/exports/<slug>-<date>.md`；引擎未启动时给 npm start 引导 |
+| 38 | 连续记 3 条后刷新页面再按 Alt+Shift+N | 视频/字幕上下文重建；同一视频笔记归到同一 id（元数据加载前记录的可能另归，见限制） |
 
 ## 已知限制 / TODO
 
 - **无法自动化验证真实 tabCapture**：本机/CI 无法在无头环境点击扩展图标并播放真实视频，自动测试只做 manifest、静态检查、纯函数单测、线协议冒烟；音画同步、真实抓音、全屏/导出/SRT 下载必须按上面的手动清单验证。
+- **笔记截图**依赖 activeTab/用户手势：快捷键与 popup 点击可用；页面受限（chrome://、PDF 等）或权限未授予时自动降级为无图笔记并提示。
+- **笔记离线队列只保存文本**（不保存截图）：离线期间截图上传失败会丢弃截图，笔记照常排队；队列上限 50 条，超出丢最旧。
+- 笔记 videoId 由 url+title+时长生成：视频元数据（duration）尚未加载时记录的第一条可能归入另一 id，加载完成后的笔记会归到带时长的 id；同一视频标题变化（站点改标题）也会导致 id 变化。
+- 笔记写入/导出依赖本地引擎 Notes API（`docs/CONTRACTS.md` §7.6）；引擎未实现/未启动时仅能排队 + `npm start` 引导，不影响字幕主链路。
+  实现说明：优先 `POST /api/notes`（笔记库存档、支持 imageUrl，工作台笔记本/导出可见）；若引擎只有 quick 路由则回退
+  `POST /api/notes/quick`（写每日摘录 `quick-YYYY-MM-DD.md`，截图降级为无图）。
+- 「打开笔记本」跳到 `/studio/?notes=1`，笔记面板由工作台负责；若该版本工作台未实现 notes 视图，会显示主界面（扩展侧不报错）。
+- 快捷键是 **Chrome 命令**，只在浏览器窗口聚焦时触发（VSCode 等外部编辑器内无法直接触发 OS 级快捷键）；可切回浏览器按 `Alt+Shift+N`，或使用浮层/popup 按钮。
+- 截图是 `captureVisibleTab`（当前可见区域），会包含页面 UI/水印；受 DRM 保护页面可能黑屏或失败，失败自动降级无图。
 - **原生全屏的浏览器限制（v0.3 尽力解决）**：容器型全屏（YouTube/B 站）一直正常；裸 `<video>` 全屏通过
   page-hook 包裹容器解决，但以下情况会回退原生全屏（浮层不可见，并提示）：页面用非标准方式进入全屏
   （浏览器原生控件、iOS `webkitEnterFullscreen`、跨进程 iframe 内部全屏）、站点异步/延迟调用
@@ -210,6 +249,7 @@ node --test tests/extension.test.mjs
 - `lib/srt.js`：SRT 时间戳、caption 排序/防重叠/兜底时长、双语行折叠、文件名清洗与时间戳；
 - **线协议冒烟**：用 Node 起一个 `engine/ws.mjs` 回环服务，验证扩展的 `hello` + 二进制音频帧 + `control stop` 能被引擎解析；
 - `computeDubPlayhead`：dub 按 `startMs` 排期、落后立即播；
+- `lib/notes.js`（v0.4）：videoId 稳定/URL 规范化、quick note 请求体/Markdown、离线队列（入队/上限/flush 成功与失败/持久化）、今日计数、时间码、Notes API URL/响应解析；
 - `page-hook.js`：MAIN world 猴补 `requestFullscreen`、裸 video 包裹/回滚、postMessage 协作协议；
 - content/background/offscreen/popup 的关键实现静态断言（user gesture、offscreen reasons、Shadow DOM、
   v0.3 原声总线 duck/恢复、全局限定压音让位、压音 800ms 等）。

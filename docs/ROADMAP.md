@@ -1,6 +1,6 @@
 # Roadmap
 
-## 已实现（v0.3）
+## 已实现（v0.4）
 
 - 本地实时同传引擎：VAD 切分、滚动 partial、子句级 TTS、调度/压音、失败隔离；
 - Chrome MV3 扩展：tabCapture 抓声、Shadow DOM 双语字幕浮层、中文配音、原声 ducking；
@@ -11,6 +11,8 @@
 - v0.2：翻译流式 × TTS 重叠、TTS 预热/LRU 缓存/可中断、快速档（small ASR e2e ~2.4s）、
   成片时轴修正、ASR partial/推测收句的 A/B 结论（默认关闭）、工作台主题/字幕预设/快捷键/延迟趋势/JSONL 导出、
   扩展全屏浮层/SRT 导出/断连引导、服务端会话上限与优雅退出、MIT 开源与 GitHub Actions CI。
+- v0.4：**学习笔记**（Notes API + 工作台笔记抽屉/Markdown 预览/截图/代码块/大纲/导出/画中画 +
+  扩展 `Alt+Shift+N` + macOS `⌥N` 全局快捷笔记 + CLI），笔记只落本机、可导出 Obsidian。
 - v0.3：**云端 ASR 档**（MiniMax asr-1.0，e2e 2.2–2.4s + 本地降级/熔断 + 隐私提示）、
   **火山引擎 TTS + 声音复刻 v3**（真正音色克隆，需豆包语音 UUID Key）、
   **macOS 桌面悬浮窗**（ScreenCaptureKit + NSPanel 字幕 + 配音）、扩展**全局限定压音**（iframe/WebAudio）+

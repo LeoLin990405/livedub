@@ -602,6 +602,8 @@ function buildHealth(state) {
       updatedAt: ui.updatedAt ?? null,
       overridden: Object.keys(ui.overrides ?? {}).length > 0,
     },
+    // Notes API 统计（不带内容）
+    notes: getNotesStats(state),
     features: { dubEnabled: effective.dub.enabled },
     whisper: { found: Boolean(model), model: toProjectRelative(model) },
     sayless: { configPath: saylessPath, found: Boolean(saylessPath) },
@@ -749,6 +751,7 @@ function buildPublicConfigPayload(state) {
       effective,
       warnings: Array.isArray(ui.warnings) ? ui.warnings : [],
     },
+    notes: getNotesStats(state),
   };
   return { ok: true, protocol: PROTOCOL_VERSION, config: scrubSecrets(snapshot) };
 }
@@ -857,6 +860,843 @@ async function sendVoicesPayload(state, req, res, head) {
 
 // ------------------------------------------------------------- HTTP dispatch
 
+// ------------------------------------------------------------- Notes API（v0.4）
+// 共享契约（T5 扩展 / T6 macOS App 共用）：
+//   VideoRef = { id, title, url?, durationMs? }
+//   Note = { id, video, tMs, body(Markdown<=200KB), quotes?, tags?, imageUrl?, kind?, source, createdAt, updatedAt }
+// 存储：data/notes/<videoSlug>.json；assets: data/notes/assets/；quick: data/notes/quick-YYYY-MM-DD.md；
+// 导出：data/exports/<slug>-<date>.md。只落本地 data/，不写密钥；文件名/ID 仅 [A-Za-z0-9._-]。
+
+const NOTES_MAX_BODY_BYTES = 200 * 1024;
+const NOTES_MAX_JSON_BYTES = 1024 * 1024;
+const NOTES_ASSET_MAX_BYTES = 4 * 1024 * 1024;
+const NOTES_LIST_LIMIT_DEFAULT = 200;
+const NOTES_LIST_LIMIT_MAX = 500;
+const NOTE_KINDS = Object.freeze(['note', 'outline', 'quick', 'marker']);
+const NOTE_SOURCES = Object.freeze(['studio', 'extension', 'macos', 'cli']);
+const SAFE_RESOURCE_NAME_RE = /^[A-Za-z0-9._-]+$/;
+const NOTE_ID_RE = /^[A-Za-z0-9._-]{1,120}$/;
+const NOTE_ASSET_FILE_RE = /^[A-Za-z0-9._-]+\.png$/;
+const NOTES_KIND_LABELS = Object.freeze({ note: '笔记', outline: '课程大纲', quick: '快速摘录', marker: '标记' });
+
+function notesPaths(state) {
+  const notesDir = path.join(state.dataDir, 'notes');
+  return { notesDir, assetsDir: path.join(notesDir, 'assets'), exportsDir: path.join(state.dataDir, 'exports') };
+}
+
+function ensureDirSync(dir) {
+  fs.mkdirSync(dir, { recursive: true });
+}
+
+/** 原子写（temp + rename），只写本地 data/ */
+function atomicWriteFileSync(file, data) {
+  ensureDirSync(path.dirname(file));
+  const tmp = `${file}.tmp-${process.pid}-${crypto.randomBytes(4).toString('hex')}`;
+  fs.writeFileSync(tmp, data, { mode: 0o600 });
+  fs.renameSync(tmp, file);
+}
+
+/** video.id -> 安全文件名 slug（保留可读前缀 + sha1 防碰撞/大小写冲突） */
+function notesSlugForVideoId(videoId) {
+  const raw = String(videoId ?? '');
+  const base = raw.replace(/[^A-Za-z0-9._-]+/g, '-').replace(/^[.-]+|[.-]+$/g, '').slice(0, 80) || 'video';
+  return `${base}-${crypto.createHash('sha1').update(raw).digest('hex').slice(0, 10)}`;
+}
+
+function notesFileFor(state, videoId) {
+  return path.join(notesPaths(state).notesDir, `${notesSlugForVideoId(videoId)}.json`);
+}
+
+function localDateString(date = new Date()) {
+  const y = date.getFullYear();
+  const m = String(date.getMonth() + 1).padStart(2, '0');
+  const d = String(date.getDate()).padStart(2, '0');
+  return `${y}-${m}-${d}`;
+}
+
+/** 时间戳：HH:MM:SS */
+function formatNoteTimestamp(ms) {
+  const total = Math.max(0, Math.round(Number(ms) || 0));
+  const hours = Math.floor(total / 3_600_000);
+  const minutes = Math.floor((total % 3_600_000) / 60_000);
+  const seconds = Math.floor((total % 60_000) / 1000);
+  return `${String(hours).padStart(2, '0')}:${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`;
+}
+
+// ---- 校验/规范化 ----
+
+function noteError(code, message, field) {
+  return { ok: false, status: 400, error: { code, message, ...(field ? { field } : {}) } };
+}
+
+function normalizeVideoRef(raw) {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return noteError('invalid_video', 'video 必须是对象', 'video');
+  const id = typeof raw.id === 'string' ? raw.id.trim() : '';
+  if (!id || id.length > 200) return noteError('invalid_video', 'video.id 必须是 1-200 字符的字符串', 'video.id');
+  const title = typeof raw.title === 'string' && raw.title.trim() ? raw.title.trim() : id;
+  const url = typeof raw.url === 'string' ? raw.url.trim().slice(0, 2000) : '';
+  let durationMs;
+  if (raw.durationMs != null) {
+    const value = Number(raw.durationMs);
+    if (!Number.isFinite(value) || value < 0) return noteError('invalid_video', 'video.durationMs 必须是非负数字', 'video.durationMs');
+    durationMs = Math.round(value);
+  }
+  return {
+    ok: true,
+    video: { id, title: title.slice(0, 300), ...(url ? { url } : {}), ...(durationMs != null ? { durationMs } : {}) },
+  };
+}
+
+function normalizeNoteTMs(raw, fallback = 0) {
+  if (raw == null) return { ok: true, value: fallback };
+  const value = Number(raw);
+  if (!Number.isFinite(value) || value < 0) return noteError('invalid_tms', 'tMs 必须是非负毫秒数', 'tMs');
+  return { ok: true, value: Math.round(value) };
+}
+
+function normalizeNoteBody(raw, { allowEmpty = true } = {}) {
+  if (typeof raw !== 'string') return noteError('invalid_body', 'body 必须是 Markdown 字符串', 'body');
+  if (!allowEmpty && raw.trim().length === 0) return noteError('invalid_body', 'body 不能为空', 'body');
+  if (Buffer.byteLength(raw, 'utf8') > NOTES_MAX_BODY_BYTES) {
+    return noteError('body_too_large', `body 超过 ${Math.round(NOTES_MAX_BODY_BYTES / 1024)}KB 上限`, 'body');
+  }
+  return { ok: true, value: raw };
+}
+
+function normalizeNoteQuotes(raw) {
+  if (raw == null) return { ok: true, value: [] };
+  if (!Array.isArray(raw)) return noteError('invalid_quotes', 'quotes 必须是数组', 'quotes');
+  if (raw.length > 50) return noteError('invalid_quotes', 'quotes 最多 50 条', 'quotes');
+  const out = [];
+  for (const item of raw) {
+    if (!item || typeof item !== 'object' || Array.isArray(item)) continue;
+    const quote = {};
+    for (const key of ['t0Ms', 't1Ms']) {
+      if (item[key] == null) continue;
+      const value = Number(item[key]);
+      if (!Number.isFinite(value) || value < 0) return noteError('invalid_quotes', `quotes.${key} 必须是非负数字`, 'quotes');
+      quote[key] = Math.round(value);
+    }
+    for (const key of ['src', 'dst']) {
+      if (typeof item[key] !== 'string' || !item[key].trim()) continue;
+      quote[key] = item[key].slice(0, 2000);
+    }
+    if (Object.keys(quote).length > 0) out.push(quote);
+  }
+  return { ok: true, value: out };
+}
+
+function normalizeNoteTags(raw) {
+  if (raw == null) return { ok: true, value: [] };
+  if (!Array.isArray(raw)) return noteError('invalid_tags', 'tags 必须是数组', 'tags');
+  if (raw.length > 20) return noteError('invalid_tags', 'tags 最多 20 个', 'tags');
+  const seen = new Set();
+  const out = [];
+  for (const item of raw) {
+    if (typeof item !== 'string') return noteError('invalid_tags', 'tags 每项必须是字符串', 'tags');
+    const tag = item.trim();
+    if (!tag) continue;
+    if (tag.length > 40) return noteError('invalid_tags', '单个 tag 不能超过 40 字符', 'tags');
+    if (seen.has(tag)) continue;
+    seen.add(tag);
+    out.push(tag);
+  }
+  return { ok: true, value: out };
+}
+
+function normalizeNoteImageUrl(raw) {
+  if (raw == null || raw === '') return { ok: true, value: undefined };
+  if (typeof raw !== 'string') return noteError('invalid_image', 'imageUrl 必须是字符串', 'imageUrl');
+  const value = raw.trim();
+  if (value.length > 500) return noteError('invalid_image', 'imageUrl 过长', 'imageUrl');
+  if (!/^\/api\/notes\/assets\/[A-Za-z0-9._-]+\.png$/.test(value)) {
+    return noteError('invalid_image', 'imageUrl 必须指向 /api/notes/assets/<file>.png', 'imageUrl');
+  }
+  return { ok: true, value };
+}
+
+function normalizeNoteKind(raw, fallback = 'note') {
+  if (raw == null || raw === '') return { ok: true, value: fallback };
+  if (!NOTE_KINDS.includes(raw)) return noteError('invalid_kind', `kind 必须是 ${NOTE_KINDS.join(' / ')}`, 'kind');
+  return { ok: true, value: raw };
+}
+
+function normalizeNoteSource(raw, fallback = 'studio') {
+  if (raw == null || raw === '') return { ok: true, value: fallback };
+  if (!NOTE_SOURCES.includes(raw)) return noteError('invalid_source', `source 必须是 ${NOTE_SOURCES.join(' / ')}`, 'source');
+  return { ok: true, value: raw };
+}
+
+/** POST /api/notes 的完整校验 */
+function normalizeNoteCreate(input) {
+  if (!input || typeof input !== 'object' || Array.isArray(input)) return noteError('invalid_body', '请求体必须是 JSON 对象');
+  const allowed = new Set(['video', 'tMs', 'body', 'quotes', 'tags', 'imageUrl', 'kind', 'source']);
+  for (const key of Object.keys(input)) {
+    if (!allowed.has(key)) return noteError('unknown_field', `不支持的字段：${key}`, key);
+  }
+  const videoResult = normalizeVideoRef(input.video);
+  if (!videoResult.ok) return videoResult;
+  const tMsResult = normalizeNoteTMs(input.tMs, 0);
+  if (!tMsResult.ok) return tMsResult;
+  const bodyResult = normalizeNoteBody(input.body ?? '');
+  if (!bodyResult.ok) return bodyResult;
+  const quotesResult = normalizeNoteQuotes(input.quotes);
+  if (!quotesResult.ok) return quotesResult;
+  const tagsResult = normalizeNoteTags(input.tags);
+  if (!tagsResult.ok) return tagsResult;
+  const imageResult = normalizeNoteImageUrl(input.imageUrl);
+  if (!imageResult.ok) return imageResult;
+  const kindResult = normalizeNoteKind(input.kind, 'note');
+  if (!kindResult.ok) return kindResult;
+  const sourceResult = normalizeNoteSource(input.source, 'studio');
+  if (!sourceResult.ok) return sourceResult;
+  return {
+    ok: true,
+    value: {
+      video: videoResult.video,
+      tMs: tMsResult.value,
+      body: bodyResult.value,
+      quotes: quotesResult.value,
+      tags: tagsResult.value,
+      imageUrl: imageResult.value,
+      kind: kindResult.value,
+      source: sourceResult.value,
+    },
+  };
+}
+
+/** PUT /api/notes/:id 的部分更新校验（白名单，不允许改 video/id/source/createdAt） */
+function normalizeNotePatch(input) {
+  if (!input || typeof input !== 'object' || Array.isArray(input)) return noteError('invalid_body', '请求体必须是 JSON 对象');
+  const allowed = new Set(['body', 'tMs', 'tags', 'quotes', 'imageUrl', 'kind']);
+  const patch = {};
+  for (const [key, raw] of Object.entries(input)) {
+    if (!allowed.has(key)) return noteError('unknown_field', `不支持的字段：${key}`, key);
+    if (key === 'body') {
+      const result = normalizeNoteBody(raw);
+      if (!result.ok) return result;
+      patch.body = result.value;
+    } else if (key === 'tMs') {
+      const result = normalizeNoteTMs(raw);
+      if (!result.ok) return result;
+      patch.tMs = result.value;
+    } else if (key === 'tags') {
+      const result = normalizeNoteTags(raw);
+      if (!result.ok) return result;
+      patch.tags = result.value;
+    } else if (key === 'quotes') {
+      const result = normalizeNoteQuotes(raw);
+      if (!result.ok) return result;
+      patch.quotes = result.value;
+    } else if (key === 'imageUrl') {
+      const result = normalizeNoteImageUrl(raw);
+      if (!result.ok) return result;
+      patch.imageUrl = result.value;
+    } else if (key === 'kind') {
+      const result = normalizeNoteKind(raw);
+      if (!result.ok) return result;
+      patch.kind = result.value;
+    }
+  }
+  if (Object.keys(patch).length === 0) return noteError('empty_patch', '没有可更新的字段（body/tMs/tags/quotes/imageUrl/kind）');
+  return { ok: true, value: patch };
+}
+
+// ---- 存储 ----
+
+function readNotesStore(file) {
+  const data = readJsonIfExists(file);
+  if (!data || typeof data !== 'object') return { version: 1, video: null, notes: [] };
+  const notes = Array.isArray(data.notes)
+    ? data.notes.filter((note) => note && typeof note === 'object' && typeof note.id === 'string' && NOTE_ID_RE.test(note.id))
+    : [];
+  return { version: 1, video: data.video && typeof data.video === 'object' ? data.video : null, notes };
+}
+
+function saveNotesStore(state, file, store) {
+  atomicWriteFileSync(file, `${JSON.stringify(store, null, 2)}\n`);
+  state.notesStatsCache = null;
+}
+
+/** 同一文件的写操作串行化（并发写不丢数据） */
+function withNotesFileQueue(state, file, task) {
+  const previous = state.noteQueues.get(file) ?? Promise.resolve();
+  const run = previous.then(task, task);
+  const chained = run.then(
+    () => undefined,
+    () => undefined,
+  );
+  const tracked = chained.finally(() => {
+    if (state.noteQueues.get(file) === tracked) state.noteQueues.delete(file);
+  });
+  state.noteQueues.set(file, tracked);
+  return run;
+}
+
+function listNotesStoreFiles(state) {
+  const { notesDir } = notesPaths(state);
+  let names = [];
+  try {
+    names = fs.readdirSync(notesDir).filter((name) => name.endsWith('.json') && SAFE_RESOURCE_NAME_RE.test(name) && !name.includes('..'));
+  } catch {
+    names = [];
+  }
+  return names.map((name) => path.join(notesDir, name));
+}
+
+function readAllNoteEntries(state) {
+  const entries = [];
+  for (const file of listNotesStoreFiles(state)) {
+    const store = readNotesStore(file);
+    for (const note of store.notes) {
+      const video = note.video && typeof note.video === 'object' ? note.video : store.video;
+      if (!video || typeof video.id !== 'string') continue;
+      entries.push({ file, store, note: { ...note, video } });
+    }
+  }
+  return entries;
+}
+
+function findNoteEntry(state, id) {
+  if (!NOTE_ID_RE.test(String(id ?? '')) || String(id).includes('..')) return null;
+  for (const file of listNotesStoreFiles(state)) {
+    const store = readNotesStore(file);
+    const index = store.notes.findIndex((note) => note.id === id);
+    if (index >= 0) return { file, store, note: store.notes[index], index };
+  }
+  return null;
+}
+
+function getNotesStats(state) {
+  const now = Date.now();
+  if (state.notesStatsCache && now - state.notesStatsCache.at < 3000) return state.notesStatsCache.value;
+  const { notesDir, exportsDir } = notesPaths(state);
+  let videos = 0;
+  let count = 0;
+  for (const file of listNotesStoreFiles(state)) {
+    const store = readNotesStore(file);
+    if (store.notes.length === 0) continue;
+    videos += 1;
+    count += store.notes.length;
+  }
+  const value = {
+    count,
+    videos,
+    notesDir: toProjectRelative(notesDir),
+    exportsDir: toProjectRelative(exportsDir),
+    assetsDir: toProjectRelative(path.join(notesDir, 'assets')),
+  };
+  state.notesStatsCache = { at: now, value };
+  return value;
+}
+
+function buildNotesListPayload(state, { videoId = '', q = '', limit = NOTES_LIST_LIMIT_DEFAULT } = {}) {
+  const entries = readAllNoteEntries(state);
+  const videosMap = new Map();
+  for (const { note } of entries) {
+    const video = note.video;
+    const summary = videosMap.get(video.id) ?? { video, count: 0, updatedAt: null };
+    summary.count += 1;
+    if (!summary.updatedAt || String(note.updatedAt ?? '') > summary.updatedAt) summary.updatedAt = note.updatedAt ?? null;
+    summary.video = { ...video, ...(video.title ? { title: video.title } : {}) };
+    videosMap.set(video.id, summary);
+  }
+  const videos = [...videosMap.values()].sort((a, b) => String(b.updatedAt ?? '').localeCompare(String(a.updatedAt ?? '')));
+  let notes = entries.map((entry) => entry.note);
+  if (videoId) notes = notes.filter((note) => note.video?.id === String(videoId));
+  const needle = String(q ?? '').trim().toLowerCase();
+  if (needle) {
+    notes = notes.filter((note) => {
+      const haystack = [
+        note.body ?? '',
+        ...(Array.isArray(note.quotes) ? note.quotes.flatMap((quote) => [quote?.src ?? '', quote?.dst ?? '']) : []),
+        ...(Array.isArray(note.tags) ? note.tags : []),
+      ].join('\n');
+      return haystack.toLowerCase().includes(needle);
+    });
+  }
+  notes.sort((a, b) => String(b.updatedAt ?? '').localeCompare(String(a.updatedAt ?? '')) || String(b.createdAt ?? '').localeCompare(String(a.createdAt ?? '')));
+  const parsedLimit = Number(limit);
+  const capped = Math.min(NOTES_LIST_LIMIT_MAX, Math.max(1, Number.isFinite(parsedLimit) && parsedLimit > 0 ? Math.floor(parsedLimit) : NOTES_LIST_LIMIT_DEFAULT));
+  return { videos, notes: notes.slice(0, capped), total: notes.length };
+}
+
+// ---- Markdown 导出 / quick 追加 ----
+
+function buildQuoteMarkdown(quotes = []) {
+  const lines = [];
+  for (const quote of Array.isArray(quotes) ? quotes : []) {
+    if (quote?.src) lines.push(`> 原文：${String(quote.src).trim()}`);
+    if (quote?.dst) lines.push(`> 译文：${String(quote.dst).trim()}`);
+    if ((!quote?.src && !quote?.dst) && (quote?.t0Ms != null || quote?.t1Ms != null)) {
+      lines.push(`> 时间：${formatNoteTimestamp(quote.t0Ms ?? quote.t1Ms ?? 0)}`);
+    }
+  }
+  return lines;
+}
+
+function buildNoteMarkdown(note) {
+  const lines = [];
+  const kindLabel = NOTES_KIND_LABELS[note.kind] ?? note.kind ?? '笔记';
+  lines.push(`## [${formatNoteTimestamp(note.tMs)}](?t=${Math.round(Number(note.tMs) || 0)}) · ${kindLabel}`);
+  lines.push('');
+  const body = String(note.body ?? '').trim();
+  lines.push(body || '（空笔记）');
+  lines.push('');
+  for (const quoteLine of buildQuoteMarkdown(note.quotes)) lines.push(quoteLine);
+  if (Array.isArray(note.tags) && note.tags.length > 0) lines.push(`标签：${note.tags.join('、')}`);
+  if (note.imageUrl) lines.push(`![截图](${note.imageUrl})`);
+  lines.push('');
+  return lines.join('\n');
+}
+
+function buildVideoHeader(video, noteCount, { forExport = false } = {}) {
+  const date = localDateString();
+  const lines = [
+    '---',
+    `title: ${JSON.stringify(String(video?.title ?? video?.id ?? 'livedub 笔记'))}`,
+    `videoId: ${JSON.stringify(String(video?.id ?? ''))}`,
+    ...(video?.url ? [`url: ${JSON.stringify(String(video.url))}`] : []),
+    `date: ${date}`,
+    `langFrom: ${JSON.stringify('en')}`,
+    `langTo: ${JSON.stringify('zh')}`,
+    `notes: ${noteCount}`,
+    `generatedBy: ${JSON.stringify('livedub')}`,
+    '---',
+    '',
+    `# ${String(video?.title ?? video?.id ?? 'livedub 笔记')}`,
+    '',
+  ];
+  if (video?.url) lines.push(`> 视频：${video.url}`);
+  if (video?.durationMs) lines.push(`> 时长：${formatNoteTimestamp(video.durationMs)}`);
+  if (video?.url || video?.durationMs) lines.push('');
+  if (noteCount === 0) {
+    lines.push('（还没有笔记）');
+    lines.push('');
+  }
+  return lines;
+}
+
+function buildVideoNotesMarkdown(state, videoId) {
+  const id = String(videoId ?? '');
+  const notes = readAllNoteEntries(state)
+    .map((entry) => entry.note)
+    .filter((note) => note.video?.id === id)
+    .sort((a, b) => (Number(a.tMs) || 0) - (Number(b.tMs) || 0));
+  const video = notes[0]?.video ?? { id, title: id };
+  const lines = buildVideoHeader(video, notes.length, { forExport: true });
+  for (const note of notes) lines.push(buildNoteMarkdown(note));
+  return `${lines.join('\n').replace(/\n{3,}/g, '\n\n')}\n`;
+}
+
+function buildQuickBlock({ video, tMs, text, quotes, tags, source }) {
+  const lines = [`### ${formatNoteTimestamp(tMs)} · ${String(video.title ?? video.id)}`, ''];
+  lines.push(`- 视频：${video.url ? `[${String(video.url)}](${String(video.url)})` : '`' + String(video.id) + '`'}`);
+  lines.push(`- 时间戳：[${formatNoteTimestamp(tMs)}](?t=${Math.round(tMs)})（tMs=${Math.round(tMs)}）`);
+  lines.push(`- 来源：${source}`);
+  if (Array.isArray(tags) && tags.length > 0) lines.push(`- 标签：${tags.join('、')}`);
+  lines.push('');
+  lines.push(String(text ?? '').trim() || '（空摘录）');
+  for (const quoteLine of buildQuoteMarkdown(quotes)) lines.push(quoteLine);
+  lines.push('', '');
+  return lines.join('\n');
+}
+
+function sendApiErrorPayload(res, status, error) {
+  return sendJson(res, status, { ok: false, error: error.code, message: error.message, ...(error.field ? { field: error.field } : {}) });
+}
+
+function sendMarkdownPayload(res, filename, markdown, { head = false } = {}) {
+  const body = Buffer.from(String(markdown ?? ''), 'utf8');
+  res.writeHead(200, {
+    'Content-Type': 'text/markdown; charset=utf-8',
+    'Content-Length': body.length,
+    'Content-Disposition': `attachment; filename="${filename}"`,
+    'Cache-Control': 'no-store',
+  });
+  res.end(head ? undefined : body);
+}
+
+function readJsonBodyForNotes(req, limit = NOTES_MAX_JSON_BYTES) {
+  return new Promise((resolve) => {
+    let size = 0;
+    let settled = false;
+    let tooLarge = false;
+    const chunks = [];
+    const finish = (result) => {
+      if (settled) return;
+      settled = true;
+      resolve(result);
+    };
+    req.on('data', (chunk) => {
+      if (settled) return;
+      size += chunk.length;
+      // 超限后继续把剩余 body 读完再回 413，避免客户端收到 socket reset（本地大笔记/攻击请求都更可控）
+      if (tooLarge) {
+        if (size > limit * 8) {
+          finish({ ok: false, status: 413, error: { code: 'body_too_large', message: `请求体超过 ${Math.round(limit / 1024)}KB 上限` } });
+          try {
+            req.destroy();
+          } catch {
+            /* ignore */
+          }
+        }
+        return;
+      }
+      if (size > limit) {
+        tooLarge = true;
+        chunks.length = 0;
+        return;
+      }
+      chunks.push(chunk);
+    });
+    req.on('end', () => {
+      if (settled) return;
+      if (tooLarge) {
+        return finish({ ok: false, status: 413, error: { code: 'body_too_large', message: `请求体超过 ${Math.round(limit / 1024)}KB 上限` } });
+      }
+      const raw = Buffer.concat(chunks).toString('utf8');
+      if (!raw.trim()) return finish({ ok: true, value: {} });
+      try {
+        finish({ ok: true, value: JSON.parse(raw) });
+      } catch {
+        finish({ ok: false, status: 400, error: { code: 'invalid_json', message: '请求体不是合法 JSON' } });
+      }
+    });
+    req.on('error', () => finish({ ok: false, status: 400, error: { code: 'bad_request', message: '读取请求体失败' } }));
+  });
+}
+
+function readRawBodyForNotes(req, limit = NOTES_ASSET_MAX_BYTES) {
+  return new Promise((resolve) => {
+    let size = 0;
+    let settled = false;
+    let tooLarge = false;
+    const chunks = [];
+    const finish = (result) => {
+      if (settled) return;
+      settled = true;
+      resolve(result);
+    };
+    req.on('data', (chunk) => {
+      if (settled) return;
+      size += chunk.length;
+      if (tooLarge) {
+        if (size > limit * 4) {
+          finish({ ok: false, status: 413, error: { code: 'body_too_large', message: `截图超过 ${Math.round(limit / 1024 / 1024)}MB 上限` } });
+          try {
+            req.destroy();
+          } catch {
+            /* ignore */
+          }
+        }
+        return;
+      }
+      if (size > limit) {
+        tooLarge = true;
+        chunks.length = 0;
+        return;
+      }
+      chunks.push(chunk);
+    });
+    req.on('end', () => {
+      if (settled) return;
+      if (tooLarge) {
+        return finish({ ok: false, status: 413, error: { code: 'body_too_large', message: `截图超过 ${Math.round(limit / 1024 / 1024)}MB 上限` } });
+      }
+      finish({ ok: true, buffer: Buffer.concat(chunks) });
+    });
+    req.on('error', () => finish({ ok: false, status: 400, error: { code: 'bad_request', message: '读取截图失败' } }));
+  });
+}
+
+// ---- 请求处理 ----
+
+async function handleNotesRequest(state, req, res, { method, pathname, url }) {
+  const head = method === 'HEAD';
+
+  if (pathname === '/api/notes') {
+    if (method === 'GET' || method === 'HEAD') {
+      const payload = buildNotesListPayload(state, {
+        videoId: url.searchParams.get('videoId') ?? '',
+        q: url.searchParams.get('q') ?? '',
+        limit: url.searchParams.get('limit') ?? NOTES_LIST_LIMIT_DEFAULT,
+      });
+      return sendJson(res, 200, { ok: true, ...payload }, { head });
+    }
+    const parsed = await readJsonBodyForNotes(req);
+    if (!parsed.ok) return sendJson(res, parsed.status, { ok: false, error: parsed.error.code, message: parsed.error.message });
+    const normalized = normalizeNoteCreate(parsed.value);
+    if (!normalized.ok) return sendApiErrorPayload(res, normalized.status, normalized.error);
+    const value = normalized.value;
+    const file = notesFileFor(state, value.video.id);
+    const result = await withNotesFileQueue(state, file, () => {
+      const store = readNotesStore(file);
+      const now = new Date().toISOString();
+      const note = {
+        id: `n_${Date.now().toString(36)}_${crypto.randomBytes(4).toString('hex')}`,
+        video: value.video,
+        tMs: value.tMs,
+        body: value.body,
+        kind: value.kind,
+        source: value.source,
+        ...(value.quotes.length > 0 ? { quotes: value.quotes } : {}),
+        ...(value.tags.length > 0 ? { tags: value.tags } : {}),
+        ...(value.imageUrl ? { imageUrl: value.imageUrl } : {}),
+        createdAt: now,
+        updatedAt: now,
+      };
+      store.video = value.video;
+      store.notes.push(note);
+      saveNotesStore(state, file, store);
+      return note;
+    });
+    state.log(`笔记创建 ${result.id}（${toProjectRelative(file)}，${result.body.length} 字符）`);
+    return sendJson(res, 200, { ok: true, note: result });
+  }
+
+  if (pathname === '/api/notes/quick') {
+    const parsed = await readJsonBodyForNotes(req);
+    if (!parsed.ok) return sendJson(res, parsed.status, { ok: false, error: parsed.error.code, message: parsed.error.message });
+    const input = parsed.value && typeof parsed.value === 'object' ? parsed.value : {};
+    for (const key of Object.keys(input)) {
+      if (!['video', 'tMs', 'text', 'quotes', 'source', 'tags', 'imageUrl'].includes(key)) {
+        return sendApiErrorPayload(res, 400, { code: 'unknown_field', message: `不支持的字段：${key}`, field: key });
+      }
+    }
+    const videoResult = normalizeVideoRef(input.video);
+    if (!videoResult.ok) return sendApiErrorPayload(res, videoResult.status, videoResult.error);
+    const tMsResult = normalizeNoteTMs(input.tMs, 0);
+    if (!tMsResult.ok) return sendApiErrorPayload(res, tMsResult.status, tMsResult.error);
+    if (typeof input.text !== 'string') return sendApiErrorPayload(res, 400, { code: 'invalid_text', message: 'text 必须是字符串', field: 'text' });
+    if (Buffer.byteLength(input.text, 'utf8') > NOTES_MAX_BODY_BYTES) {
+      return sendApiErrorPayload(res, 400, { code: 'text_too_large', message: 'text 超过 200KB 上限', field: 'text' });
+    }
+    const quotesResult = normalizeNoteQuotes(input.quotes);
+    if (!quotesResult.ok) return sendApiErrorPayload(res, quotesResult.status, quotesResult.error);
+    const tagsResult = normalizeNoteTags(input.tags);
+    if (!tagsResult.ok) return sendApiErrorPayload(res, tagsResult.status, tagsResult.error);
+    const sourceResult = normalizeNoteSource(input.source, 'extension');
+    if (!sourceResult.ok) return sendApiErrorPayload(res, sourceResult.status, sourceResult.error);
+    const imageResult = normalizeNoteImageUrl(input.imageUrl);
+    if (!imageResult.ok) return sendApiErrorPayload(res, imageResult.status, imageResult.error);
+    const { notesDir } = notesPaths(state);
+    const date = localDateString();
+    const file = path.join(notesDir, `quick-${date}.md`);
+    const markdown = buildQuickBlock({
+      video: videoResult.video,
+      tMs: tMsResult.value,
+      text: input.text,
+      quotes: quotesResult.value,
+      tags: tagsResult.value,
+      source: sourceResult.value,
+    });
+    // 关键：quick 同时写入 per-video 笔记库（kind:'quick'），这样工作台笔记面板 /
+    // GET /api/notes / 导出都能看到扩展、macOS、CLI 的快捷笔记；每日 markdown 照旧追加。
+    const noteFile = notesFileFor(state, videoResult.video.id);
+    const created = await withNotesFileQueue(state, noteFile, () => {
+      const store = readNotesStore(noteFile);
+      const now = new Date().toISOString();
+      const note = {
+        id: `n_${Date.now().toString(36)}_${crypto.randomBytes(4).toString('hex')}`,
+        video: videoResult.video,
+        tMs: tMsResult.value,
+        body: input.text,
+        kind: 'quick',
+        source: sourceResult.value,
+        ...(quotesResult.value.length > 0 ? { quotes: quotesResult.value } : {}),
+        ...(tagsResult.value.length > 0 ? { tags: tagsResult.value } : {}),
+        ...(imageResult.value ? { imageUrl: imageResult.value } : {}),
+        createdAt: now,
+        updatedAt: now,
+      };
+      store.video = videoResult.video;
+      store.notes.push(note);
+      saveNotesStore(state, noteFile, store);
+      return note;
+    });
+    await withNotesFileQueue(state, file, () => {
+      ensureDirSync(notesDir);
+      let prefix = '';
+      let existing = '';
+      try {
+        existing = fs.existsSync(file) ? fs.readFileSync(file, 'utf8') : '';
+      } catch {
+        existing = '';
+      }
+      if (!existing) prefix = `# livedub 快速摘录 · ${date}\n\n`;
+      else if (!existing.endsWith('\n')) prefix = '\n';
+      fs.appendFileSync(file, `${prefix}${markdown}`);
+    });
+    state.log(`快速摘录 ${created.id}（${toProjectRelative(noteFile)} + ${toProjectRelative(file)}）`);
+    return sendJson(res, 200, { ok: true, path: toProjectRelative(file), markdown, note: created });
+  }
+
+  if (pathname === '/api/notes/assets') {
+    const contentType = String(req.headers['content-type'] ?? '').toLowerCase();
+    if (!contentType.startsWith('image/png')) {
+      return sendJson(res, 415, { ok: false, error: 'unsupported_media_type', message: '截图必须以 image/png 上传' });
+    }
+    const parsed = await readRawBodyForNotes(req);
+    if (!parsed.ok) return sendJson(res, parsed.status, { ok: false, error: parsed.error.code, message: parsed.error.message });
+    const buffer = parsed.buffer;
+    if (buffer.length < 8 || buffer[0] !== 0x89 || buffer.toString('latin1', 1, 4) !== 'PNG') {
+      return sendJson(res, 400, { ok: false, error: 'invalid_png', message: '文件不是合法 PNG' });
+    }
+    const { assetsDir } = notesPaths(state);
+    const file = `img_${Date.now().toString(36)}_${crypto.randomBytes(4).toString('hex')}.png`;
+    try {
+      ensureDirSync(assetsDir);
+      atomicWriteFileSync(path.join(assetsDir, file), buffer);
+    } catch (err) {
+      return sendJson(res, 500, { ok: false, error: 'persist_failed', message: `保存截图失败：${err?.message ?? err}` });
+    }
+    state.log(`笔记截图已保存 data/notes/assets/${file}（${buffer.length} 字节）`);
+    return sendJson(res, 200, { ok: true, url: `/api/notes/assets/${file}`, size: buffer.length });
+  }
+
+  if (pathname.startsWith('/api/notes/assets/')) {
+    const raw = pathname.slice('/api/notes/assets/'.length);
+    let name;
+    try {
+      name = decodeURIComponent(raw);
+    } catch {
+      return sendJson(res, 400, { ok: false, error: 'invalid_name', message: '文件名编码非法' });
+    }
+    if (!NOTE_ASSET_FILE_RE.test(name) || name.includes('..')) {
+      return sendJson(res, 403, { ok: false, error: 'forbidden', message: '截图文件名非法' });
+    }
+    const file = path.join(notesPaths(state).assetsDir, name);
+    let stat;
+    try {
+      stat = fs.statSync(file);
+    } catch {
+      return sendJson(res, 404, { ok: false, error: 'not_found', message: '截图不存在' });
+    }
+    if (!stat.isFile()) return sendJson(res, 404, { ok: false, error: 'not_found', message: '截图不存在' });
+    res.writeHead(200, {
+      'Content-Type': 'image/png',
+      'Content-Length': stat.size,
+      'Cache-Control': 'private, max-age=3600',
+    });
+    if (head) return res.end();
+    const stream = fs.createReadStream(file);
+    stream.on('error', () => res.destroy());
+    return stream.pipe(res);
+  }
+
+  if (pathname === '/api/notes/export.md') {
+    const videoId = String(url.searchParams.get('videoId') ?? '').trim();
+    if (!videoId) return sendJson(res, 400, { ok: false, error: 'missing_video_id', message: '需要 ?videoId=' });
+    if (videoId.length > 200) return sendJson(res, 400, { ok: false, error: 'invalid_video_id', message: 'videoId 过长' });
+    const markdown = buildVideoNotesMarkdown(state, videoId);
+    const filename = `${notesSlugForVideoId(videoId)}-${localDateString()}.md`;
+    return sendMarkdownPayload(res, filename, markdown, { head });
+  }
+
+  if (pathname === '/api/notes/export') {
+    const parsed = await readJsonBodyForNotes(req);
+    if (!parsed.ok) return sendJson(res, parsed.status, { ok: false, error: parsed.error.code, message: parsed.error.message });
+    const videoId = typeof parsed.value?.videoId === 'string' ? parsed.value.videoId.trim() : '';
+    if (!videoId) return sendJson(res, 400, { ok: false, error: 'missing_video_id', message: '需要 videoId' });
+    if (videoId.length > 200) return sendJson(res, 400, { ok: false, error: 'invalid_video_id', message: 'videoId 过长' });
+    const markdown = buildVideoNotesMarkdown(state, videoId);
+    const { exportsDir } = notesPaths(state);
+    const filename = `${notesSlugForVideoId(videoId)}-${localDateString()}.md`;
+    const file = path.join(exportsDir, filename);
+    try {
+      ensureDirSync(exportsDir);
+      atomicWriteFileSync(file, markdown);
+    } catch (err) {
+      return sendJson(res, 500, { ok: false, error: 'persist_failed', message: `导出失败：${err?.message ?? err}` });
+    }
+    state.log(`笔记导出 -> ${toProjectRelative(file)}（${markdown.length} 字符）`);
+    return sendJson(res, 200, { ok: true, path: toProjectRelative(file), bytes: Buffer.byteLength(markdown, 'utf8') });
+  }
+
+  // /api/notes/:id —— PUT / DELETE
+  if (pathname.startsWith('/api/notes/')) {
+    const rawId = pathname.slice('/api/notes/'.length);
+    if (!rawId || rawId.includes('/')) {
+      return sendJson(res, 404, { ok: false, error: 'not_found', message: '笔记路由不存在' });
+    }
+    let id;
+    try {
+      id = decodeURIComponent(rawId);
+    } catch {
+      return sendJson(res, 400, { ok: false, error: 'invalid_id', message: '笔记 id 编码非法' });
+    }
+    if (!NOTE_ID_RE.test(id) || id.includes('..')) {
+      return sendJson(res, 400, { ok: false, error: 'invalid_id', message: '笔记 id 非法（仅允许 A-Za-z0-9._-）' });
+    }
+    if (method === 'PUT') {
+      const parsed = await readJsonBodyForNotes(req);
+      if (!parsed.ok) return sendJson(res, parsed.status, { ok: false, error: parsed.error.code, message: parsed.error.message });
+      const patchResult = normalizeNotePatch(parsed.value);
+      if (!patchResult.ok) return sendApiErrorPayload(res, patchResult.status, patchResult.error);
+      const found = findNoteEntry(state, id);
+      if (!found) return sendJson(res, 404, { ok: false, error: 'not_found', message: '笔记不存在' });
+      const patch = patchResult.value;
+      const updated = await withNotesFileQueue(state, found.file, () => {
+        const store = readNotesStore(found.file);
+        const note = store.notes.find((item) => item.id === id);
+        if (!note) return null;
+        if (patch.body !== undefined) note.body = patch.body;
+        if (patch.tMs !== undefined) note.tMs = patch.tMs;
+        if (patch.tags !== undefined) note.tags = patch.tags;
+        if (patch.quotes !== undefined) note.quotes = patch.quotes;
+        if (patch.imageUrl !== undefined) {
+          if (patch.imageUrl) note.imageUrl = patch.imageUrl;
+          else delete note.imageUrl;
+        }
+        if (patch.kind !== undefined) note.kind = patch.kind;
+        note.updatedAt = new Date().toISOString();
+        saveNotesStore(state, found.file, store);
+        return note;
+      });
+      if (!updated) return sendJson(res, 404, { ok: false, error: 'not_found', message: '笔记不存在' });
+      return sendJson(res, 200, { ok: true, note: updated });
+    }
+    if (method === 'DELETE') {
+      const found = findNoteEntry(state, id);
+      if (!found) return sendJson(res, 404, { ok: false, error: 'not_found', message: '笔记不存在' });
+      await withNotesFileQueue(state, found.file, () => {
+        const store = readNotesStore(found.file);
+        const index = store.notes.findIndex((item) => item.id === id);
+        if (index < 0) return;
+        store.notes.splice(index, 1);
+        if (store.notes.length === 0) {
+          try {
+            fs.unlinkSync(found.file);
+          } catch {
+            /* ignore */
+          }
+          state.notesStatsCache = null;
+        } else {
+          saveNotesStore(state, found.file, store);
+        }
+      });
+      state.log(`笔记删除 ${id}`);
+      return sendJson(res, 200, { ok: true, deleted: true });
+    }
+  }
+
+  return sendJson(res, 404, { ok: false, error: 'not_found', message: '笔记路由不存在' });
+}
+
+/** /api/notes 系列允许的方法（用于全局 405/OPTIONS 判定） */
+function allowedMethodsForPath(pathname) {
+  if (pathname === '/api/settings') return ['GET', 'HEAD', 'PUT'];
+  if (pathname === '/api/notes') return ['GET', 'HEAD', 'POST'];
+  if (pathname === '/api/notes/quick') return ['POST'];
+  if (pathname === '/api/notes/assets') return ['POST'];
+  if (pathname.startsWith('/api/notes/assets/')) return ['GET', 'HEAD'];
+  if (pathname === '/api/notes/export') return ['POST'];
+  if (pathname === '/api/notes/export.md') return ['GET', 'HEAD'];
+  if (pathname.startsWith('/api/notes/')) return ['PUT', 'DELETE'];
+  return ['GET', 'HEAD'];
+}
+
 function createRequestHandler(state) {
   return async function handleRequest(req, res) {
     const method = req.method ?? 'GET';
@@ -872,8 +1712,7 @@ function createRequestHandler(state) {
     res.setHeader('Referrer-Policy', 'no-referrer');
 
     const isApi = pathname === '/health' || pathname.startsWith('/api/');
-    const isSettings = pathname === '/api/settings';
-    const allowedMethods = isSettings ? ['GET', 'HEAD', 'PUT'] : ['GET', 'HEAD'];
+    const allowedMethods = allowedMethodsForPath(pathname);
 
     if (method === 'OPTIONS') {
       res.setHeader('Access-Control-Allow-Origin', '*');
@@ -907,6 +1746,10 @@ function createRequestHandler(state) {
           health.whisper.server = { running: null, source: 'unknown', error: 'status probe failed' };
         }
         return sendJson(res, 200, health, { head: method === 'HEAD' });
+      }
+
+      if (pathname === '/api/notes' || pathname.startsWith('/api/notes/')) {
+        return await handleNotesRequest(state, req, res, { method, pathname, url });
       }
 
       if (pathname === '/api/settings') {
@@ -1651,6 +2494,9 @@ export async function startServer(options = {}) {
     uiSettingsPath: path.resolve(options.settingsPath ?? path.join(dataDir, UI_SETTINGS_FILE)),
     desktopAppPath: options.desktopAppPath ? path.resolve(options.desktopAppPath) : path.join(PROJECT_ROOT, DESKTOP_APP_RELATIVE_PATH),
     uiSettings: null,
+    // v0.4：共享 Notes API（data/notes、data/exports；文件级串行化 + 原子写）
+    noteQueues: new Map(),
+    notesStatsCache: null,
     env,
   };
 
@@ -1773,6 +2619,8 @@ export async function startServer(options = {}) {
     dataDir: state.dataDir,
     uiSettingsPath: state.uiSettingsPath,
     desktopAppPath: state.desktopAppPath,
+    notesDir: path.join(state.dataDir, 'notes'),
+    exportsDir: path.join(state.dataDir, 'exports'),
     sessions: state.sessions,
     close,
   };
@@ -1781,7 +2629,7 @@ export async function startServer(options = {}) {
 // ----------------------------------------------------------------------- CLI
 
 export function parseCliArgs(argv = []) {
-  const args = { port: undefined, host: undefined, open: false, demo: false, help: false, verbose: false };
+  const args = { port: undefined, host: undefined, dataDir: undefined, open: false, demo: false, help: false, verbose: false };
   for (let i = 0; i < argv.length; i += 1) {
     const item = String(argv[i]);
     if (item === '--open' || item === '-o') args.open = true;
@@ -1793,6 +2641,8 @@ export function parseCliArgs(argv = []) {
     } else if (item.startsWith('--port=')) args.port = Number(item.slice('--port='.length));
     else if (item === '--host') args.host = argv[++i];
     else if (item.startsWith('--host=')) args.host = item.slice('--host='.length);
+    else if (item === '--data-dir') args.dataDir = argv[++i];
+    else if (item.startsWith('--data-dir=')) args.dataDir = item.slice('--data-dir='.length);
     else throw new Error(`未知参数：${item}（支持 --port/--host/--open/--demo/--verbose/--help）`);
   }
   if (args.port !== undefined) {
@@ -1835,6 +2685,7 @@ function printHelp() {
       --host <地址>   监听地址（默认 127.0.0.1）
   -o, --open          启动后在默认浏览器打开工作台（macOS: open）
       --demo          强制使用内置演示会话（mock ASR/翻译/TTS，不需要密钥/模型）
+      --data-dir <目录> 运行期数据目录（默认 ./data；笔记/设置/导出都放这里）
   -v, --verbose       输出调试日志（也不打印密钥）
   -h, --help          显示帮助
 
@@ -1862,6 +2713,7 @@ async function main(argv = process.argv.slice(2)) {
     started = await startServer({
       port: args.port,
       host: args.host,
+      dataDir: args.dataDir,
       demo: args.demo,
       verbose: args.verbose,
       log,
@@ -1901,6 +2753,8 @@ async function main(argv = process.argv.slice(2)) {
   line('翻译', `${config?.translate?.provider ?? '?'}${Array.isArray(config?.translate?.chain) ? `（链：${config.translate.chain.join(' → ')}）` : ''}`);
   line('配音', `${config?.tts?.provider ?? '?'} · ${config?.tts?.voiceMode ?? 'preset'}`);
   line('并发', `最多 ${started.maxSessions} 个会话（config.server.maxSessions）`);
+  const notesStats = getNotesStats(started.state);
+  line('笔记', `${notesStats.count} 条 · ${notesStats.notesDir}（导出 ${notesStats.exportsDir}）`);
   line('凭据', saylessPath ? `~/.sayless 配置已发现` : '未发现 ~/.sayless/config.json（可使用 --demo 体验）');
   console.log('  ─────────────────────────────────────────────');
   console.log('  按 Ctrl+C 退出');
