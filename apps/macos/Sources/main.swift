@@ -38,6 +38,10 @@ struct LaunchOptions {
     var notesVision = false
     /// 调试用：本次运行强制开启「实时画面上下文推送」，不写用户设置
     var visualContext = false
+    /// 调试/截图用：启动后直接打开设置窗口
+    var showSettings = false
+    /// 调试/截图用：启动后演示一条成功笔记 toast
+    var demoToast = false
     var help = false
 
     static let helpText = """
@@ -51,6 +55,8 @@ struct LaunchOptions {
                             记录完成后退出（配合 --engine-url 指向测试引擎）
       --notes-vision        调试用：本次运行开启「画面理解（VLM，慢）」开关（不写用户设置）
       --visual-context      调试用：本次运行开启「实时画面上下文（OCR，每 10s 推送）」开关
+      --show-settings       调试/截图用：启动后直接打开设置窗口
+      --demo-toast          调试/截图用：启动 2.2s 后演示一条「已记录笔记」toast
       --duration <秒>       调试用：N 秒后自动退出（配合 --simulate 可做冒烟）
       --engine-url <url>    覆盖引擎地址（默认 ws://127.0.0.1:8787/ws）
       --self-test           headless 自检（协议字节布局 / hello / 事件解析 / 字幕排版），退出码 0/1
@@ -78,6 +84,10 @@ struct LaunchOptions {
                 options.notesVision = true
             case "--visual-context":
                 options.visualContext = true
+            case "--show-settings":
+                options.showSettings = true
+            case "--demo-toast":
+                options.demoToast = true
             case "-h", "--help":
                 options.help = true
             case "--duration":
@@ -223,6 +233,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var visualContextStartToastShown = false
     private var engineConnectionState: EngineConnectionState = .disconnected
 
+    // v0.7 视觉重设计 / 设置窗口
+    private var settingsController: SettingsWindowController?
+    private var demoToastTimer: Timer?
+    private var pauseMenuItem: NSMenuItem?
+    private var settingsMenuItem: NSMenuItem?
+    private var visionSummaryItem: NSMenuItem?
+
     init(options: LaunchOptions) {
         self.options = options
         super.init()
@@ -236,6 +253,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let overlay = OverlayController(settings: settings)
         overlay.onLog = { [weak self] message in self?.log(message) }
         overlay.onVisibilityChanged = { [weak self] _ in self?.refreshMenu() }
+        overlay.onPauseToggle = { [weak self] in self?.togglePauseResume() }
+        overlay.onNoteAction = { [weak self] in self?.takeNote(trigger: "浮层按钮") }
+        overlay.onSettingsAction = { [weak self] in self?.openSettingsWindow() }
+        overlay.onCloseAction = { [weak self] in self?.overlay?.hide() }
         self.overlay = overlay
 
         if let override = options.engineURL {
@@ -245,6 +266,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         setupNotes()
         setupVisualContext()
         setupAutoQuit()
+
+        if options.showSettings {
+            openSettingsWindow()
+        }
+        if options.demoToast {
+            demoToastTimer = Timer.scheduledTimer(withTimeInterval: 2.2, repeats: false) { [weak self] _ in
+                guard let self else { return }
+                let clock = NoteComposer.formatClock(Date())
+                self.overlay?.showToast(model: OverlayToastFactory.note(.success, clock: clock))
+            }
+        }
 
         if options.noteOnce {
             // 只给 --note-once 时：记录完成即退出（冒烟）；若同时显式给 --duration，则保持运行到时长
@@ -271,6 +303,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         noteOnceTimer?.invalidate()
         visionHealthTimer?.invalidate()
         visualContextTimer?.invalidate()
+        demoToastTimer?.invalidate()
         GlobalHotKey.shared.unregister()
         capture?.stop()
         engine?.stop()
@@ -286,70 +319,73 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func buildStatusItem() {
         let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         if let button = item.button {
-            if let image = NSImage(systemSymbolName: "captions.bubble", accessibilityDescription: "livedub") {
+            if let image = NSImage(systemSymbolName: MenuDesign.brandSymbol, accessibilityDescription: "livedub") {
                 image.isTemplate = true
                 button.image = image
             } else {
                 button.title = "ld"
             }
-            button.toolTip = "livedub · 实时同传（macOS 系统音频）"
+            button.toolTip = "livedub · 实时同传（⌥N 记笔记）"
+            button.setAccessibilityLabel("livedub 菜单")
         }
 
         let menu = NSMenu()
         menu.autoenablesItems = false
 
-        statusMenuItem = addMenuItem(to: menu, title: "状态：未开始", action: nil)
-        engineMenuItem = addMenuItem(to: menu, title: "引擎：\(settings.engineURL)", action: nil)
+        // 分区 1：状态摘要（引擎 · OCR/VLM · 画面上下文）
+        statusMenuItem = addMenuItem(to: menu, title: "livedub · 未开始", action: nil, symbol: "circle.dashed")
+        engineMenuItem = addMenuItem(to: menu, title: "引擎：\(settings.engineURL)", action: nil, symbol: MenuDesign.engineSymbol)
+        visionSummaryItem = addMenuItem(to: menu, title: "视觉：检测中…", action: nil, symbol: "eye")
         menu.addItem(.separator())
 
-        toggleMenuItem = addMenuItem(to: menu, title: "开始同传", action: #selector(toggleSession))
+        // 分区 2：会话操作（开始/停止、暂停、⌥N 记笔记）
+        toggleMenuItem = addMenuItem(
+            to: menu,
+            title: MenuDesign.startStopTitle(isRunning: false),
+            action: #selector(toggleSession),
+            symbol: MenuDesign.startSymbol
+        )
+        pauseMenuItem = addMenuItem(
+            to: menu,
+            title: MenuDesign.pauseTitle(isPaused: false),
+            action: #selector(togglePauseFromMenu),
+            symbol: MenuDesign.pauseSymbol
+        )
+        pauseMenuItem?.isEnabled = false
         noteMenuItem = addMenuItem(
             to: menu,
-            title: "记笔记（\(GlobalHotKey.displayName)）",
+            title: MenuDesign.noteTitle(),
             action: #selector(takeNoteFromMenu),
             keyEquivalent: "n",
-            modifiers: [.option]
+            modifiers: [.option],
+            symbol: MenuDesign.noteSymbol
         )
-        noteMenuItem?.toolTip = "把当前双语字幕 + 时间戳（+ 可选截图）记进本地笔记库；全局快捷键 \(GlobalHotKey.displayName)"
-        openNotesMenuItem = addMenuItem(to: menu, title: "打开笔记（工作台学习笔记）", action: #selector(openNotesPanel))
-        openWorkbenchMenuItem = addMenuItem(to: menu, title: "打开工作台", action: #selector(openWorkbench))
+        noteMenuItem?.toolTip = "把当前双语字幕 + 时间戳（+ 可选截图/OCR）记进本地笔记库；全局快捷键 ⌥N"
         menu.addItem(.separator())
 
-        overlayMenuItem = addMenuItem(to: menu, title: "显示字幕浮层", action: #selector(toggleOverlay))
-        clickThroughMenuItem = addMenuItem(to: menu, title: "字幕点击穿透", action: #selector(toggleClickThrough))
-        clickThroughMenuItem?.toolTip = "开启后鼠标事件穿透浮层（可点击下方窗口/播放器），但浮层不能拖动"
-        dubMenuItem = addMenuItem(to: menu, title: "播放中文配音", action: #selector(toggleDub))
-        dubMenuItem?.toolTip = "关闭后只显示字幕，不播放中文配音"
-        sourceLineMenuItem = addMenuItem(to: menu, title: "显示原文行", action: #selector(toggleSourceLine))
-        fontSizeUpMenuItem = addMenuItem(to: menu, title: "增大字幕字号", action: #selector(increaseFontSize))
-        fontSizeDownMenuItem = addMenuItem(to: menu, title: "减小字幕字号", action: #selector(decreaseFontSize))
-
-        menu.addItem(.separator())
-        notesScreenshotMenuItem = addMenuItem(to: menu, title: "记笔记时附截图", action: #selector(toggleNotesScreenshot))
-        notesScreenshotMenuItem?.toolTip = "开启后用 SCScreenshotManager 截当前屏幕作为笔记附件（复用屏幕录制权限，不含 livedub 浮层）"
-        notesWhenPausedMenuItem = addMenuItem(to: menu, title: "暂停时仍可笔记", action: #selector(toggleNotesWhenPaused))
-        notesWhenPausedMenuItem?.toolTip = "同传暂停时仍允许 \(GlobalHotKey.displayName) 记录当前字幕"
-        notesOCRMenuItem = addMenuItem(to: menu, title: "识别画面文字（OCR，快）", action: #selector(toggleNotesOCR))
-        notesOCRMenuItem?.toolTip = "⌥N 时识别截图中的文字并写入笔记（需要引擎 v0.5；本地 OCR，默认开）"
-        notesVisionMenuItem = addMenuItem(to: menu, title: "画面理解（VLM，慢，约 20–30s）", action: #selector(toggleNotesVision))
-        notesVisionMenuItem?.toolTip = "用 VLM 生成画面描述；较慢、可能产生云端费用，失败自动降级为仅 OCR（默认关）"
-        notesQueueMenuItem = addMenuItem(to: menu, title: "笔记队列：空", action: nil)
-        visionStatusMenuItem = addMenuItem(to: menu, title: "视觉：检测中…", action: nil)
-        visualContextMenuItem = addMenuItem(
+        // 分区 3：设置 / 打开笔记 / 打开工作台
+        settingsMenuItem = addMenuItem(
             to: menu,
-            title: "翻译参考画面文字（OCR，每 10s）",
-            action: #selector(toggleVisualContext)
+            title: MenuDesign.settingsTitle(),
+            action: #selector(openSettingsWindowAction),
+            keyEquivalent: ",",
+            modifiers: [.command],
+            symbol: MenuDesign.settingsSymbol
         )
-        visualContextMenuItem?.toolTip = "直播时每 10s 截屏 OCR 并把画面文字推送给引擎，供实时翻译参考（默认关闭，注意 CPU/隐私）"
-        visualContextStatusMenuItem = addMenuItem(to: menu, title: "画面上下文：关", action: nil)
+        openNotesMenuItem = addMenuItem(to: menu, title: "打开笔记", action: #selector(openNotesPanel), symbol: MenuDesign.openNotesSymbol)
+        openWorkbenchMenuItem = addMenuItem(to: menu, title: "打开工作台", action: #selector(openWorkbench), symbol: MenuDesign.workbenchSymbol)
         menu.addItem(.separator())
 
-        _ = addMenuItem(to: menu, title: "设置引擎地址…", action: #selector(editEngineURL))
-        _ = addMenuItem(to: menu, title: "打开屏幕录制权限设置…", action: #selector(openPermissionSettings))
-        _ = addMenuItem(to: menu, title: "重置字幕位置", action: #selector(resetOverlayPosition))
-        _ = addMenuItem(to: menu, title: "诊断信息…", action: #selector(showDiagnostics))
+        // 分区 4：浮层显隐 + 退出
+        overlayMenuItem = addMenuItem(to: menu, title: "隐藏字幕浮层", action: #selector(toggleOverlay), symbol: MenuDesign.overlaySymbol)
         menu.addItem(.separator())
-        _ = addMenuItem(to: menu, title: "退出 livedub", action: #selector(quitApp), keyEquivalent: "q")
+        _ = addMenuItem(
+            to: menu,
+            title: MenuDesign.quitTitle(),
+            action: #selector(quitApp),
+            keyEquivalent: "q",
+            symbol: MenuDesign.quitSymbol
+        )
 
         self.menu = menu
         item.menu = menu
@@ -362,7 +398,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         title: String,
         action: Selector?,
         keyEquivalent: String = "",
-        modifiers: NSEvent.ModifierFlags = [.command]
+        modifiers: NSEvent.ModifierFlags = [.command],
+        symbol: String? = nil
     ) -> NSMenuItem {
         let item = NSMenuItem(title: title, action: action, keyEquivalent: keyEquivalent)
         item.target = action == nil ? nil : self
@@ -370,33 +407,41 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if !keyEquivalent.isEmpty {
             item.keyEquivalentModifierMask = modifiers
         }
+        if let symbol, let image = NSImage(systemSymbolName: symbol, accessibilityDescription: nil) {
+            image.isTemplate = true
+            item.image = image
+        }
         menu.addItem(item)
         return item
     }
 
     private func refreshMenu() {
         guard statusItem != nil else { return }
-        statusMenuItem?.title = "状态：\(currentStatus)"
+        statusMenuItem?.title = MenuDesign.statusSummary(
+            state: currentStatus,
+            latencyMs: currentLatencyMs,
+            connectionText: engineConnectionState.displayText,
+            ocrAvailable: visionStatus?.ocr.available,
+            vlmAvailable: visionStatus?.vision.available,
+            visualContextEnabled: visualContextEnabledForRun
+        )
         engineMenuItem?.title = "引擎：\(settings.engineURL)"
-        toggleMenuItem?.title = isSimulating ? "停止模拟演示" : (isRunning ? "停止同传" : "开始同传")
+        visionSummaryItem?.title = visionStatus?.summaryText ?? "视觉：检测中…"
+        toggleMenuItem?.title = MenuDesign.startStopTitle(isRunning: isRunning || isSimulating)
+        toggleMenuItem?.image = NSImage(
+            systemSymbolName: (isRunning || isSimulating) ? MenuDesign.stopSymbol : MenuDesign.startSymbol,
+            accessibilityDescription: nil
+        )
+        pauseMenuItem?.title = MenuDesign.pauseTitle(isPaused: isEnginePaused)
+        pauseMenuItem?.isEnabled = isRunning
+        pauseMenuItem?.image = NSImage(
+            systemSymbolName: isEnginePaused ? MenuDesign.resumeSymbol : MenuDesign.pauseSymbol,
+            accessibilityDescription: nil
+        )
+        noteMenuItem?.title = MenuDesign.noteTitle()
+        settingsMenuItem?.title = MenuDesign.settingsTitle()
         overlayMenuItem?.title = overlay?.isVisible == true ? "隐藏字幕浮层" : "显示字幕浮层"
         overlayMenuItem?.state = overlay?.isVisible == true ? .on : .off
-        clickThroughMenuItem?.state = settings.clickThrough ? .on : .off
-        dubMenuItem?.state = settings.dubEnabled ? .on : .off
-        sourceLineMenuItem?.state = settings.showSourceLine ? .on : .off
-        fontSizeUpMenuItem?.isEnabled = settings.fontSize < 40
-        fontSizeDownMenuItem?.isEnabled = settings.fontSize > 11
-        notesScreenshotMenuItem?.state = settings.notesIncludeScreenshot ? .on : .off
-        notesWhenPausedMenuItem?.state = settings.notesWhenPaused ? .on : .off
-        notesOCRMenuItem?.state = settings.notesOCR ? .on : .off
-        notesVisionMenuItem?.state = (options.notesVision || settings.notesVision) ? .on : .off
-        visionStatusMenuItem?.title = visionStatus?.summaryText ?? "视觉：检测中…"
-        visualContextMenuItem?.state = visualContextEnabledForRun ? .on : .off
-        visualContextStatusMenuItem?.title = VisualContextPlanner.formatStatus(
-            enabled: visualContextEnabledForRun,
-            lastPush: visualContextStatus.lastPushedAt,
-            lastTextChars: visualContextStatus.lastTextChars
-        )
         refreshNotesQueueMenu()
     }
 
@@ -421,6 +466,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         currentLatencyMs = nil
         currentTranslation = ""
         currentSource = ""
+        overlay?.setPaused(false)
         lastVisualContextText = nil
         visualContextStatus.lastPushedAt = nil
         visualContextStatus.lastTextChars = 0
@@ -543,6 +589,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         currentTranslation = ""
         currentSource = ""
         isEnginePaused = false
+        overlay?.setPaused(false)
+        overlay?.setConnection(connected: false)
         overlay?.setPlaceholder("已停止 · 从菜单栏「开始同传」继续")
         overlay?.setStatus("已停止", latencyMs: nil)
         refreshMenu()
@@ -553,6 +601,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func handleConnectionState(_ state: EngineConnectionState) {
         engineConnectionState = state
+        overlay?.setConnection(connected: state == .connected)
         guard !isSimulating else { return }
         switch state {
         case .connecting:
@@ -601,6 +650,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 overlay?.setStatus("引擎错误\(detail.map { "：\($0)" } ?? "")", latencyMs: currentLatencyMs, isError: true)
             } else {
                 isEnginePaused = (state == "paused")
+                overlay?.setPaused(isEnginePaused)
                 currentStatus = CaptionLayout.statusLabel(state)
                 if let detail, !detail.isEmpty { lastEngineDetail = detail }
                 overlay?.setStatus(currentStatus, latencyMs: currentLatencyMs)
@@ -667,6 +717,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         simulatePhase = 0
         simulateTurnIndex = 0
         overlay?.show()
+        overlay?.setConnection(connected: true)
         applySimulationStep()
 
         simulateTimer?.invalidate()
@@ -715,6 +766,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         currentTranslation = ""
         currentSource = ""
         isEnginePaused = false
+        overlay?.setPaused(false)
+        overlay?.setConnection(connected: false)
         overlay?.setPlaceholder("已停止 · 从菜单栏「开始同传」继续")
         overlay?.setStatus("已停止", latencyMs: nil)
         refreshMenu()
@@ -828,7 +881,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     @objc private func showDiagnostics() {
         NSApp.activate(ignoringOtherApps: true)
         var lines: [String] = []
-        lines.append("livedub macOS app（v0.6）")
+        lines.append("livedub macOS app（v0.7）")
         lines.append("状态：\(currentStatus)")
         lines.append("引擎地址：\(settings.engineURL)")
         if let engine {
@@ -1381,6 +1434,53 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             visualContextStatus.lastError = errorText
             log("[visual-context] 本轮跳过（\(reason)）：\(errorText)")
         }
+        refreshMenu()
+    }
+
+    // MARK: - v0.7 设置窗口 / 暂停
+
+    @objc private func openSettingsWindowAction() {
+        openSettingsWindow()
+    }
+
+    private func openSettingsWindow() {
+        if settingsController == nil {
+            let controller = SettingsWindowController(settings: settings)
+            controller.onChange = { [weak self] in self?.settingsDidChange() }
+            controller.onOpenPermission = { [weak self] in self?.openScreenRecordingSettings() }
+            controller.onDiagnostics = { [weak self] in self?.showDiagnostics() }
+            settingsController = controller
+        }
+        settingsController?.show()
+    }
+
+    /// 设置窗口任意改动：即时应用（浮层外观/位置/配音/画面上下文定时器/菜单）
+    private func settingsDidChange() {
+        overlay?.reloadFromSettings()
+        overlay?.applyPositionPreset()
+        dubPlayer?.setEnabled(settings.dubEnabled)
+        if visualContextEnabledForRun {
+            if visualContextTimer == nil { startVisualContextTimer() }
+        } else {
+            stopVisualContextTimer()
+        }
+        refreshMenu()
+    }
+
+    @objc private func togglePauseFromMenu() {
+        togglePauseResume()
+    }
+
+    /// 暂停 / 继续同传（浮层工具条与菜单共用；通过 control 消息让引擎停/续处理）
+    private func togglePauseResume() {
+        guard isRunning, let engine else { return }
+        let nextPaused = !isEnginePaused
+        engine.sendControl(nextPaused ? "pause" : "resume")
+        isEnginePaused = nextPaused
+        currentStatus = nextPaused ? "已暂停" : "聆听中"
+        overlay?.setPaused(nextPaused)
+        overlay?.setStatus(currentStatus, latencyMs: currentLatencyMs)
+        log("[app] \(nextPaused ? "已暂停" : "已继续")同传（control \(nextPaused ? "pause" : "resume")）")
         refreshMenu()
     }
 

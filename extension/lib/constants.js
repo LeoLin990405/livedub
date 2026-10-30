@@ -99,6 +99,8 @@ export const DEFAULT_SETTINGS = Object.freeze({
   subsOpacity: 0.82,
   /** 字幕背景：dark | light | none */
   subsBg: 'dark',
+  /** v0.7：字幕宽度档位 auto（按视口）| wide | compact */
+  subsDensity: 'auto',
   /** v0.3：offscreen 是否把抓到的原声重放给用户（tabCapture 会静音标签页，关闭=只听配音） */
   captureReplay: true,
   /** v0.3：全局限定压音（offscreen 对重放原声做 GainNode duck，覆盖 iframe/WebAudio 站点） */

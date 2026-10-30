@@ -60,6 +60,8 @@ const ui = {
   exportNotes: $('export-notes'),
   noteScreenshot: $('note-screenshot'),
   noteHint: $('note-hint'),
+  sessionState: $('session-state'),
+  version: $('version'),
   visionHealth: $('vision-health'),
   visionOcr: $('vision-ocr'),
   visionCaption: $('vision-caption'),
@@ -238,6 +240,17 @@ function render() {
   ui.providers.textContent = providerLabel();
   ui.voiceDetail.textContent = voiceLabel();
   ui.languages.textContent = languageLabel();
+  if (ui.sessionState) {
+    const engineState = runtime.bgState && runtime.bgState.engineState;
+    ui.sessionState.textContent = summary.text + (engineState && active ? ` · ${engineState}` : '');
+  }
+  if (ui.version) {
+    try {
+      ui.version.textContent = `v${chrome.runtime.getManifest().version}`;
+    } catch {
+      ui.version.textContent = 'v0.7';
+    }
+  }
 
   if (document.activeElement !== ui.engineUrl) ui.engineUrl.value = runtime.settings.engineUrl;
   ui.voiceMode.value = runtime.settings.voiceMode === 'preset' ? 'preset' : 'clone-first';
@@ -608,6 +621,9 @@ function bindEvents() {
 
   ui.captureNote.addEventListener('click', async () => {
     hideError();
+    const originalLabel = ui.captureNote.textContent;
+    ui.captureNote.disabled = true;
+    ui.captureNote.innerHTML = '<span class="spin" aria-hidden="true"></span>记录中…';
     try {
       const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
       const tab = tabs && tabs[0];
@@ -629,6 +645,9 @@ function bindEvents() {
       }
     } catch (err) {
       showError(`记笔记失败：${String((err && err.message) || err)}`);
+    } finally {
+      ui.captureNote.disabled = false;
+      ui.captureNote.textContent = originalLabel;
     }
   });
 

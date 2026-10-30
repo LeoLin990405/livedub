@@ -127,6 +127,26 @@ import {
 } from '../extension/lib/notes.js';
 import { buildFencedCode, buildVisionCaptionSection, buildVisionOcrSection } from '../extension/lib/notes.js';
 import {
+  COMPACT_BREAKPOINT_PX,
+  PANEL_TABS,
+  QUICK_ACTIONS,
+  SHORTCUTS,
+  buildGuideModel,
+  computeCaptionProgress,
+  cyclePanelTab,
+  estimateCaptionDurationMs,
+  formatDensityLabel,
+  formatDuckIndicator,
+  formatNoteButtonState,
+  formatNoteSummary,
+  formatStatusPill,
+  motionProfile,
+  normalizePanelTab,
+  planToastStack,
+  resolveSubsDensity,
+  resolveTheme,
+} from '../extension/lib/overlay.js';
+import {
   PROTOCOL_VERSION as ENGINE_PROTOCOL_VERSION,
   decodeAudioFrame as engineDecodeAudioFrame,
   encodeAudioFrame as engineEncodeAudioFrame,
@@ -153,8 +173,12 @@ function walkExtension(dir = EXT, prefix = '') {
 }
 
 const ALL_EXTENSION_FILES = walkExtension();
-const JS_FILES = ALL_EXTENSION_FILES.filter((file) => file.endsWith('.js'));
-const CODE_FILES = ALL_EXTENSION_FILES.filter((file) => /\.(?:js|html|json)$/.test(file));
+// extension/preview/** 是「离线 UI 预览 fixture」：用 example.com 等假数据 + chrome stub 打开静态页面，
+// manifest 不加载、运行时不会执行；安全用例（远程代码扫描）显式排除，避免误报。
+const PREVIEW_PREFIX = 'preview/';
+const SHIPPED_EXTENSION_FILES = ALL_EXTENSION_FILES.filter((file) => !file.startsWith(PREVIEW_PREFIX));
+const JS_FILES = SHIPPED_EXTENSION_FILES.filter((file) => file.endsWith('.js'));
+const CODE_FILES = SHIPPED_EXTENSION_FILES.filter((file) => /\.(?:js|html|json)$/.test(file));
 
 const source = {
   background: readSource('background.js'),
@@ -184,7 +208,7 @@ test('manifest：合法的 MV3 清单，background 为 module service worker + a
   assert.equal(typeof manifest.name, 'string');
   assert.ok(manifest.name.length > 0);
   assert.match(manifest.version, /^\d+\.\d+\.\d+$/);
-  assert.match(manifest.version, /^0\.6\./, 'v0.6 迭代应把扩展版本提升到 0.6.x');
+  assert.match(manifest.version, /^0\.7\./, 'v0.7 迭代应把扩展版本提升到 0.7.x');
   assert.equal(manifest.background.service_worker, 'background.js');
   assert.equal(manifest.background.type, 'module', 'service worker 必须是 type: module，background.js 里用了 ESM import');
   assert.equal(manifest.action.default_popup, 'popup.html');
@@ -281,6 +305,7 @@ test('扩展文件齐全（background/offscreen/content/popup/lib/worklet/README
     'lib/ui.js',
     'lib/srt.js',
     'lib/notes.js',
+    'lib/overlay.js',
     'page-hook.js',
     'worklet/pcm-worklet.js',
     'README.md',
@@ -289,7 +314,7 @@ test('扩展文件齐全（background/offscreen/content/popup/lib/worklet/README
 });
 
 test('所有扩展 JS 通过 node --check 语法检查', () => {
-  assert.ok(JS_FILES.length >= 11, `期望至少 11 个 JS 文件，实际 ${JS_FILES.length}`);
+  assert.ok(JS_FILES.length >= 12, `期望至少 12 个 JS 文件，实际 ${JS_FILES.length}`);
   for (const rel of JS_FILES) {
     const result = spawnSync(process.execPath, ['--check', join(EXT, rel)], { encoding: 'utf8' });
     assert.equal(result.status, 0, `node --check 失败: extension/${rel}\n${result.stderr || ''}`);
@@ -332,7 +357,7 @@ test('lib/*.js 是浏览器/Node 双端纯模块（不依赖 node: 内置模块�
   // 注释里可以出现 chrome.xxx 的说明，只检查真实代码（先去掉注释）
   const stripComments = (code) =>
     code.replace(/\/\*[\s\S]*?\*\//g, '').replace(/(^|[^:])\/\/.*$/gm, '$1');
-  for (const rel of ['lib/pcm.js', 'lib/constants.js', 'lib/ui.js', 'lib/srt.js', 'lib/notes.js']) {
+  for (const rel of ['lib/pcm.js', 'lib/constants.js', 'lib/ui.js', 'lib/srt.js', 'lib/notes.js', 'lib/overlay.js']) {
     const raw = readExt(rel);
     const code = stripComments(raw);
     assert.ok(!/from\s+['"]node:/.test(code), `extension/${rel} 不应 import node: 模块`);
@@ -570,6 +595,10 @@ test('README 覆盖安装/权限/排障/手动测试清单', () => {
     '画面文字',
     '画面理解',
     '20-30s',
+    '快捷面板',
+    'toast',
+    'prefers-reduced-motion',
+    '亮暗',
   ]) {
     assert.ok(source.readme.includes(keyword), `README 缺少内容: ${keyword}`);
   }
@@ -1749,6 +1778,183 @@ test('content/popup v0.5：视觉设置与健康状态展示', () => {
   assert.match(source.popup, /async function probeVisionHealth\(/);
   assert.match(source.popup, /visionEndpoint\(base, 'health'\)/);
   assert.match(source.popup, /20-30s/);
+});
+
+
+// ===========================================================================
+// 8e. v0.7：UI 纯函数（浮层/面板/popup 设计系统）
+// ===========================================================================
+
+test('overlay：tab 规范化与循环切换', () => {
+  assert.deepEqual(
+    PANEL_TABS.map((tab) => tab.id),
+    ['subtitles', 'notes', 'settings'],
+  );
+  assert.equal(normalizePanelTab('notes'), 'notes');
+  assert.equal(normalizePanelTab('unknown'), 'subtitles');
+  assert.equal(normalizePanelTab(undefined), 'subtitles');
+  assert.equal(cyclePanelTab('subtitles', 1), 'notes');
+  assert.equal(cyclePanelTab('settings', 1), 'subtitles');
+  assert.equal(cyclePanelTab('subtitles', -1), 'settings');
+});
+
+test('overlay：字幕宽度档位（auto 断点 / 强制）', () => {
+  assert.equal(COMPACT_BREAKPOINT_PX, 760);
+  assert.equal(resolveSubsDensity({ viewportWidth: 1440, setting: 'auto' }), 'wide');
+  assert.equal(resolveSubsDensity({ viewportWidth: 700, setting: 'auto' }), 'compact');
+  assert.equal(resolveSubsDensity({ viewportWidth: 700, setting: 'wide' }), 'wide');
+  assert.equal(resolveSubsDensity({ viewportWidth: 1440, setting: 'compact' }), 'compact');
+  assert.equal(resolveSubsDensity({}), 'wide');
+  assert.equal(formatDensityLabel('compact'), '紧凑');
+  assert.equal(formatDensityLabel('wide'), '宽');
+});
+
+test('overlay：状态 pill 文案/色调（识别中/翻译中/播放中/错误）', () => {
+  assert.deepEqual(formatStatusPill({ phase: 'idle' }).text, '未连接');
+  assert.equal(formatStatusPill({ phase: 'starting' }).tone, 'busy');
+  assert.equal(formatStatusPill({ phase: 'running', connection: 'connecting' }).text, '重连中');
+  assert.equal(formatStatusPill({ phase: 'running', connection: 'closed' }).text, '已断开');
+  assert.equal(formatStatusPill({ phase: 'running', connection: 'open', engineState: 'listening' }).text, '识别中');
+  assert.equal(formatStatusPill({ phase: 'running', connection: 'open', engineState: 'listening' }).tone, 'live');
+  assert.equal(formatStatusPill({ phase: 'running', connection: 'open', engineState: 'translating' }).text, '翻译中');
+  assert.equal(formatStatusPill({ phase: 'running', connection: 'open', engineState: 'speaking' }).text, '播放中');
+  assert.equal(formatStatusPill({ phase: 'running', connection: 'open', engineState: 'speaking' }).tone, 'speak');
+  assert.equal(formatStatusPill({ phase: 'error' }).tone, 'error');
+  assert.match(formatStatusPill({ phase: 'running', connection: 'open', engineState: 'listening' }).ariaLabel, /livedub 状态/);
+});
+
+test('overlay：原声 duck 指示 / 引导卡模型', () => {
+  assert.deepEqual(formatDuckIndicator({ engineState: 'idle' }), { visible: false, label: '' });
+  assert.deepEqual(formatDuckIndicator({ engineState: 'speaking', globalDuck: true }), {
+    visible: true,
+    label: '原声已压低',
+  });
+  assert.equal(formatDuckIndicator({ engineState: 'speaking', globalDuck: false }).label, '页面音量压音中');
+  assert.equal(formatDuckIndicator({ engineState: 'speaking', captureReplay: false }).visible, false);
+
+  const offline = buildGuideModel({ phase: 'idle', connection: 'closed' });
+  assert.equal(offline.visible, true);
+  assert.equal(offline.showStart, true);
+  assert.equal(offline.copyCommand, 'npm start');
+  assert.match(offline.body, /npm start/);
+  assert.match(offline.body, /127\.0\.0\.1:8787\/health/);
+  const reconnecting = buildGuideModel({ phase: 'running', connection: 'closed' });
+  assert.equal(reconnecting.showRetry, true);
+  assert.equal(reconnecting.showStart, false);
+  const failed = buildGuideModel({ phase: 'error', error: { message: '抓音失败原因' } });
+  assert.equal(failed.showStart, true);
+  assert.match(failed.body, /抓音失败原因/);
+  assert.equal(buildGuideModel({ phase: 'running', connection: 'open' }).visible, false);
+});
+
+test('overlay：reduced-motion / 亮暗 / 字幕时长与进度', () => {
+  assert.deepEqual(motionProfile({ reducedMotion: false }), { durationMs: 170, transitions: true, progressAnimation: true });
+  assert.deepEqual(motionProfile({ reducedMotion: true }), { durationMs: 0, transitions: false, progressAnimation: false });
+  assert.equal(resolveTheme({ prefersLight: true }), 'light');
+  assert.equal(resolveTheme({ prefersLight: false }), 'dark');
+  assert.equal(resolveTheme({}), 'dark');
+
+  // 有真实时间跨度优先
+  assert.equal(estimateCaptionDurationMs({ t0Ms: 1000, t1Ms: 4000 }), 3000);
+  assert.equal(estimateCaptionDurationMs({ t0Ms: 0, t1Ms: 100 }), 1200, '过短钳制到 1.2s');
+  assert.equal(estimateCaptionDurationMs({ t0Ms: 0, t1Ms: 20000 }), 8000, '过长钳制到 8s');
+  const byLength = estimateCaptionDurationMs({ text: '梯度下降法' });
+  assert.ok(byLength >= 1200 && byLength <= 6000);
+  assert.ok(estimateCaptionDurationMs({ text: 'x'.repeat(200) }) <= 6000);
+
+  assert.equal(computeCaptionProgress({ startedAtMs: 0, nowMs: 0, durationMs: 2000 }), 0);
+  assert.equal(computeCaptionProgress({ startedAtMs: 0, nowMs: 1000, durationMs: 2000 }), 0.5);
+  assert.equal(computeCaptionProgress({ startedAtMs: 0, nowMs: 9000, durationMs: 2000 }), 1);
+  assert.equal(computeCaptionProgress({ nowMs: 100, durationMs: 0 }), 0);
+});
+
+test('overlay：记笔记按钮状态（loading/已记录/已排队）', () => {
+  const loading = formatNoteButtonState({ pending: true });
+  assert.equal(loading.state, 'loading');
+  assert.equal(loading.disabled, true);
+  assert.match(loading.label, /识别画面文字中/);
+  assert.equal(loading.ariaBusy, true);
+
+  const done = formatNoteButtonState({ lastNote: { at: 1000, tMs: 65_000, queued: false }, nowMs: 5000 });
+  assert.equal(done.state, 'done');
+  assert.equal(done.label, '已记录 @ 01:05');
+  const queued = formatNoteButtonState({ lastNote: { at: 1000, tMs: 5000, queued: true }, nowMs: 5000 });
+  assert.equal(queued.state, 'queued');
+  assert.equal(queued.label, '已排队 @ 00:05');
+  // 超过展示窗口回到 idle
+  assert.equal(formatNoteButtonState({ lastNote: { at: 1000, tMs: 0 }, nowMs: 99999 }).state, 'idle');
+  assert.equal(formatNoteButtonState({}).label, '记笔记');
+});
+
+test('overlay：toast 堆叠（最多 3 条，保留最新）', () => {
+  const { items } = planToastStack({ existing: [], next: { id: 'a', text: 'A' } });
+  assert.equal(items.length, 1);
+  let stack = [];
+  for (const id of ['a', 'b', 'c', 'd']) stack = planToastStack({ existing: stack, next: { id, text: id }, max: 3 }).items;
+  assert.deepEqual(stack.map((item) => item.id), ['b', 'c', 'd']);
+  assert.equal(planToastStack({ existing: [{ id: '1' }, { id: '2' }], next: null, max: 3 }).items.length, 2);
+  assert.equal(planToastStack({ existing: [{ id: '1' }], next: { id: '2' }, max: 1 }).items.length, 1);
+});
+
+test('overlay：popup 快捷操作/快捷键/笔记摘要', () => {
+  assert.equal(QUICK_ACTIONS.length, 4);
+  assert.deepEqual(
+    QUICK_ACTIONS.map((action) => action.id),
+    ['capture-note', 'open-notebook', 'export-notes', 'show-overlay'],
+  );
+  for (const action of QUICK_ACTIONS) assert.ok(action.label && action.hint, `快捷操作 ${action.id} 缺少 label/hint`);
+  const shortcutMap = Object.fromEntries(SHORTCUTS.map((item) => [item.id, item.keys]));
+  assert.equal(shortcutMap.toggle, 'Alt+Shift+L');
+  assert.equal(shortcutMap.note, 'Alt+Shift+N');
+  assert.equal(formatNoteSummary({ todayCount: 3, queueCount: 1 }), '今日 3 条 · 待同步 1');
+  assert.equal(formatNoteSummary({}), '今日 0 条 · 待同步 0');
+});
+
+test('content.js v0.7：tab 面板/开关/aria/toast 堆叠/Esc/动效降级/亮暗', () => {
+  // 设计系统与可访问性
+  assert.match(source.content, /--livedub-accent: #2dd4bf/);
+  assert.match(source.content, /@media \(prefers-color-scheme: light\)/);
+  assert.match(source.content, /@media \(prefers-reduced-motion: reduce\)/);
+  assert.match(source.content, /backdrop-filter: blur\(/);
+  assert.match(source.content, /:focus-visible/);
+  assert.match(source.content, /role="tablist"/);
+  assert.match(source.content, /role="tab"/);
+  assert.match(source.content, /data-panel-tab="subtitles"/);
+  assert.match(source.content, /data-panel-tab="notes"/);
+  assert.match(source.content, /data-panel-tab="settings"/);
+  assert.match(source.content, /aria-selected=/);
+  assert.match(source.content, /data-act="tab"/);
+  assert.match(source.content, /data-part="note-summary"/);
+  assert.match(source.content, /data-part="note-btn"/);
+  assert.match(source.content, /data-part="duck"/);
+  assert.match(source.content, /data-part="progress"/);
+  assert.match(source.content, /data-part="subs-handle"/);
+  assert.match(source.content, /data-density=/);
+  assert.match(source.content, /data-act="density-compact"/);
+  assert.match(source.content, /role="switch"/);
+  assert.match(source.content, /aria-label="字幕停靠底部"/);
+  assert.match(source.content, /data-act="copy-command"/);
+  assert.match(source.content, /event\.key !== 'Escape'/);
+  assert.match(source.content, /toast-close/);
+  assert.match(source.content, /livedub-progress-fill|progressFill/);
+  assert.match(source.content, /原声已压低/);
+});
+
+test('popup v0.7：品牌头/主操作/笔记卡/快捷 grid/footer/亮暗/focus-visible', () => {
+  assert.match(source.popupHtml, /class="brand"/);
+  assert.match(source.popupHtml, /class="primary"/);
+  assert.match(source.popupHtml, /class="quick-grid"/);
+  assert.match(source.popupHtml, /class="switches"/);
+  assert.match(source.popupHtml, /class="footer"/);
+  assert.match(source.popupHtml, /@media \(prefers-color-scheme: light\)/);
+  assert.match(source.popupHtml, /@media \(prefers-reduced-motion: reduce\)/);
+  assert.match(source.popupHtml, /:focus-visible/);
+  assert.match(source.popupHtml, /aria-label=/);
+  assert.match(source.popupHtml, /id="export-srt"/);
+  assert.match(source.popupHtml, /id="version"/);
+  assert.match(source.popupHtml, /Alt<\/kbd>\+<kbd>Shift<\/kbd>\+<kbd>N/);
+  assert.match(source.popup, /getManifest\(\)\.version/);
+  assert.match(source.popup, /记录中…/);
 });
 
 

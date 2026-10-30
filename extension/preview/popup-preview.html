@@ -1,0 +1,93 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <title>livedub popup preview</title>
+    <style id="popup-style"></style>
+  </head>
+  <body>
+    <script>
+      // 预置「运行中」状态，让预览展示完整信息层级
+      window.__livedubPreviewSettings = {
+        engineUrl: 'ws://127.0.0.1:8787/ws',
+        voiceMode: 'clone-first',
+        dubEnabled: true,
+        duckRatio: 0.18,
+        showOriginal: true,
+        fontSize: 22,
+        noteScreenshot: true,
+        visionOcr: true,
+        visionCaption: false,
+        noteStats: null,
+      };
+      window.__livedubPreviewState = {
+        phase: 'running',
+        connection: 'open',
+        engineState: 'speaking',
+        engineUrl: 'ws://127.0.0.1:8787/ws',
+        tabId: 1,
+        tabTitle: 'CS231n Lecture 1 · 梯度下降',
+        session: { title: 'CS231n Lecture 1', url: 'https://example.com/lecture/cs231n', langFrom: 'en', langTo: 'zh' },
+        startedAt: Date.now() - 15 * 60 * 1000,
+        captionCount: 42,
+        ready: {
+          protocol: 1,
+          providers: { asr: 'whisper-local', translate: 'deepseek', tts: 'minimax' },
+          voice: { mode: 'preset', voiceId: 'male-qn-qingse' },
+        },
+        voice: { mode: 'preset', voiceId: 'male-qn-qingse', degraded: false },
+        metrics: { id: 12, asrFinalMs: 240, mtFirstMs: 900, mtDoneMs: 1100, ttsFirstMs: 380, e2eLagMs: 1650 },
+        latencyMs: 1650,
+        noteStats: { date: '2026-10-30', count: 3 },
+        noteQueueCount: 1,
+        visionHealth: { available: true, ocr: true, vision: true, ocrLabel: 'OCR macos-vision', visionLabel: 'VLM ark-plan', error: '' },
+        error: null,
+        notice: '',
+      };
+      window.__livedubPreviewHandleMessage = (message) => {
+        if (message && message.type === 'livedub:get-state') {
+          return { ok: true, state: window.__livedubPreviewState, settings: window.__livedubPreviewSettings };
+        }
+        return { ok: true, state: window.__livedubPreviewState, settings: window.__livedubPreviewSettings };
+      };
+      // stub 引擎 HTTP：/health + /api/vision/health（让 popup 健康行显示在线）
+      const json = (value, status = 200) =>
+        new Response(JSON.stringify(value), { status, headers: { 'content-type': 'application/json' } });
+      window.fetch = async (url) => {
+        const target = String(url);
+        if (target.includes('/api/vision/health')) {
+          return json({
+            ok: true,
+            ready: true,
+            ocr: { ok: true, provider: 'macos-vision', bin: 'data/bin/ocr-macos' },
+            vision: { configured: true, provider: 'ark-plan', model: 'doubao-seed-2-1-turbo' },
+          });
+        }
+        if (target.includes('/health')) {
+          return json({
+            ok: true,
+            version: '0.7.0',
+            providers: { asr: 'whisper-local', translate: 'deepseek', translateChain: ['deepseek', 'minimax'], tts: 'minimax', ttsModel: 'speech-2.8-hd' },
+            whisper: { found: true, model: 'models/ggml-large-v3-turbo-q5_0.bin' },
+          });
+        }
+        return json({ ok: true });
+      };
+
+      // 把真实 popup.html 的样式 + 结构注入预览页，再加载真实 popup.js（模块相对路径可用）
+    </script>
+    <script src="chrome-stub.js"></script>
+    <script type="module">
+      const response = await fetch('../popup.html');
+      const markup = await response.text();
+      const doc = new DOMParser().parseFromString(markup, 'text/html');
+      document.getElementById('popup-style').textContent = doc.querySelector('style').textContent;
+      document.title = doc.title;
+      for (const node of [...doc.body.children]) {
+        if (node.tagName === 'SCRIPT') continue;
+        document.body.appendChild(node);
+      }
+      await import('../popup.js');
+    </script>
+  </body>
+</html>

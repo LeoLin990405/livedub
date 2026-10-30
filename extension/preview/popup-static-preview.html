@@ -1,0 +1,300 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <title>livedub 实时同传</title>
+    <style>
+      :root {
+        color-scheme: light dark;
+        --bg: #0b1211;
+        --surface: #111b1a;
+        --surface-2: #16211f;
+        --line: rgba(255, 255, 255, 0.1);
+        --ink: #eef7f6;
+        --ink-dim: #a7bcba;
+        --ink-mute: #7d928f;
+        --accent: #2dd4bf;
+        --accent-strong: #14b8a6;
+        --accent-soft: rgba(45, 212, 191, 0.13);
+        --accent-ink: #062622;
+        --ok: #34d399;
+        --warn: #fbbf24;
+        --err: #fb7185;
+        --radius: 15px;
+        --radius-sm: 11px;
+        --shadow: 0 10px 30px rgba(0, 0, 0, 0.32);
+        --dur: 170ms;
+      }
+      @media (prefers-color-scheme: light) {
+        :root {
+          --bg: #f4faf9;
+          --surface: #ffffff;
+          --surface-2: #f0f7f5;
+          --line: rgba(12, 40, 36, 0.12);
+          --ink: #12201f;
+          --ink-dim: #47605d;
+          --ink-mute: #6b827f;
+          --accent: #14b8a6;
+          --accent-strong: #0d9488;
+          --accent-soft: rgba(20, 184, 166, 0.12);
+          --accent-ink: #ffffff;
+          --shadow: 0 10px 26px rgba(15, 40, 38, 0.14);
+        }
+      }
+      * { box-sizing: border-box; }
+      body {
+        margin: 0;
+        width: 372px;
+        padding: 14px;
+        background: var(--bg);
+        color: var(--ink);
+        font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+        font-size: 13px;
+      }
+      @media (prefers-reduced-motion: reduce) {
+        * { transition: none !important; animation: none !important; }
+      }
+      .card {
+        background: var(--surface); border: 1px solid var(--line);
+        border-radius: var(--radius); box-shadow: var(--shadow);
+        padding: 11px 12px; margin-bottom: 10px;
+      }
+      .card-title {
+        display: flex; align-items: center; justify-content: space-between; gap: 8px;
+        font-size: 10.5px; font-weight: 700; letter-spacing: 0.8px; text-transform: uppercase;
+        color: var(--ink-mute); margin: 0 0 8px;
+      }
+      header { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-bottom: 12px; }
+      .brand { display: flex; align-items: center; gap: 10px; min-width: 0; }
+      .logo {
+        width: 34px; height: 34px; border-radius: 11px; flex: none;
+        display: grid; place-items: center; font-size: 16px; font-weight: 800;
+        background: linear-gradient(135deg, var(--accent-strong), var(--accent));
+        color: var(--accent-ink);
+      }
+      h1 { margin: 0; font-size: 15px; font-weight: 700; letter-spacing: 0.2px; }
+      .sub { margin: 2px 0 0; color: var(--ink-mute); font-size: 11px; }
+      .pill {
+        display: inline-flex; align-items: center; gap: 6px; flex: none;
+        min-height: 30px; padding: 5px 10px; border-radius: 999px;
+        background: var(--surface); border: 1px solid var(--line);
+        color: var(--ink-dim); font-size: 11px; white-space: nowrap;
+      }
+      .pill .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--ink-mute); flex: none; }
+      .pill[data-tone="live"] .dot { background: var(--ok); box-shadow: 0 0 0 3px rgba(52, 211, 153, 0.15); }
+      .pill[data-tone="busy"] .dot { background: var(--warn); animation: pulse 1.4s ease-in-out infinite; }
+      .pill[data-tone="translate"] .dot { background: #60a5fa; }
+      .pill[data-tone="speak"] .dot { background: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }
+      .pill[data-tone="error"] .dot { background: var(--err); }
+      @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.35; } }
+      /* 主操作 */
+      .primary {
+        width: 100%; min-height: 44px; margin-bottom: 10px; padding: 11px;
+        border: none; border-radius: 13px; cursor: pointer;
+        background: linear-gradient(135deg, var(--accent-strong), var(--accent));
+        color: var(--accent-ink); font-size: 14px; font-weight: 800; font-family: inherit;
+        letter-spacing: 0.4px; box-shadow: 0 8px 20px rgba(20, 184, 166, 0.28);
+        transition: filter var(--dur) ease, transform var(--dur) ease;
+      }
+      .primary:hover:not(:disabled) { filter: brightness(1.06); transform: translateY(-1px); }
+      .primary[data-mode="stop"] { background: linear-gradient(135deg, #e11d48, #fb7185); color: #fff; box-shadow: 0 8px 20px rgba(225, 29, 72, 0.25); }
+      .metrics { display: grid; grid-template-columns: repeat(4, 1fr); gap: 6px; }
+      .metric {
+        background: var(--surface-2); border: 1px solid var(--line); border-radius: 10px;
+        padding: 7px 8px; display: flex; flex-direction: column; gap: 3px; min-width: 0;
+      }
+      .metric span { color: var(--ink-mute); font-size: 10px; white-space: nowrap; }
+      .metric b { font-size: 12px; font-weight: 700; font-variant-numeric: tabular-nums; overflow: hidden; text-overflow: ellipsis; }
+      .kv { display: flex; gap: 8px; padding: 3px 0; font-size: 12px; line-height: 1.45; }
+      .kv > span { color: var(--ink-mute); flex: none; width: 36px; }
+      .kv > b { font-weight: 500; word-break: break-all; color: var(--ink-dim); }
+      .quick-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 7px; }
+      .quick {
+        display: flex; flex-direction: column; align-items: flex-start; gap: 2px;
+        min-height: 52px; padding: 9px 10px; border-radius: var(--radius-sm);
+        background: var(--accent-soft); border: 1px solid var(--line);
+        color: var(--ink); font-family: inherit; cursor: pointer; text-align: left;
+        transition: background var(--dur) ease, transform var(--dur) ease;
+      }
+      .quick:hover:not(:disabled) { background: var(--surface-2); transform: translateY(-1px); }
+      .quick .ico { font-size: 14px; line-height: 1; color: var(--accent); }
+      .quick .label { font-size: 12.5px; font-weight: 600; }
+      .quick .desc { font-size: 10px; color: var(--ink-mute); }
+      .quick:disabled { opacity: 0.5; cursor: default; }
+      .switches { display: grid; grid-template-columns: 1fr 1fr; gap: 4px 10px; margin-top: 9px; }
+      .switch { display: flex; align-items: center; gap: 7px; min-height: 32px; cursor: pointer; font-size: 11.5px; color: var(--ink-dim); }
+      .switch input {
+        appearance: none; -webkit-appearance: none; flex: none;
+        width: 32px; height: 19px; margin: 0; border-radius: 999px;
+        background: var(--line); border: 1px solid var(--line); cursor: pointer;
+        transition: background var(--dur) ease;
+      }
+      .switch input::after {
+        content: ""; display: block; width: 13px; height: 13px; margin: 2px;
+        border-radius: 50%; background: var(--ink-mute);
+        transition: transform var(--dur) ease, background var(--dur) ease;
+      }
+      .switch input:checked { background: var(--accent-soft); border-color: var(--accent-strong); }
+      .switch input:checked::after { transform: translateX(13px); background: var(--accent-strong); }
+      .fields { display: flex; flex-direction: column; gap: 8px; }
+      .field { display: flex; flex-direction: column; gap: 5px; }
+      .field > span { color: var(--ink-mute); font-size: 10.5px; }
+      input[type="text"], select {
+        width: 100%; min-height: 34px; padding: 8px 10px; border-radius: 9px; font-size: 12px;
+        background: var(--surface-2); border: 1px solid var(--line); color: var(--ink);
+        outline: none;
+      }
+      input[type="text"] { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11.5px; }
+      input[type="text"]:focus, select:focus { border-color: var(--accent-strong); }
+      .row-actions { display: flex; gap: 6px; margin-top: 8px; flex-wrap: wrap; }
+      .row-actions .ghost { flex: 1; min-width: 82px; }
+      button.ghost {
+        min-height: 34px; padding: 8px 10px; border-radius: 10px;
+        background: var(--surface-2); border: 1px solid var(--line); color: var(--ink);
+        font-size: 12px; font-family: inherit; cursor: pointer;
+        transition: background var(--dur) ease;
+      }
+      button.ghost:hover:not(:disabled) { background: var(--accent-soft); }
+      button:disabled { opacity: 0.5; cursor: default; }
+      button:focus-visible, input:focus-visible, select:focus-visible {
+        outline: 2px solid var(--accent); outline-offset: 2px;
+      }
+      .hint { margin: 7px 0 0; color: var(--ink-mute); font-size: 10.5px; line-height: 1.5; }
+      .error {
+        margin-bottom: 10px; padding: 9px 11px; border-radius: var(--radius-sm); font-size: 11.5px; line-height: 1.5;
+        background: rgba(251, 113, 133, 0.12); border: 1px solid rgba(251, 113, 133, 0.38); color: var(--ink);
+      }
+      .error[data-kind="info"] { background: var(--accent-soft); border-color: rgba(45, 212, 191, 0.3); }
+      .error[hidden] { display: none; }
+      .health { display: flex; align-items: center; gap: 6px; margin-top: 8px; font-size: 11px; color: var(--ink-mute); }
+      .health .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--ink-mute); flex: none; }
+      .health[data-state="online"] { color: var(--ok); }
+      .health[data-state="online"] .dot { background: var(--ok); }
+      .health[data-state="offline"] { color: var(--err); }
+      .health[data-state="offline"] .dot { background: var(--err); }
+      .health[data-state="checking"] .dot { background: var(--warn); }
+      .health-detail { margin-top: 4px; color: var(--ink-mute); font-size: 10.5px; line-height: 1.5; word-break: break-all; }
+      .health-detail[hidden] { display: none; }
+      .guidance {
+        margin-bottom: 10px; padding: 10px 11px; border-radius: var(--radius-sm);
+        background: var(--accent-soft); border: 1px solid rgba(45, 212, 191, 0.28);
+        font-size: 11.5px; line-height: 1.55; color: var(--ink);
+      }
+      .guidance[hidden] { display: none; }
+      .guidance-title { font-weight: 700; margin-bottom: 4px; }
+      .guidance-body { white-space: pre-line; color: var(--ink-dim); }
+      .guidance-actions { display: flex; gap: 6px; margin-top: 8px; }
+      .guidance-actions button { flex: 1; font-size: 11.5px; min-height: 32px; }
+      .footer {
+        display: flex; align-items: center; justify-content: space-between; gap: 8px;
+        margin-top: 2px; color: var(--ink-mute); font-size: 10.5px; line-height: 1.5;
+      }
+      .footer kbd {
+        font-family: inherit; padding: 1px 5px; border-radius: 5px;
+        border: 1px solid var(--line); background: var(--surface-2); color: var(--ink-dim);
+      }
+      .note-summary { font-size: 12px; color: var(--ink-dim); margin-bottom: 8px; }
+      .spin {
+        display: inline-block; width: 11px; height: 11px; margin-right: 6px;
+        border: 2px solid currentColor; border-right-color: transparent; border-radius: 50%;
+        animation: spin 0.8s linear infinite; vertical-align: -1px;
+      }
+      @keyframes spin { to { transform: rotate(360deg); } }
+      .note-btn {
+        width: 100%; min-height: 38px; margin-bottom: 8px; border-radius: 11px; border: 1px solid transparent;
+        background: var(--accent-soft); color: var(--ink); font-size: 12.5px; font-weight: 600;
+        font-family: inherit; cursor: pointer;
+      }
+      .note-btn:hover:not(:disabled) { background: var(--surface-2); }
+    </style>
+  </head>
+  <body>
+    <header>
+      <div class="brand">
+        <div class="logo">字</div>
+        <div>
+          <h1>livedub</h1>
+          <p class="sub">本地实时同传 · 边看边写笔记</p>
+        </div>
+      </div>
+      <div class="pill" id="status" data-tone="speak"><span class="dot"></span><span id="status-text">播放中</span></div>
+    </header>
+
+    <div id="error" class="error" hidden></div>
+
+    <button id="toggle" class="primary" type="button" data-mode="stop">停止同传</button>
+
+    <section class="card" aria-label="延迟指标">
+      <div class="card-title"><span>延迟</span><span id="session-state" style="text-transform:none;letter-spacing:0">播放中 · speaking</span></div>
+      <div class="metrics">
+        <div class="metric"><span>ASR</span><b id="lat-asr">240ms</b></div>
+        <div class="metric"><span>翻译</span><b id="lat-mt">900ms</b></div>
+        <div class="metric"><span>配音</span><b id="lat-tts">380ms</b></div>
+        <div class="metric"><span>端到端</span><b id="lat-e2e">1.7s</b></div>
+      </div>
+    </section>
+
+    <div id="guidance" class="guidance" hidden>
+      <div class="guidance-title" id="guidance-title"></div>
+      <div class="guidance-body" id="guidance-body"></div>
+      <div class="guidance-actions">
+        <button id="retry-engine" class="ghost" type="button">立即重连</button>
+        <button id="probe-again" class="ghost" type="button">重新检测</button>
+      </div>
+    </div>
+
+    <section class="card" aria-label="笔记">
+      <div class="card-title"><span>笔记</span><span id="caption-count" style="text-transform:none;letter-spacing:0">字幕 42 条</span></div>
+      <div class="kv"><span>今日</span><b id="note-stats">3 条 · 待同步 1</b></div>
+      <div class="kv"><span>画面</span><b id="vision-health">OCR macos-vision · VLM ark-plan</b></div>
+      <button id="capture-note" class="note-btn" type="button" title="记录当前句（Alt+Shift+N）">✎ 记当前句</button>
+      <div class="quick-grid">
+        <button id="open-notebook" class="quick" type="button" title="在工作台打开笔记库"><span class="ico">▤</span><span class="label">笔记库</span><span class="desc">打开笔记面板</span></button>
+        <button id="export-notes" class="quick" type="button" title="导出当前视频笔记 Markdown"><span class="ico">⇩</span><span class="label">导出</span><span class="desc">Markdown</span></button>
+        <button id="show-overlay" class="quick" type="button" title="显示字幕浮层"><span class="ico">▭</span><span class="label">浮层</span><span class="desc">显示字幕</span></button>
+        <button id="open-studio" class="quick" type="button" title="打开本地工作台"><span class="ico">⌂</span><span class="label">工作台</span><span class="desc">studio</span></button>
+      </div>
+      <div class="switches">
+        <label class="switch"><input type="checkbox" id="note-screenshot" checked /> 附页面截图</label>
+        <label class="switch"><input type="checkbox" id="vision-ocr" checked /> 画面 OCR</label>
+        <label class="switch"><input type="checkbox" id="vision-caption" /> 画面理解 VLM（慢）</label>
+      </div>
+      <div class="row-actions">
+        <button id="export-srt" class="ghost" type="button" title="导出本次会话字幕 SRT">导出本次字幕 SRT</button>
+      </div>
+      <p class="hint" id="note-hint">Alt+Shift+N 记笔记 · Alt+Shift+L 开始/停止</p>
+    </section>
+
+    <section class="card" aria-label="引擎与音色">
+      <div class="card-title"><span>引擎</span><span id="engine" style="text-transform:none;letter-spacing:0">未连接</span></div>
+      <div class="fields">
+        <label class="field"><span>本地引擎地址（WebSocket）</span>
+          <input id="engine-url" type="text" spellcheck="false" autocomplete="off" placeholder="ws://127.0.0.1:8787/ws" />
+        </label>
+        <div class="row-actions">
+          <button id="save-url" class="ghost" type="button">保存地址</button>
+          <button id="probe-engine" class="ghost" type="button">检测引擎</button>
+        </div>
+      </div>
+      <div class="health" id="health" data-state="online"><span class="dot"></span><span id="health-text">引擎在线 · v0.7.0 · whisper ✓</span></div>
+      <div class="health-detail" id="health-detail" hidden></div>
+      <p class="hint" id="url-hint">默认 ws://127.0.0.1:8787/ws；启动引擎：cd livedub &amp;&amp; npm start</p>
+      <div class="kv"><span>服务</span><b id="providers">whisper-local · deepseek · minimax</b></div>
+      <div class="kv"><span>音色</span><b id="voice-detail">预设 · male-qn-qingse</b></div>
+      <div class="kv"><span>语言</span><b id="languages">en → zh</b></div>
+      <label class="field" style="margin-top:8px"><span>音色模式</span>
+        <select id="voice-mode">
+          <option value="clone-first">克隆优先（不可用时自动降级）</option>
+          <option value="preset">固定预设音色</option>
+        </select>
+      </label>
+    </section>
+
+    <footer class="footer">
+      <span><kbd>Alt</kbd>+<kbd>Shift</kbd>+<kbd>N</kbd> 记笔记 · <kbd>Alt</kbd>+<kbd>Shift</kbd>+<kbd>L</kbd> 开始/停止</span>
+      <span id="version">v0.7.0</span>
+    </footer>
+
+    
+  </body>
+</html>

@@ -33,6 +33,10 @@ import {
   visualNoteTags,
 } from './vision-kit.mjs';
 import {
+  groupNotesForDisplay,
+  matchesNoteFilter,
+} from './notes-kit.mjs';
+import {
   buildNoteExportFilename,
   buildNotesMarkdown,
   buildOutlineMarkdown,
@@ -79,6 +83,9 @@ import {
   normalizeAsrEngine,
   normalizeSubsStyle,
   normalizeTheme,
+  filterCommands,
+  nextTabIndex,
+  progressStepStates,
   resolveShortcut,
 } from './ui-kit.mjs';
 
@@ -88,6 +95,31 @@ const $ = (id) => document.getElementById(id);
 
 const els = {
   connBadge: $('connBadge'),
+  btnCommands: $('btnCommands'),
+  btnHelpShortcuts: $('btnHelpShortcuts'),
+  commandPalette: $('commandPalette'),
+  commandInput: $('commandInput'),
+  commandList: $('commandList'),
+  commandCount: $('commandCount'),
+  shortcutHelp: $('shortcutHelp'),
+  helpGrid: $('helpGrid'),
+  btnHelpClose: $('btnHelpClose'),
+  imageLightbox: $('imageLightbox'),
+  lightboxImage: $('lightboxImage'),
+  btnLightboxClose: $('btnLightboxClose'),
+  dockTabSubtitles: $('dockTabSubtitles'),
+  dockTabNotes: $('dockTabNotes'),
+  dockTabSettings: $('dockTabSettings'),
+  btnDockCollapse: $('btnDockCollapse'),
+  dockNotesDot: $('dockNotesDot'),
+  dockPanelSubtitles: $('dockPanelSubtitles'),
+  dockPanelNotes: $('dockPanelNotes'),
+  dockPanelSettings: $('dockPanelSettings'),
+  subtitleHeroSrc: $('subtitleHeroSrc'),
+  subtitleHeroDst: $('subtitleHeroDst'),
+  subtitleHeroTime: $('subtitleHeroTime'),
+  notesFilters: $('notesFilters'),
+  visualSteps: $('visualSteps'),
   connText: $('connText'),
   hudAsr: $('hudAsr'),
   hudMt: $('hudMt'),
@@ -308,6 +340,8 @@ const state = {
   status: 'idle',
   metrics: null,
 
+  dock: { tab: 'subtitles', collapsed: false, mobileOpen: false },
+  ui: { commandOpen: false, commandIndex: 0, commandResults: [], helpOpen: false, lightboxOpen: false },
   media: { name: '', url: '', objectUrl: null, isFile: false, size: null },
   // v0.4：当前视频身份（Notes API 的 VideoRef 基础）+ 学习笔记状态
   video: null,
@@ -362,6 +396,7 @@ const state = {
     apiAvailable: null,
     loading: false,
     query: '',
+    filter: 'all',
     tab: 'edit',
     localOnlyCount: 0,
     syncing: false,
@@ -448,12 +483,23 @@ function mediaTitle() {
 function toast(message, tone = 'info', timeout = 4200) {
   const node = document.createElement('div');
   node.className = `toast ${tone}`;
-  node.textContent = String(message);
-  els.toasts.appendChild(node);
-  setTimeout(() => {
+  node.setAttribute('role', tone === 'err' ? 'alert' : 'status');
+  const text = document.createElement('span');
+  text.className = 'toast-text';
+  text.textContent = String(message);
+  const close = document.createElement('button');
+  close.type = 'button';
+  close.className = 'toast-close';
+  close.setAttribute('aria-label', '关闭提示');
+  close.textContent = '×';
+  const dismiss = () => {
     node.classList.add('leaving');
     setTimeout(() => node.remove(), 240);
-  }, timeout);
+  };
+  close.addEventListener('click', dismiss);
+  node.append(text, close);
+  els.toasts.appendChild(node);
+  setTimeout(dismiss, timeout);
 }
 
 function logEvent(type, message, tone = 'mt') {
@@ -1294,6 +1340,7 @@ function renderCurrentSubtitle({ src, dst, translating }) {
   els.subsSrc.textContent = sourceText;
   els.subsDst.textContent = destText || (translating ? '…' : '');
   els.subsDst.classList.toggle('pending', !destText && Boolean(translating));
+  updateSubtitleHero({ src: sourceText, dst: destText || (translating ? '…' : '') });
   scheduleSubtitleHide(0);
 }
 
@@ -1309,6 +1356,7 @@ function hideSubtitle() {
   els.subsSrc.textContent = '';
   els.subsDst.textContent = '';
   els.subsDst.classList.remove('pending');
+  updateSubtitleHero({ src: '', dst: '' });
 }
 
 function setSubsVisible(visible) {
@@ -2155,6 +2203,7 @@ function applySimAt(tMs) {
   } else {
     hideSubtitle();
   }
+  if (els.subtitleHeroTime) els.subtitleHeroTime.textContent = formatClock(tMs);
   renderTranscriptsFrozen(snapshot.segmentsSoFar, snapshot.current?.id && !snapshot.current.partial ? snapshot.current.id : null);
   if (snapshot.metrics) updateMetricsHud(snapshot.metrics);
   if (snapshot.voice) applyVoice(snapshot.voice);
@@ -2274,6 +2323,7 @@ function onVideoChanged() {
     apiAvailable: null,
     loading: false,
     query: '',
+    filter: 'all',
     tab: 'edit',
     localOnlyCount: 0,
   });
@@ -2423,6 +2473,7 @@ async function openNotesDrawer({ create = false, allowNoVideo = false } = {}) {
   els.notesDrawer.classList.add('open');
   els.notesDrawer.setAttribute('aria-hidden', 'false');
   els.btnNotes.setAttribute('aria-expanded', 'true');
+  setDockTab('notes');
   if (state.vision.checkedAt == null || Date.now() - state.vision.checkedAt > 30_000) void loadVisionHealth();
   if (!state.video) {
     renderNotesAll();
@@ -2448,6 +2499,8 @@ function closeNotesDrawer() {
   els.notesDrawer.classList.remove('open');
   els.notesDrawer.setAttribute('aria-hidden', 'true');
   els.btnNotes.setAttribute('aria-expanded', 'false');
+  closeDockMobile();
+  setDockTab('subtitles');
 }
 
 function focusNotesEditor() {
@@ -3053,6 +3106,8 @@ function setVisualProgress(text, percent) {
   els.visualProgress.hidden = false;
   els.visualProgressText.textContent = text;
   els.visualProgressBar.style.width = `${clamp(percent, 0, 100)}%`;
+  const step = visualStepForText(text);
+  if (step) applyVisualSteps(step);
 }
 
 function openVisualModal() {
@@ -3066,6 +3121,7 @@ function openVisualModal() {
   els.visualVideoTitle.textContent = state.video.title;
   els.visualError.hidden = true;
   els.visualVlm.checked = Boolean(state.visual.vlm && state.vision.health?.visionAvailable);
+  applyVisualSteps(null);
   for (const button of els.visualMode.querySelectorAll('button[data-mode]')) {
     const active = button.dataset.mode === state.visual.mode;
     button.setAttribute('aria-pressed', String(active));
@@ -4146,6 +4202,7 @@ function renderNotesAll() {
   els.notesVideoTitle.textContent = state.video ? state.video.title : '未加载视频';
   els.notesCount.textContent = `${state.notes.items.length} 条`;
   updateNotesBadge(state.notes.items.length);
+  if (els.dockNotesDot) els.dockNotesDot.hidden = state.notes.items.length === 0;
   els.btnNotesNew.disabled = !state.video;
   els.btnNotesOutline.disabled = !state.video;
   els.notesOfflineBanner.hidden = !state.notes.offline;
@@ -4159,19 +4216,28 @@ function noteKindLabel(kind) {
 
 function renderNotesList() {
   const query = state.notes.query;
-  const items = filterNotes(sortNotesByTime(state.notes.items), query);
+  const filtered = filterNotes(sortNotesByTime(state.notes.items), query);
+  const groups = groupNotesForDisplay(filtered, state.notes.filter);
+  const total = groups.reduce((sum, group) => sum + group.notes.length, 0);
   els.notesList.textContent = '';
-  els.notesListCount.textContent = `${items.length} 条`;
-  if (items.length === 0) {
+  els.notesListCount.textContent = `${total} 条`;
+  if (total === 0) {
     const empty = document.createElement('div');
-    empty.className = 'notes-empty';
+    empty.className = 'notes-empty-rich';
     empty.innerHTML = query
       ? '没有匹配的笔记，换个关键词试试'
-      : '载入视频后按 <kbd>N</kbd> 新建第一条笔记';
+      : '按 <kbd>N</kbd> 新建笔记，或用「图文笔记」按章节生成图文笔记<br />选中的笔记会显示在右侧编辑器';
     els.notesList.appendChild(empty);
     return;
   }
-  for (const note of items) {
+  for (const group of groups) {
+    if (state.notes.filter === 'all') {
+      const head = document.createElement('div');
+      head.className = 'notes-group-head';
+      head.textContent = `${group.title} · ${group.notes.length}`;
+      els.notesList.appendChild(head);
+    }
+  for (const note of group.notes) {
     const item = document.createElement('div');
     item.className = `notes-item${note.id === state.notes.currentId ? ' active' : ''}`;
     item.dataset.noteId = note.id;
@@ -4269,6 +4335,7 @@ function renderNotesList() {
     });
     els.notesList.appendChild(item);
   }
+  }
 }
 
 function renderNotesPreview() {
@@ -4312,6 +4379,238 @@ function setNotesTab(tab) {
   els.notesTabPreview.setAttribute('aria-selected', String(preview));
   if (preview) renderNotesPreview();
   else els.notesEditor.focus({ preventScroll: true });
+}
+
+// ==================================================== v0.7 dock / 命令面板 / 帮助
+
+const DOCK_TABS = ['subtitles', 'notes', 'settings'];
+
+function setDockTab(tab, { focus = false, openMobile = true } = {}) {
+  const target = DOCK_TABS.includes(tab) ? tab : 'subtitles';
+  state.dock.tab = target;
+  for (const button of [els.dockTabSubtitles, els.dockTabNotes, els.dockTabSettings]) {
+    const active = button?.dataset.dockTab === target;
+    button?.classList.toggle('is-active', active);
+    button?.setAttribute('aria-selected', String(active));
+    button?.setAttribute('tabindex', active ? '0' : '-1');
+  }
+  for (const panel of [els.dockPanelSubtitles, els.dockPanelNotes, els.dockPanelSettings]) {
+    if (!panel) continue;
+    panel.hidden = panel.id !== `dockPanel${target[0].toUpperCase()}${target.slice(1)}`;
+  }
+  if (openMobile && window.matchMedia?.('(max-width: 1100px)').matches) document.querySelector('.app')?.classList.add('dock-mobile-open');
+  if (focus) {
+    const activeTab = document.querySelector(`.dock-tab[data-dock-tab="${target}"]`);
+    activeTab?.focus();
+  }
+}
+
+function closeDockMobile() {
+  document.querySelector('.app')?.classList.remove('dock-mobile-open');
+}
+
+function setDockCollapsed(collapsed) {
+  state.dock.collapsed = Boolean(collapsed);
+  document.querySelector('.app')?.classList.toggle('dock-collapsed', state.dock.collapsed);
+  els.btnDockCollapse?.setAttribute('aria-pressed', String(state.dock.collapsed));
+}
+
+function openShortcutHelp() {
+  if (!els.shortcutHelp) return;
+  state.ui.helpOpen = true;
+  els.shortcutHelp.hidden = false;
+  els.shortcutHelp.setAttribute('aria-hidden', 'false');
+  if (els.helpGrid && els.helpGrid.childElementCount === 0) {
+    const rows = [
+      ['Space', '播放 / 暂停'],
+      ['S', '显示 / 隐藏字幕'],
+      ['D', '开启 / 关闭配音'],
+      ['N', '新建笔记 / 打开笔记'],
+      ['Esc', '关闭弹层 / 面板'],
+      ['⌘K / Ctrl+K', '打开命令面板'],
+      ['?', '打开本帮助'],
+      ['Alt+1/2/3', '切换 dock：字幕 / 笔记 / 设置'],
+      ['Ctrl/⌘+Enter', '保存当前笔记'],
+      ['Ctrl/⌘+Shift+C', '插入代码块'],
+      ['↑ / ↓', '命令面板内选择'],
+      ['Enter', '执行选中的命令'],
+    ];
+    for (const [keys, label] of rows) {
+      const row = document.createElement('div');
+      row.className = 'help-row';
+      const kbd = document.createElement('kbd');
+      kbd.textContent = keys;
+      const span = document.createElement('span');
+      span.textContent = label;
+      row.append(kbd, span);
+      els.helpGrid.appendChild(row);
+    }
+  }
+  els.btnHelpShortcuts?.setAttribute('aria-expanded', 'true');
+}
+
+function closeShortcutHelp() {
+  state.ui.helpOpen = false;
+  if (els.shortcutHelp) {
+    els.shortcutHelp.hidden = true;
+    els.shortcutHelp.setAttribute('aria-hidden', 'true');
+  }
+  els.btnHelpShortcuts?.setAttribute('aria-expanded', 'false');
+}
+
+const COMMANDS = [
+  { id: 'start', title: '开始同传', keywords: 'start session 开始 连接', icon: 'i-wand', action: () => els.btnStart.click() },
+  { id: 'play', title: '播放 / 暂停', keywords: 'play pause space 播放 暂停', icon: 'i-play', action: () => els.btnPlay.click() },
+  { id: 'stop', title: '停止同传', keywords: 'stop 停止', icon: 'i-stop', action: () => els.btnStop.click() },
+  { id: 'notes', title: '打开笔记工作区', keywords: 'notes 笔记 打开', icon: 'i-note', action: () => void openNotesDrawer() },
+  { id: 'visual', title: '生成图文笔记（整段）', keywords: 'visual 图文 生成 ocr', icon: 'i-image', action: () => { openVisualModal(); setVisualMode('single'); } },
+  { id: 'chapters', title: '按章节生成图文笔记', keywords: 'chapter 章节 分段 总览', icon: 'i-list', action: () => { openVisualModal(); setVisualMode('chapters'); } },
+  { id: 'quote', title: '插入当前句到笔记', keywords: 'quote 当前句 插入 字幕', icon: 'i-subtitles', action: () => void (async () => { await openNotesDrawer(); if (!currentNote()) await createNoteAtCurrentTime(); insertCurrentQuote(); })() },
+  { id: 'capture', title: '捕获当前画面', keywords: 'capture 画面 截图 ocr', icon: 'i-camera', action: () => void (async () => { await openNotesDrawer(); await captureCurrentVisual(); })() },
+  { id: 'obsidian', title: '同步到 Obsidian', keywords: 'obsidian sync 同步 笔记', icon: 'i-sync', action: () => void syncCurrentVideoToObsidian() },
+  { id: 'theme', title: '切换暗色 / 亮色主题', keywords: 'theme 主题 亮色 暗色', icon: 'i-sun', action: () => toggleTheme() },
+  { id: 'pip', title: '画中画', keywords: 'pip picture 画中画', icon: 'i-pip', action: () => void togglePip() },
+  { id: 'export', title: '下载笔记 Markdown', keywords: 'export 导出 markdown 下载', icon: 'i-download', action: () => void exportNotes('download') },
+  { id: 'subtitles', title: '打开字幕 dock', keywords: 'subtitle 字幕 历史', icon: 'i-subtitles', action: () => setDockTab('subtitles') },
+  { id: 'settings', title: '打开设置 dock', keywords: 'settings 设置 引擎 声音', icon: 'i-settings', action: () => setDockTab('settings') },
+  { id: 'dock', title: '收起 / 展开右侧 dock', keywords: 'dock 收起 展开 布局', icon: 'i-expand', action: () => setDockCollapsed(!state.dock.collapsed) },
+  { id: 'help', title: '快捷键帮助', keywords: 'help 快捷键 帮助 ?', icon: 'i-keyboard', action: () => openShortcutHelp() },
+];
+
+function setCommandActive(index) {
+  const list = els.commandList?.querySelectorAll('.command-item') ?? [];
+  if (list.length === 0) return;
+  const target = Math.max(0, Math.min(list.length - 1, index));
+  state.ui.commandIndex = target;
+  list.forEach((node, nodeIndex) => {
+    node.classList.toggle('is-active', nodeIndex === target);
+    node.setAttribute('aria-selected', String(nodeIndex === target));
+  });
+  list[target].scrollIntoView({ block: 'nearest' });
+}
+
+function renderCommandList(query = '') {
+  if (!els.commandList) return;
+  const results = filterCommands(COMMANDS, query);
+  state.ui.commandResults = results;
+  state.ui.commandIndex = 0;
+  els.commandList.textContent = '';
+  els.commandCount.textContent = `${results.length} 条命令`;
+  if (results.length === 0) {
+    const empty = document.createElement('div');
+    empty.className = 'command-empty';
+    empty.textContent = '没有匹配的命令，换个关键词试试';
+    els.commandList.appendChild(empty);
+    return;
+  }
+  results.forEach((command, index) => {
+    const item = document.createElement('div');
+    item.className = `command-item${index === 0 ? ' is-active' : ''}`;
+    item.setAttribute('role', 'option');
+    item.setAttribute('aria-selected', String(index === 0));
+    item.dataset.commandId = command.id;
+    const icon = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+    icon.setAttribute('class', 'icon');
+    const use = document.createElementNS('http://www.w3.org/2000/svg', 'use');
+    use.setAttribute('href', `#${command.icon ?? 'i-dot'}`);
+    icon.appendChild(use);
+    const title = document.createElement('span');
+    title.textContent = command.title;
+    const hint = document.createElement('small');
+    hint.textContent = 'Enter ↵';
+    item.append(icon, title, hint);
+    item.addEventListener('click', () => runCommand(index));
+    item.addEventListener('mousemove', () => setCommandActive(index));
+    els.commandList.appendChild(item);
+  });
+}
+
+function runCommand(index) {
+  const command = state.ui.commandResults[index];
+  closeCommandPalette();
+  if (!command) return;
+  try {
+    command.action();
+  } catch (error) {
+    toast(`命令执行失败：${error.message}`, 'err', 5000);
+  }
+}
+
+function openCommandPalette() {
+  if (!els.commandPalette) return;
+  state.ui.commandOpen = true;
+  els.commandPalette.hidden = false;
+  els.commandPalette.setAttribute('aria-hidden', 'false');
+  els.btnCommands?.setAttribute('aria-expanded', 'true');
+  if (els.commandInput) els.commandInput.value = '';
+  renderCommandList('');
+  requestAnimationFrame(() => els.commandInput?.focus());
+}
+
+function closeCommandPalette() {
+  state.ui.commandOpen = false;
+  if (els.commandPalette) {
+    els.commandPalette.hidden = true;
+    els.commandPalette.setAttribute('aria-hidden', 'true');
+  }
+  els.btnCommands?.setAttribute('aria-expanded', 'false');
+}
+
+function toggleCommandPalette() {
+  if (state.ui.commandOpen) closeCommandPalette();
+  else openCommandPalette();
+}
+
+function openLightbox(src) {
+  if (!src || !els.imageLightbox) return;
+  state.ui.lightboxOpen = true;
+  els.lightboxImage.src = src;
+  els.imageLightbox.hidden = false;
+  els.imageLightbox.setAttribute('aria-hidden', 'false');
+}
+
+function closeLightbox() {
+  state.ui.lightboxOpen = false;
+  if (els.imageLightbox) {
+    els.imageLightbox.hidden = true;
+    els.imageLightbox.setAttribute('aria-hidden', 'true');
+  }
+  if (els.lightboxImage) els.lightboxImage.removeAttribute('src');
+}
+
+// ------------------------------------------------ 字幕 hero / 分步进度
+
+function updateSubtitleHero({ src = '', dst = '', timeMs = null } = {}) {
+  if (!els.subtitleHeroSrc) return;
+  els.subtitleHeroSrc.textContent = src || '等待字幕…';
+  els.subtitleHeroDst.textContent = dst || '打开视频并开始同传后，这里显示实时双语字幕。';
+  const tMs = Number.isFinite(Number(timeMs))
+    ? Number(timeMs)
+    : state.sim.active
+      ? state.sim.clock || 0
+      : (els.video?.currentTime || 0) * 1000;
+  els.subtitleHeroTime.textContent = formatClock(tMs);
+}
+
+function visualStepForText(text) {
+  const value = String(text ?? '');
+  if (/完成|取消|失败/.test(value)) return 'done';
+  if (/采样/.test(value)) return 'sample';
+  if (/识别|OCR/i.test(value)) return 'ocr';
+  if (/画面理解|VLM/.test(value)) return 'vlm';
+  if (/总结|总览/.test(value)) return 'summary';
+  if (/保存|组装|整理/.test(value)) return 'save';
+  return null;
+}
+
+function applyVisualSteps(activeStep) {
+  if (!els.visualSteps) return;
+  const states = activeStep === 'done' ? progressStepStates(null).map((entry) => ({ ...entry, state: 'done' })) : progressStepStates(activeStep);
+  for (const item of els.visualSteps.querySelectorAll('li[data-step]')) {
+    const entry = states.find((value) => value.step === item.dataset.step);
+    item.dataset.state = entry?.state ?? 'pending';
+    item.setAttribute('aria-current', entry?.state === 'active' ? 'step' : 'false');
+  }
 }
 
 // ---------------------------------------------------------------- 事件绑定
@@ -4360,6 +4659,126 @@ function handleShortcut(action) {
 }
 
 function bindEvents() {
+  // v0.7 dock 切换（role=tablist，左右箭头键盘）
+  const dockTabs = [els.dockTabSubtitles, els.dockTabNotes, els.dockTabSettings];
+  for (const tab of dockTabs) {
+    tab.addEventListener('click', () => {
+      if (tab.dataset.dockTab === 'notes') void openNotesDrawer({ allowNoVideo: true });
+      else setDockTab(tab.dataset.dockTab, { focus: false });
+    });
+    tab.addEventListener('keydown', (event) => {
+      if (!['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)) return;
+      event.preventDefault();
+      const current = DOCK_TABS.indexOf(state.dock.tab);
+      const delta = event.key === 'ArrowLeft' ? -1 : event.key === 'ArrowRight' ? 1 : 0;
+      let next = event.key === 'Home' ? 0 : event.key === 'End' ? DOCK_TABS.length - 1 : nextTabIndex(current, DOCK_TABS.length, delta);
+      setDockTab(DOCK_TABS[next], { focus: true });
+    });
+  }
+  els.btnDockCollapse.addEventListener('click', () => {
+    if (window.matchMedia?.('(max-width: 1100px)').matches) closeDockMobile();
+    else setDockCollapsed(!state.dock.collapsed);
+  });
+
+  // v0.7 命令面板 / 快捷键帮助 / lightbox
+  els.btnCommands.addEventListener('click', openCommandPalette);
+  els.commandInput.addEventListener('input', () => renderCommandList(els.commandInput.value));
+  els.commandInput.addEventListener('keydown', (event) => {
+    if (event.key === 'ArrowDown') {
+      event.preventDefault();
+      setCommandActive(state.ui.commandIndex + 1);
+    } else if (event.key === 'ArrowUp') {
+      event.preventDefault();
+      setCommandActive(state.ui.commandIndex - 1);
+    } else if (event.key === 'Enter') {
+      event.preventDefault();
+      runCommand(state.ui.commandIndex);
+    }
+  });
+  els.commandList.addEventListener('mousemove', (event) => {
+    const item = event.target.closest('.command-item');
+    if (!item) return;
+    const siblings = [...els.commandList.querySelectorAll('.command-item')];
+    const index = siblings.indexOf(item);
+    if (index >= 0 && index !== state.ui.commandIndex) setCommandActive(index);
+  });
+  els.commandPalette.addEventListener('click', (event) => {
+    if (event.target === els.commandPalette) closeCommandPalette();
+  });
+  els.btnHelpShortcuts.addEventListener('click', openShortcutHelp);
+  els.btnHelpClose.addEventListener('click', closeShortcutHelp);
+  els.shortcutHelp.addEventListener('click', (event) => {
+    if (event.target === els.shortcutHelp) closeShortcutHelp();
+  });
+  els.btnLightboxClose.addEventListener('click', closeLightbox);
+  els.imageLightbox.addEventListener('click', (event) => {
+    if (event.target === els.imageLightbox) closeLightbox();
+  });
+  els.notesPreview.addEventListener('click', (event) => {
+    const image = event.target.closest('img');
+    if (image) openLightbox(image.currentSrc || image.src);
+  });
+
+  // v0.7 全局快捷键：命令面板 / ? 帮助 / Esc 关闭弹层优先
+  document.addEventListener(
+    'keydown',
+    (event) => {
+      const mod = event.metaKey || event.ctrlKey;
+      if (mod && !event.shiftKey && !event.altKey && event.code === 'KeyK') {
+        event.preventDefault();
+        toggleCommandPalette();
+        return;
+      }
+      if (!mod && !event.altKey && (event.key === '?' || (event.shiftKey && event.code === 'Slash'))) {
+        if (!isEditableTarget(event.target)) {
+          event.preventDefault();
+          openShortcutHelp();
+          return;
+        }
+      }
+      if (event.altKey && ['Digit1', 'Digit2', 'Digit3'].includes(event.code)) {
+        event.preventDefault();
+        setDockTab(['subtitles', 'notes', 'settings'][Number(event.code.slice(-1)) - 1], { focus: true });
+        return;
+      }
+      if (event.key === 'Escape') {
+        if (state.ui.lightboxOpen) {
+          event.preventDefault();
+          closeLightbox();
+          return;
+        }
+        if (state.ui.helpOpen) {
+          event.preventDefault();
+          closeShortcutHelp();
+          return;
+        }
+        if (state.ui.commandOpen) {
+          event.preventDefault();
+          closeCommandPalette();
+          return;
+        }
+        if (window.matchMedia?.('(max-width: 1100px)').matches && document.querySelector('.app.dock-mobile-open')) {
+          event.preventDefault();
+          closeDockMobile();
+        }
+      }
+    },
+    true,
+  );
+
+  // v0.7 笔记过滤 chips
+  els.notesFilters.addEventListener('click', (event) => {
+    const chip = event.target.closest('button[data-note-filter]');
+    if (!chip) return;
+    state.notes.filter = chip.dataset.noteFilter;
+    for (const button of els.notesFilters.querySelectorAll('button[data-note-filter]')) {
+      const active = button.dataset.noteFilter === state.notes.filter;
+      button.classList.toggle('is-active', active);
+      button.setAttribute('aria-pressed', String(active));
+    }
+    renderNotesList();
+  });
+
   // 顶栏
   els.btnStart.addEventListener('click', () => void startSession());
   els.btnStop.addEventListener('click', () => stopSession());
@@ -4559,7 +4978,8 @@ function bindEvents() {
 
   // 学习笔记（v0.4）
   els.btnNotes.addEventListener('click', () => {
-    if (state.notes.open) closeNotesDrawer();
+    const mobile = window.matchMedia?.('(max-width: 1100px)').matches;
+    if (state.notes.open && state.dock.tab === 'notes' && mobile) closeNotesDrawer();
     else void openNotesDrawer();
   });
   els.btnNotesClose.addEventListener('click', closeNotesDrawer);
@@ -4678,6 +5098,9 @@ function bindEvents() {
 
 async function bootstrap() {
   bindEvents();
+  setDockTab('subtitles', { openMobile: false });
+  applyVisualSteps(null);
+  updateSubtitleHero({});
   setupSubtitleDrag();
   updateSessionButtons();
   resetMetricsHud();
@@ -4701,7 +5124,7 @@ async function bootstrap() {
     renderAsrEngine,
     renderDesktopApp,
     selectAsrEngine,
-    version: '0.5.0',
+    version: '0.7.0',
     notes: {
       state: state.notes,
       open: (options) => openNotesDrawer(options ?? {}),
@@ -4729,6 +5152,22 @@ async function bootstrap() {
       state: state.visualContext,
       setEnabled: setVisualContextEnabled,
       tick: tickVisualContext,
+    },
+    ui: {
+      state: state.ui,
+      dock: state.dock,
+      commands: COMMANDS,
+      openCommands: openCommandPalette,
+      closeCommands: closeCommandPalette,
+      openHelp: openShortcutHelp,
+      closeHelp: closeShortcutHelp,
+      setDockTab,
+      setDockCollapsed,
+      openLightbox,
+      closeLightbox,
+      setProgress: setVisualProgress,
+      openVisual: openVisualModal,
+      setVisualMode,
     },
     vision: {
       state: state.vision,

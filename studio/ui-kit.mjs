@@ -233,3 +233,54 @@ export function mergeSettingsSnapshot(snapshot = {}, defaults = ASR_ENGINE_OPTIO
     asrEngine: snapshot?.asrEngine ?? null,
   };
 }
+
+// ==================================================== v0.7 命令面板 / tab / 进度
+
+/** 简单模糊匹配：query 字符按顺序出现即命中（忽略大小写/空白） */
+export function fuzzyMatch(text, query) {
+  const needle = String(query ?? '').trim().toLowerCase().replace(/\s+/g, '');
+  if (!needle) return true;
+  const haystack = String(text ?? '').toLowerCase();
+  let cursor = 0;
+  for (const char of needle) {
+    const found = haystack.indexOf(char, cursor);
+    if (found < 0) return false;
+    cursor = found + 1;
+  }
+  return true;
+}
+
+/** 命令面板过滤：title/keywords 模糊匹配，startswith/includes 优先，其余保持原顺序 */
+export function filterCommands(commands, query) {
+  const list = Array.isArray(commands) ? commands : [];
+  const needle = String(query ?? '').trim().toLowerCase();
+  if (!needle) return [...list];
+  const scored = [];
+  for (let index = 0; index < list.length; index += 1) {
+    const command = list[index];
+    const title = String(command?.title ?? '').toLowerCase();
+    const haystack = `${command?.title ?? ''} ${Array.isArray(command?.keywords) ? command.keywords.join(' ') : command?.keywords ?? ''}`;
+    if (title.startsWith(needle)) scored.push({ command, score: 0, index });
+    else if (title.includes(needle)) scored.push({ command, score: 1, index });
+    else if (fuzzyMatch(haystack, needle)) scored.push({ command, score: 2, index });
+  }
+  scored.sort((a, b) => a.score - b.score || a.index - b.index);
+  return scored.map((entry) => entry.command);
+}
+
+/** tab rail 键盘左右/Home/End 循环 */
+export function nextTabIndex(currentIndex, count, delta) {
+  const total = Math.max(1, Math.round(Number(count) || 1));
+  const index = Number.isFinite(Number(currentIndex)) ? Math.round(Number(currentIndex)) : 0;
+  return ((index + (Number(delta) || 0)) % total + total) % total;
+}
+
+/** 分步进度状态：'pending' | 'active' | 'done' */
+export function progressStepStates(activeStep, steps = ['sample', 'ocr', 'vlm', 'summary', 'save']) {
+  const list = (Array.isArray(steps) ? steps : []).map(String);
+  const activeIndex = list.indexOf(String(activeStep ?? ''));
+  return list.map((step, index) => ({
+    step,
+    state: activeIndex < 0 ? 'pending' : index < activeIndex ? 'done' : index === activeIndex ? 'active' : 'pending',
+  }));
+}

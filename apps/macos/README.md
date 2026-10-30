@@ -10,6 +10,11 @@
   视觉不可用（旧引擎 / 未安装 vision 模块）时静默降级，笔记照常保存。
 - **v0.6 新能力**：可选**实时画面上下文**——直播时每 10s 截屏 OCR，经 WS `visual-context`
   推给引擎作为实时翻译参考（默认**关闭**，注意 CPU/耗电与画面隐私；异步、不阻塞音频/字幕）。
+- **v0.7 新能力**：**视觉重设计**——jade/ink 色板、材质模糊浮层（降低透明度自动降级纯色）、
+  品牌小标 + 状态 pill、22–26pt 译文层级、accent 呼吸线、悬停工具条、亮暗自适应、150–200ms 动效
+  （`reduceMotion` 关闭）；新增**设置窗口**（字号/宽度/位置/透明度/穿透/音频/笔记与视觉/引擎只读，
+  即时生效 + 恢复默认 + Esc 关闭）；**菜单栏分区重构**（SF Symbol 图标 + 快捷键提示 + 状态摘要）；
+  VoiceOver label / 28pt 命中区 / focus ring。见 [设计说明](https://github.com/LeoLin990405/livedub/blob/main/docs/DESIGN.md)。
 - 和 Chrome 扩展（只抓网页标签页）、本地工作台（只处理本地文件）互补，三端共用同一套线协议：
   [`docs/CONTRACTS.md`](../../docs/CONTRACTS.md) §3 / [`engine/protocol.mjs`](../../engine/protocol.mjs)。
 - 原生 Swift，零第三方依赖：只用系统框架 `ScreenCaptureKit` / `AVFoundation` / `AppKit` / `Foundation`。
@@ -24,7 +29,7 @@ apps/macos/
 │   ├── main.swift                 # 入口：参数解析、NSApplication、菜单栏、会话编排、--simulate、⌥N 笔记
 │   ├── ScreenAudioCapture.swift   # ScreenCaptureKit 只抓音频：CMSampleBuffer -> mono float -> 16k s16le -> 100ms 分帧
 │   ├── EngineClient.swift         # URLSessionWebSocketTask：hello / 二进制帧 / 事件解析 / 指数退避重连 / ping
-│   ├── OverlayWindow.swift        # NSPanel 透明置顶浮层：译文+原文+状态/延迟，可拖动、可选点击穿透
+│   ├── OverlayWindow.swift        # v0.7 NSPanel 浮层：材质模糊/品牌+状态 pill/层级字幕/呼吸线/悬停工具条
 │   ├── DubPlayer.swift            # AVAudioEngine + AVAudioPlayerNode：24k PCM 按 startMs 排序播放
 │   ├── Settings.swift             # UserDefaults：引擎地址 / 字号 / 浮层位置 / 点击穿透 / 配音 / 笔记开关
 │   ├── Protocol.swift             # 线协议 Swift 镜像（帧编解码、hello、事件解析、字幕折行、重采样）
@@ -32,6 +37,8 @@ apps/macos/
 │   ├── Screenshot.swift           # SCScreenshotManager 截图（PNG ≤4MB）+ 截图降级决策
 │   ├── Vision.swift               # v0.5 视觉纯逻辑：OCR/analyze 请求、文本清洗/代码块转义、降级决策、health 解析
 │   ├── VisualContext.swift        # v0.6 实时画面上下文：visual-context 事件、清洗/去重/发送决策/状态文案
+│   ├── OverlayDesign.swift        # v0.7 设计 token / 布局纯函数 / 状态 pill / toast / 菜单文案 / a11y / 亮暗降级
+│   ├── SettingsWindow.swift       # v0.7 设置窗口：分组表单 + 即时生效 + 恢复默认 + Esc 关闭
 │   ├── HotKey.swift               # Carbon RegisterEventHotKey 全局 ⌥N（无第三方依赖）
 │   └── SelfTest.swift             # --self-test headless 自检 + --simulate 演示语料
 ├── Info.plist                     # LSUIElement=true（菜单栏 App）、NSScreenCaptureUsageDescription 等
@@ -73,7 +80,7 @@ bash scripts/build-macos.sh --clean
 - 脚本只显式链接系统框架：`AppKit` / `AVFoundation` / `CoreMedia` / `CoreGraphics` / `ScreenCaptureKit`。
 - 构建末尾会做 **ad-hoc 签名**（`codesign --force --sign -`），便于 `open` 正常启动；App 未公证。
 - 本机实测（Swift 5.10 / macOS 14.8.9，Apple Silicon）：增量编译约 **6–15s**（clean 全量约 36s）、
-  可执行文件 **862 KB**、bundle **876 KB**（v0.6 增加实时画面上下文）。
+  可执行文件 **1,002 KB**、bundle **1.0 MB**（v0.7 视觉重设计 + 设置窗口）。
 
 ## 运行
 
@@ -114,6 +121,8 @@ BIN=apps/macos/build/livedub.app/Contents/MacOS/livedub
 | `--note-once` | 启动 2.5s 后自动记一条测试笔记（截图/OCR/VLM 全链路）；未显式给 `--duration` 时记录完自动退出（冒烟用） |
 | `--notes-vision` | 调试用：本次运行开启「画面理解（VLM，慢）」开关（不写用户设置） |
 | `--visual-context` | 调试用：本次运行开启「实时画面上下文（OCR，每 10s 推送）」开关（不写用户设置） |
+| `--show-settings` | 调试/截图用：启动后直接打开设置窗口 |
+| `--demo-toast` | 调试/截图用：启动 2.2s 后演示一条「已记录笔记」toast |
 | `--duration <秒>` | N 秒后自动退出（调试用） |
 | `--engine-url <url>` | 覆盖引擎地址并持久化 |
 | `--self-test` | headless 自检：协议字节布局 / hello / 事件解析 / 字幕排版 / 重采样 / 分帧 |
@@ -123,32 +132,23 @@ BIN=apps/macos/build/livedub.app/Contents/MacOS/livedub
 
 | 菜单项 | 行为 |
 |---|---|
-| 状态：… | 当前状态 + 引擎地址（只读展示） |
+| 状态摘要 | 只读：连接状态 · 当前状态 · 延迟 · OCR/VLM · 画面上下文（引擎地址在下一行） |
 | 开始 / 停止同传 | 连接引擎 + 开始系统音频捕获；再次点击停止 |
-| **记笔记（⌥N）** | 把当前双语字幕 + 时间戳 +（可选）截图记进学习笔记；全局快捷键 ⌥N 等效 |
-| **打开笔记** | 打开工作台学习笔记面板（`/studio/?notes=1`） |
-| **打开工作台** | 打开工作台首页 |
+| 暂停 / 继续同传 | 直播中暂停/恢复引擎处理（浮层工具条同功能） |
+| 记笔记（⌥N） | 把当前双语字幕 + 时间戳（+ 可选截图/OCR）记进学习笔记；全局快捷键 ⌥N |
+| 设置…（⌘,） | 打开设置窗口（字号/宽度/位置/透明度/穿透/音频/笔记与视觉/引擎只读） |
+| 打开笔记 / 打开工作台 | 打开工作台学习笔记面板（`/studio/?notes=1`）/ 工作台首页 |
 | 显示 / 隐藏字幕浮层 | 浮层显隐 |
-| 字幕点击穿透 | 开启后鼠标事件穿透浮层（可点下面的窗口），此时浮层不能拖动 |
-| 播放中文配音 | 配音开关（关闭后只看字幕；原声不受影响） |
-| 显示原文行 | 原文行显隐 |
-| 增大 / 减小字幕字号 | 即时生效并持久化 |
-| **记笔记时附截图** | 开关（默认开）：按 ⌥N 时用 SCScreenshotManager 截当前屏幕作为笔记附件 |
-| **暂停时仍可笔记** | 开关（默认开）：同传暂停（引擎 status=paused）时仍允许 ⌥N 记录当前字幕 |
-| **识别画面文字（OCR，快）** | v0.5 开关（默认开）：截图上传后调用 `/api/vision/ocr`，把文字写进笔记 |
-| **画面理解（VLM，慢，约 20–30s）** | v0.5 开关（默认关）：调用 `/api/vision/analyze?mode=both` 生成画面描述；失败降级为仅 OCR |
-| **视觉：…** | 视觉能力状态（只读）：OCR/VLM 是否可用（来自 `/api/vision/health`） |
-| **翻译参考画面文字（OCR，每 10s）** | v0.6 开关（默认**关**）：直播时每 10s 截屏 OCR 并 WS 推送 `visual-context` |
-| **画面上下文：…** | 状态（只读）：开/关 · 最近 HH:MM:SS · 上次 OCR n 字 |
-| 笔记队列：… | 离线待同步条数（引擎重连后自动补发） |
-| 设置引擎地址… | 修改 WS 地址，保存后自动重连 |
-| 打开屏幕录制权限设置… | 直达 系统设置 → 隐私与安全性 → 屏幕录制 |
-| 重置字幕位置 | 回到屏幕底部居中 |
-| 诊断信息… | 连接/丢帧/抓音频帧数/配音统计/最近日志，可一键复制 |
-| 退出 livedub | 停止采集与播放后退出 |
+| 退出 livedub（⌘Q） | 停止采集与播放后退出 |
+| 视觉：… | 只读：OCR/VLM 是否可用（来自 `/api/vision/health`） |
 
-浮层：译文大字（最多 2 行）+ 原文小字（1 行）+ 底行状态/延迟；无边框、半透明深色背景、置顶、
-`NSPanel(.nonactivatingPanel)` 不抢焦点；**整个浮层可拖动**，位置持久化；多桌面/全屏 App 上也能显示。
+> 点击穿透、字幕显示模式、字号、透明度、记笔记附截图 / OCR / VLM / 画面上下文等开关已统一移入
+> **设置窗口**（菜单「设置…」或 ⌘,）。
+
+浮层（v0.7）：品牌小标 + 状态 pill（圆点/状态/延迟/连接）+ 译文 22–26pt semibold + 原文 13–14pt 次级；
+无边框、20pt 圆角、材质模糊（系统降低透明度时降级纯色）、顶部 accent 呼吸线、柔和阴影、亮暗自适应；
+`NSPanel(.nonactivatingPanel)` 不抢焦点；**整个浮层可拖动**、位置持久化、多桌面/全屏 App 上可见；
+鼠标悬停显示微型工具条（暂停 / 记笔记 / 设置 / 关闭，28pt 命中区），点击穿透开启时不响应鼠标。
 
 ## 权限设置（第一次必做）
 
@@ -339,10 +339,71 @@ sleep 6 && node /tmp/mock-notes-engine.mjs
   资产文件会落在引擎的 `data/notes/assets/`（可定期清理）。
 - **权限**：复用「屏幕录制」权限（与音频捕获/⌥N 截图同一 TCC 授权，无需额外授权）。
 
+## v0.7 视觉重设计 / 设置窗口 / 菜单 / 可访问性
+
+按统一设计语言 [`docs/DESIGN.md`](../../docs/DESIGN.md)（jade/ink 色板、内容优先、短动效、可访问）重做桌面端 UI，
+不改变音频/字幕/笔记/画面上下文的任何主链路行为。
+
+### 浮层
+
+- **层级**：品牌小标 `livedub 同传` → 状态 pill（语义色圆点 + 状态 + 延迟 + 连接状态）→ 译文（22–26pt semibold，
+  `text-strong`）→ 原文（13–14pt，次级）→ accent 呼吸线 + 悬停工具条；说话/播放配音时显示「原声未压低」提示。
+- **材质**：`NSVisualEffectView(.hudWindow / behindWindow)` + 半透明 tint；系统「降低透明度」时自动降级纯色不透明；
+  亮暗外观自适应（语义色），20pt 圆角 + 柔和阴影。
+- **动效**：字幕淡入 180ms、工具条 160ms、toast 180ms；顶部 accent 线 2.4s 呼吸；系统「减少动态」时全部静止。
+- **交互**：整层拖动、点击穿透（设置项）、位置记忆/底部居中/顶部居中；悬停 0.6s 后隐藏工具条
+  （暂停/记笔记/设置/关闭，均为 28pt 命中区 + VoiceOver label）。
+- **toast**：图标 + 单行文案 + 语义色（成功 jade / 排队 amber / 失败 rose），3s 自动消失；
+  ⌥N 记笔记、画面上下文开始推送等反馈走同一组件。
+
+### 设置窗口（新增）
+
+菜单「设置…（⌘,）」打开独立 `NSWindow`（Esc 关闭），全部改动**即时生效并持久化**：
+
+| 分组 | 设置项 |
+|---|---|
+| 字幕 | 字号 22–26pt 滑杆；显示模式：双语 / 仅译文 / 仅原文 |
+| 浮层 | 宽度（自动随字号 / 480–1100pt）、位置（底部居中 / 顶部居中 / 记住上次）、不透明度 55%–100%、点击穿透 |
+| 音频 | 播放中文配音（并说明系统原声不会被自动压低） |
+| 笔记与视觉 | 记笔记附截图、OCR、VLM（慢 20–30s）、画面上下文（每 10s 推送） |
+| 引擎 | 引擎地址**只读**展示；屏幕录制权限设置、诊断信息入口 |
+| 底部 | 恢复默认（仅重置呈现相关项）、关闭 |
+
+<img src="screenshots/settings-window.png" width="420" alt="livedub 设置窗口">
+
+### 菜单栏
+
+分区：**状态摘要**（引擎 · 当前状态 · 延迟 · OCR/VLM · 画面上下文）→ **开始/停止、暂停/继续、记笔记 ⌥N**
+→ **设置… ⌘, / 打开笔记 / 打开工作台** → **显示/隐藏浮层 / 退出 ⌘Q**。
+全部使用 SF Symbol 图标并显示快捷键提示；状态摘要随引擎/延迟/视觉能力实时更新。
+
+### 可访问性
+
+- 悬停工具条与设置窗口所有控件均设置 VoiceOver label / tooltip；状态 pill 以「状态 + 延迟」文字读屏，
+  不只靠颜色（圆点 + 文字双表达）。
+- 命中区 ≥28pt（工具条按钮 28×28）；设置窗口按钮/滑杆为标准 macOS 控件，focus ring 可见，Esc 关闭。
+- `accessibilityDisplayShouldReduceMotion` → 关闭呼吸/淡入/工具条动画；
+  `accessibilityDisplayShouldReduceTransparency` → 浮层材质降级为纯色保证对比度。
+- 亮/暗外观使用语义色（`labelColor` / `secondaryLabelColor` / 系统 accent 语义），高对比模式下可读。
+
+### 截图（`--simulate` + screencapture）
+
+| 浮层（双语 / 状态 pill / 原文 / duck 提示） | 浮层 + toast | 设置窗口 |
+|---|---|---|
+| <img src="screenshots/overlay-bilingual.png" width="480"> | <img src="screenshots/overlay-toast.png" width="480"> | <img src="screenshots/settings-window.png" width="360"> |
+
+复现命令：
+
+```bash
+BIN=apps/macos/build/livedub.app/Contents/MacOS/livedub
+"$BIN" --simulate --demo-toast --duration 10 &   # 浮层 + toast
+"$BIN" --show-settings --duration 8 &            # 设置窗口
+```
+
 ## 自检 / 测试
 
 ```bash
-# 1) 编译 + 自检（228 项，退出码 0/1）
+# 1) 编译 + 自检（273 项，退出码 0/1）
 bash scripts/build-macos.sh --check
 
 # 2) 静态契约测试（默认跨平台、离线、不跑 swiftc —— CI 在 ubuntu 也能跑）
@@ -389,6 +450,15 @@ LIVEDUB_MACOS_BUILD=1 node --test tests/macos.test.mjs
 - [ ] **配音**：默认开启能听到中文配音；菜单关闭后立即静音（原声继续）
 - [ ] **浮层交互**：拖动位置 → 退出重开位置保持；开启点击穿透 → 可点击下层窗口且无法拖动；
       关闭后可拖动；「重置字幕位置」回到底部居中
+- [ ] **v0.7 浮层外观**：品牌小标 + 状态 pill（圆点颜色随状态）+ 24pt 译文 + 14pt 原文 + 顶部 accent 呼吸线；
+      亮色/暗色外观切换后文字与材质均清晰；系统「降低透明度」时变为纯色；「减少动态」时无呼吸/淡入动画
+- [ ] **悬停工具条**：鼠标移到浮层 → 右下角出现暂停/记笔记/设置/关闭按钮（28pt 命中区，hover 高亮）；
+      点暂停后引擎暂停、按钮变继续；点关闭隐藏浮层；开启点击穿透时工具条不响应
+- [ ] **v0.7 设置窗口**：菜单「设置…」或 ⌘, 打开；拖动字号/宽度/不透明度即时生效；
+      切换显示模式（双语/仅译文/仅原文）即时变化；点击穿透、附截图、OCR、VLM、画面上下文开关生效；
+      引擎地址只读；「恢复默认」恢复字号/宽度/透明度/模式；Esc 关闭
+- [ ] **v0.7 菜单栏**：状态摘要显示 引擎/状态/延迟/OCR/画面上下文；开始/停止、暂停/继续、记笔记 ⌥N、
+      设置 ⌘,、打开笔记/工作台、退出 ⌘Q 均有图标与快捷键提示
 - [ ] **字号**：增大/减小即时生效，重启后保持
 - [ ] **权限**：系统设置取消勾选 livedub → 开始同传 → 出现权限提示；重新授权后自动恢复捕获
 - [ ] **断线重连**：`kill` 引擎 → 状态重连；重启引擎 → 自动恢复（不重启 App）
@@ -472,6 +542,19 @@ LIVEDUB_MACOS_BUILD=1 node --test tests/macos.test.mjs
   App exit 0、主链路无阻塞；首次推送浮层 toast + 菜单状态 `画面上下文：开 · 最近 … · 上次 OCR 41 字`。
 - 自动化：`node --test tests/macos.test.mjs` 全绿（含 v0.6 静态契约断言）。
 
+### v0.7 验收记录（2026-10-30，Swift 5.10 / macOS 14.8.9 / Apple Silicon）
+
+- `bash scripts/build-macos.sh --check`：**self-test 273/273 通过**，退出码 0，0 warning；
+  可执行文件 1,002 KB，bundle 1.0 MB。
+- 截图（`--simulate --demo-toast` / `--show-settings` + `screencapture`，见上方截图表）：
+  `apps/macos/screenshots/overlay-bilingual.png`（双语 + 状态 pill + 原声提示）、
+  `apps/macos/screenshots/overlay-toast.png`（成功 toast + 播放配音状态）、
+  `apps/macos/screenshots/settings-window.png`（设置窗口全分组）。
+- 视觉验证点：品牌/状态 pill 不截断（「模拟演示 · 播放配音 · 2.3s」）、译文 24pt 层级清晰、
+  材质模糊 + 20pt 圆角 + accent 呼吸线可见、拖拽/点击穿透逻辑保留、
+  VoiceOver label 与 28pt 命中区在 self-test 中断言、reduceMotion/reduceTransparency 纯函数降级通过。
+- 自动化：`node --test tests/macos.test.mjs` 全绿（含 v0.7 静态契约断言）。
+
 ## 已知限制
 
 1. **系统音频不会自动静音 → 原声与中文配音同时存在。**
@@ -512,6 +595,13 @@ LIVEDUB_MACOS_BUILD=1 node --test tests/macos.test.mjs
 20. **隐私**：画面文字会作为翻译上下文发给翻译 provider（通常是云端 LLM），屏幕上的敏感信息（密码/聊天/合同）
     可能因此离开本机；涉及敏感内容请保持关闭。截图本身只存本机引擎 `data/notes/assets/`（会累积，可清理）。
 21. 画面上下文不排队：暂停/停止/断线期间的画面不会补发（引擎 TTL 120s，过期无意义）；恢复直播后从下一轮开始。
+22. 悬停工具条依赖鼠标：开启「点击穿透」后浮层不接收鼠标事件（工具条也不出现），请先用菜单操作；
+    触控板/无鼠标设备可用菜单栏「暂停同传」「记笔记」。
+23. 材质模糊由系统外观决定：系统「降低透明度」时浮层退化为纯色（保证可读性），不是 bug；
+    不支持自定义主题色（跟随系统 accent 与亮暗外观）。
+24. 设置窗口的 ⌘, 快捷键在菜单打开时生效（菜单栏 App 无全局设置快捷键）；
+    打字时不会误触（菜单快捷键仅在菜单内响应）。
+25. 平台限制：原声压低（ducking）仍不可用（系统音频不能被 App 静音），浮层仅显示「原声未压低」提示。
 
 ## 故障排查
 
@@ -533,6 +623,10 @@ LIVEDUB_MACOS_BUILD=1 node --test tests/macos.test.mjs
 | 画面上下文不推送 | 菜单开关是否开；是否正在直播且引擎已连接；暂停/停止时不推送；看日志 `[visual-context]` 跳过原因 |
 | 画面上下文提示重复跳过 | 正常：画面 10s 没变化时客户端去重，等画面变化后自动恢复推送 |
 | 开启后 CPU/耗电升高 | 每 10s 截屏+OCR 是预期成本；不需要时关闭开关，或把间隔调大（`defaults write` 8–15s） |
+| 浮层字体太小/太大 | 菜单「设置…」→ 字号 22–26pt；宽度选「自动」会随字号联动 |
+| 悬停工具条不出现 | 是否开启「点击穿透」（浮层忽略鼠标）；浮层是否被隐藏；用菜单操作替代 |
+| 亮色下浮层发灰/看不清 | 设置里提高不透明度；系统「降低透明度」会强制纯色；或切换系统亮暗后再看（自动适配） |
+| 设置改动没生效 | 设置窗口是即时生效的；确认改的是当前设备（不是远端引擎）；重启 App 后设置应保留 |
 | 笔记时间/标题怪 | `tMs` 是会话音频轴；标题由前台媒体 App/会话推导，可在工作台里改名/编辑 |
 | 编译报 SDK/availability 错 | 需要 macOS 14+ SDK；`swiftc --version` 应为 5.10+，`MACOS_TARGET` 默认 `<arch>-apple-macos14.0` |
 
@@ -553,6 +647,7 @@ LIVEDUB_MACOS_BUILD=1 node --test tests/macos.test.mjs
 - 线协议与事件字段：[`docs/CONTRACTS.md`](../../docs/CONTRACTS.md) §3；权威实现 [`engine/protocol.mjs`](../../engine/protocol.mjs)
 - 浏览器端：[`extension/README.md`](../../extension/README.md)；本地工作台：根目录 README
 - Notes API 契约与工作台笔记面板（T4）：`engine/server.mjs` 的 `/api/notes/*`、`studio/`（v0.4）
+- 设计规范：[`docs/DESIGN.md`](../../docs/DESIGN.md)（jade/ink 色板、组件、可访问性、三端布局）
 - 视觉端点（T4 契约）：`POST /api/vision/ocr`、`POST /api/vision/analyze?mode=ocr|vision|both`、
   `GET /api/vision/health`（v0.5，见 `engine/server.mjs` 与 `engine/vision/`）
 - 画面上下文 WS 事件（v0.6，Lead 契约）：`{"type":"visual-context","text","tMs","source":"macos","capturedAtMs"}`

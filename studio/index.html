@@ -94,6 +94,12 @@
       </div>
 
       <div class="topbar-actions">
+        <button id="btnCommands" class="btn btn-ghost cmd-trigger" type="button" title="命令面板（⌘K / Ctrl+K）" aria-label="打开命令面板" aria-keyshortcuts="Meta+K Control+K">
+          <svg class="icon"><use href="#i-search"/></svg><span>命令</span><kbd>⌘K</kbd>
+        </button>
+        <button id="btnHelpShortcuts" class="icon-btn" type="button" title="快捷键帮助（?）" aria-label="打开快捷键帮助" aria-keyshortcuts="Shift+Slash">
+          <svg class="icon"><use href="#i-keyboard"/></svg>
+        </button>
         <button id="btnNotes" class="btn btn-ghost notes-toggle" title="学习笔记（N）" aria-label="打开学习笔记" aria-expanded="false" aria-controls="notesDrawer">
           <svg class="icon"><use href="#i-note"/></svg><span>笔记</span>
           <i class="notes-count" id="notesCountBadge" hidden>0</i>
@@ -171,54 +177,36 @@
           <div class="drag-overlay" id="dragOverlay"><span>松开即可载入视频</span></div>
         </div>
 
-        <div class="controls card">
-          <div class="transport">
-            <button id="btnPlay" class="icon-btn icon-btn-lg" title="播放 / 暂停 (Space)" aria-label="播放或暂停" disabled>
-              <svg class="icon"><use href="#i-play"/></svg>
-            </button>
-            <button id="btnStopVideo" class="icon-btn" title="停止播放" aria-label="停止播放并回到开头" disabled>
-              <svg class="icon"><use href="#i-stop"/></svg>
-            </button>
-            <button id="btnPip" class="icon-btn" title="画中画（边看边写笔记）" aria-label="切换画中画" aria-pressed="false" disabled>
-              <svg class="icon"><use href="#i-pip"/></svg>
-            </button>
-            <span class="time" id="timeCurrent">00:00</span>
-            <input id="seek" class="seek" type="range" min="0" max="1000" step="1" value="0" aria-label="播放进度" disabled />
-            <span class="time dim" id="timeDuration">--:--</span>
-            <div class="volume">
-              <svg class="icon"><use href="#i-volume"/></svg>
-              <input id="volume" type="range" min="0" max="100" step="1" value="100" aria-label="原声音量" />
-            </div>
-            <div class="level-meter" id="levelMeter" title="采集输入电平"><i id="levelBar"></i></div>
-          </div>
-          <div class="control-actions">
-            <label class="btn btn-ghost btn-file" for="fileInput">
-              <svg class="icon"><use href="#i-folder"/></svg><span>本地视频</span>
-            </label>
-            <input id="fileInput" type="file" accept="video/*,audio/*" hidden />
-            <div class="url-loader">
-              <svg class="icon"><use href="#i-link"/></svg>
-              <input id="urlInput" type="url" placeholder="视频 / 音频 URL" spellcheck="false" />
-              <button id="btnLoadUrl" class="btn btn-ghost btn-sm">载入</button>
-            </div>
-            <span class="capture-hint" id="captureHint" hidden>
-              <svg class="icon"><use href="#i-alert"/></svg>
-              <span>检测不到音频：请确认视频没有静音、系统音量正常，或换一个带音轨的视频</span>
-            </span>
-            <span class="spacer"></span>
-            <label class="toggle" title="显示 / 隐藏双语字幕">
-              <input id="toggleSubs" type="checkbox" checked /><span>字幕</span>
-            </label>
-            <label class="toggle" title="播放引擎下发的配音">
-              <input id="toggleDub" type="checkbox" checked /><span>配音</span>
-            </label>
-            <label class="toggle" title="配音播放时自动压低原声">
-              <input id="toggleDuck" type="checkbox" checked /><span>压低原声</span>
-            </label>
-          </div>
-        </div>
 
-        <div class="transcript card">
+      </section>
+      <aside class="side-col dock" id="dock" aria-label="右侧 dock：字幕、笔记与设置">
+        <div class="dock-rail" role="tablist" aria-label="dock 面板切换">
+          <button id="dockTabSubtitles" class="dock-tab is-active" type="button" role="tab" aria-selected="true" aria-controls="dockPanelSubtitles" data-dock-tab="subtitles" title="字幕与历史（Alt+1）">
+            <svg class="icon"><use href="#i-subtitles"/></svg><span>字幕</span>
+          </button>
+          <button id="dockTabNotes" class="dock-tab" type="button" role="tab" aria-selected="false" aria-controls="dockPanelNotes" data-dock-tab="notes" title="学习笔记（N）">
+            <svg class="icon"><use href="#i-note"/></svg><span>笔记</span><i class="dock-dot" id="dockNotesDot" hidden></i>
+          </button>
+          <button id="dockTabSettings" class="dock-tab" type="button" role="tab" aria-selected="false" aria-controls="dockPanelSettings" data-dock-tab="settings" title="引擎与设置">
+            <svg class="icon"><use href="#i-settings"/></svg><span>设置</span>
+          </button>
+          <span class="spacer"></span>
+          <button id="btnDockCollapse" class="icon-btn dock-collapse" type="button" title="收起 / 展开右侧 dock" aria-label="收起或展开右侧 dock" aria-pressed="false">
+            <svg class="icon"><use href="#i-expand"/></svg>
+          </button>
+        </div>
+        <div class="dock-body">
+          <section class="dock-panel dock-panel-subtitles" id="dockPanelSubtitles" role="tabpanel" aria-labelledby="dockTabSubtitles">
+            <div class="subtitle-hero card" aria-live="polite">
+              <div class="subtitle-hero-head">
+                <span class="mini-label">当前句 · CURRENT</span>
+                <span class="spacer"></span>
+                <span class="subtitle-hero-time" id="subtitleHeroTime">00:00</span>
+              </div>
+              <div class="subtitle-hero-src" id="subtitleHeroSrc">等待字幕…</div>
+              <div class="subtitle-hero-dst" id="subtitleHeroDst">打开视频并开始同传后，这里显示实时双语字幕。</div>
+            </div>
+<div class="transcript card">
           <div class="card-head">
             <h2><svg class="icon"><use href="#i-subtitles"/></svg>实时字幕</h2>
             <span class="muted" id="transcriptCount">0 句</span>
@@ -234,9 +222,136 @@
             <div class="list-empty">开始播放视频并开启同传后，识别出的句子会出现在这里。</div>
           </div>
         </div>
+          </section>
+          <section class="dock-panel dock-panel-notes" id="dockPanelNotes" role="tabpanel" aria-labelledby="dockTabNotes" hidden>
+            <aside id="notesDrawer" class="notes-drawer" aria-label="学习笔记" aria-hidden="true">
+    <header class="notes-head">
+      <div class="notes-head-title">
+        <span class="notes-head-icon"><svg class="icon"><use href="#i-note"/></svg></span>
+        <div>
+          <strong>学习笔记</strong>
+          <span id="notesVideoTitle">未加载视频</span>
+        </div>
+      </div>
+      <span class="tag" id="notesCount">0 条</span>
+      <span class="spacer"></span>
+      <button id="btnNotesNew" class="btn btn-primary btn-sm" type="button" title="在当前时间点新建笔记（N）">
+        <svg class="icon"><use href="#i-plus"/></svg><span>新建</span>
+      </button>
+      <button id="btnNotesOutline" class="btn btn-ghost btn-sm" type="button" title="用本次会话字幕生成课程大纲">
+        <svg class="icon"><use href="#i-list"/></svg><span>大纲</span>
+      </button>
+      <button id="btnNotesVisual" class="btn btn-ghost btn-sm" type="button" title="抽取关键帧 + OCR/VLM 生成图文笔记（v0.5）" disabled>
+        <svg class="icon"><use href="#i-image"/></svg><span>图文笔记</span>
+      </button>
+      <details id="notesExportMenu" class="notes-export">
+        <summary class="btn btn-ghost btn-sm" title="导出 Markdown">
+          <svg class="icon"><use href="#i-download"/></svg><span>导出</span>
+        </summary>
+        <div class="notes-menu" role="menu">
+          <button type="button" data-export="copy" role="menuitem">复制 Markdown</button>
+          <button type="button" data-export="download" role="menuitem">下载 .md</button>
+          <button type="button" data-export="write" role="menuitem">写入 data/exports</button>
+          <button type="button" data-export="obsidian" role="menuitem">同步到 Obsidian</button>
+        </div>
+      </details>
+      <button id="btnNotesClose" class="icon-btn" type="button" title="关闭笔记面板（Esc）" aria-label="关闭学习笔记">
+        <svg class="icon"><use href="#i-close"/></svg>
+      </button>
+    </header>
+    <div id="notesOfflineBanner" class="notes-offline" hidden>
+      <svg class="icon"><use href="#i-alert"/></svg>
+      <span>引擎不可用：笔记暂存在浏览器 localStorage，不会丢失。</span>
+      <button id="btnNotesRetry" class="link" type="button">重试同步</button>
+    </div>
+    <div class="notes-toolbar">
+      <div class="notes-search">
+        <svg class="icon"><use href="#i-search"/></svg>
+        <input id="notesSearch" type="search" placeholder="搜索笔记正文 / 引用 / 标签…" aria-label="搜索笔记" spellcheck="false" />
+      </div>
+      <span class="spacer"></span>
+      <span id="notesSaveStatus" class="notes-status" aria-live="polite">—</span>
+    </div>
+    <div class="notes-obsidian" id="notesObsidianBar">
+      <span class="notes-obsidian-dot" id="obsidianDot" aria-hidden="true"></span>
+      <span id="obsidianStatusText" class="notes-obsidian-text">Obsidian：检测中…</span>
+      <span class="spacer"></span>
+      <button id="btnObsidianSync" class="btn btn-ghost btn-sm" type="button" title="把当前视频笔记同步到 Obsidian 目录（含截图与索引）" disabled>
+        <svg class="icon"><use href="#i-sync"/></svg><span>同步 Obsidian</span>
+      </button>
+    </div>
+    <div class="notes-context">
+      <label class="toggle notes-context-toggle" title="每 8-10s 取当前画面做 OCR，作为翻译的术语/语境参考（画面文字不会被翻译）；默认关闭">
+        <input id="toggleVisualContext" type="checkbox" />
+        <span>翻译参考画面文字（OCR）</span>
+      </label>
+      <span class="spacer"></span>
+      <span id="visualContextStatus" class="notes-context-status muted">画面上下文：已关闭</span>
+    </div>
+    <div class="notes-body">
+      <section class="notes-editor-pane" aria-label="笔记编辑器">
+        <div class="notes-tabs" role="tablist" aria-label="编辑或预览">
+          <button id="notesTabEdit" class="notes-tab" type="button" role="tab" aria-selected="true" data-tab="edit">编辑</button>
+          <button id="notesTabPreview" class="notes-tab" type="button" role="tab" aria-selected="false" data-tab="preview">预览</button>
+          <span class="spacer"></span>
+          <span id="notesNoteTime" class="notes-note-time">—</span>
+        </div>
+        <div class="notes-insertbar">
+          <button id="btnInsertQuote" class="btn btn-ghost btn-sm" type="button" title="插入当前双语字幕（含 quote）">
+            <svg class="icon"><use href="#i-subtitles"/></svg><span>当前句</span>
+          </button>
+          <button id="btnInsertTimestamp" class="btn btn-ghost btn-sm" type="button" title="插入当前时间戳锚点">
+            <svg class="icon"><use href="#i-clock"/></svg><span>时间戳</span>
+          </button>
+          <button id="btnInsertCode" class="btn btn-ghost btn-sm" type="button" title="插入代码块（Ctrl/Cmd+Shift+C）">
+            <svg class="icon"><use href="#i-code"/></svg><span>代码块</span>
+          </button>
+          <button id="btnInsertScreenshot" class="btn btn-ghost btn-sm" type="button" title="截取当前视频帧并保存到笔记">
+            <svg class="icon"><use href="#i-camera"/></svg><span>截图</span>
+          </button>
+          <button id="btnCaptureVisual" class="btn btn-ghost btn-sm" type="button" title="捕获当前画面：截图 + 本地 OCR + 当前双语字幕，插入笔记">
+            <svg class="icon"><use href="#i-sparkles"/></svg><span>捕获画面</span>
+          </button>
+          <span class="spacer"></span>
+          <label class="notes-tags">
+            <svg class="icon"><use href="#i-tag"/></svg>
+            <input id="notesTagsInput" type="text" placeholder="标签：ml, 优化" aria-label="笔记标签（逗号分隔）" spellcheck="false" />
+          </label>
+        </div>
+        <textarea id="notesEditor" class="notes-editor" spellcheck="false" aria-label="笔记 Markdown 编辑器" placeholder="用 Markdown 记录：&#10;# 本节要点&#10;- 反方向走一小步&#10;&#10;快捷键：Ctrl/Cmd+Enter 保存、Ctrl/Cmd+Shift+C 插入代码块"></textarea>
+        <div id="notesPreview" class="notes-preview markdown-body" role="tabpanel" hidden></div>
+        <div class="notes-editor-foot">
+          <span id="notesEditorHint">Markdown · 自动保存</span>
+          <span class="spacer"></span>
+          <span id="notesTagsValue">无标签</span>
+        </div>
       </section>
-
-      <aside class="side-col" aria-label="会话与引擎面板">
+      <section class="notes-list-pane" aria-label="笔记时间线">
+        <div class="notes-list-head">
+          <h3><svg class="icon"><use href="#i-list"/></svg>笔记时间线</h3>
+          <span id="notesListCount" class="muted">0 条</span>
+        </div>
+        <div class="notes-filters" id="notesFilters" role="group" aria-label="笔记过滤">
+          <button type="button" class="chip is-active" data-note-filter="all" aria-pressed="true">全部</button>
+          <button type="button" class="chip" data-note-filter="visual" aria-pressed="false">图文</button>
+          <button type="button" class="chip" data-note-filter="chapter" aria-pressed="false">章节</button>
+          <button type="button" class="chip" data-note-filter="overview" aria-pressed="false">总览</button>
+          <button type="button" class="chip" data-note-filter="quick" aria-pressed="false">快捷</button>
+        </div>
+        <div id="notesList" class="notes-list">
+          <div class="notes-empty">载入视频后按 <kbd>N</kbd> 新建第一条笔记</div>
+        </div>
+      </section>
+    </div>
+    <footer class="notes-foot">
+      <span>笔记只保存在本机 <code class="inline-code">data/notes/</code></span>
+      <span class="spacer"></span>
+      <span class="muted">N 新建 · Ctrl/Cmd+Enter 保存 · Esc 关闭</span>
+    </footer>
+  </aside>
+          </section>
+          <section class="dock-panel dock-panel-settings" id="dockPanelSettings" role="tabpanel" aria-labelledby="dockTabSettings" hidden>
+            <div class="dock-scroll">
         <section class="card panel conn-help" id="connHelp" hidden>
           <div class="card-head"><h2>引擎未连接</h2><span class="tag warn">离线</span></div>
           <p class="panel-hint">工作台需要本地引擎。请在项目根目录运行：</p>
@@ -408,8 +523,58 @@
             <div class="log-empty">等待连接本地引擎…</div>
           </div>
         </section>
+            </div>
+          </section>
+        </div>
       </aside>
     </main>
+
+        <div class="controls controlbar card" role="region" aria-label="统一播放与控制条">
+          <div class="transport">
+            <button id="btnPlay" class="icon-btn icon-btn-lg" title="播放 / 暂停 (Space)" aria-label="播放或暂停" disabled>
+              <svg class="icon"><use href="#i-play"/></svg>
+            </button>
+            <button id="btnStopVideo" class="icon-btn" title="停止播放" aria-label="停止播放并回到开头" disabled>
+              <svg class="icon"><use href="#i-stop"/></svg>
+            </button>
+            <button id="btnPip" class="icon-btn" title="画中画（边看边写笔记）" aria-label="切换画中画" aria-pressed="false" disabled>
+              <svg class="icon"><use href="#i-pip"/></svg>
+            </button>
+            <span class="time" id="timeCurrent">00:00</span>
+            <input id="seek" class="seek" type="range" min="0" max="1000" step="1" value="0" aria-label="播放进度" disabled />
+            <span class="time dim" id="timeDuration">--:--</span>
+            <div class="volume">
+              <svg class="icon"><use href="#i-volume"/></svg>
+              <input id="volume" type="range" min="0" max="100" step="1" value="100" aria-label="原声音量" />
+            </div>
+            <div class="level-meter" id="levelMeter" title="采集输入电平"><i id="levelBar"></i></div>
+          </div>
+          <div class="control-actions">
+            <label class="btn btn-ghost btn-file" for="fileInput">
+              <svg class="icon"><use href="#i-folder"/></svg><span>本地视频</span>
+            </label>
+            <input id="fileInput" type="file" accept="video/*,audio/*" hidden />
+            <div class="url-loader">
+              <svg class="icon"><use href="#i-link"/></svg>
+              <input id="urlInput" type="url" placeholder="视频 / 音频 URL" spellcheck="false" />
+              <button id="btnLoadUrl" class="btn btn-ghost btn-sm">载入</button>
+            </div>
+            <span class="capture-hint" id="captureHint" hidden>
+              <svg class="icon"><use href="#i-alert"/></svg>
+              <span>检测不到音频：请确认视频没有静音、系统音量正常，或换一个带音轨的视频</span>
+            </span>
+            <span class="spacer"></span>
+            <label class="toggle" title="显示 / 隐藏双语字幕">
+              <input id="toggleSubs" type="checkbox" checked /><span>字幕</span>
+            </label>
+            <label class="toggle" title="播放引擎下发的配音">
+              <input id="toggleDub" type="checkbox" checked /><span>配音</span>
+            </label>
+            <label class="toggle" title="配音播放时自动压低原声">
+              <input id="toggleDuck" type="checkbox" checked /><span>压低原声</span>
+            </label>
+          </div>
+        </div>
 
     <footer class="statusbar">
       <span class="status-brand"><i></i> local-first</span>
@@ -421,6 +586,32 @@
       <span class="status-item demo-tag" id="demoTag" hidden>演示回放</span>
       <span class="status-item privacy" id="footerPrivacy">音频不离开本机 · 字幕不写入磁盘</span>
     </footer>
+
+  </div>
+
+  <div id="commandPalette" class="overlay command-palette" hidden role="dialog" aria-modal="true" aria-label="命令面板">
+    <div class="command-box">
+      <div class="command-search">
+        <svg class="icon"><use href="#i-search"/></svg>
+        <input id="commandInput" type="text" placeholder="输入命令…（开始同传 / 打开笔记 / 生成图文笔记 / 切换主题）" aria-label="搜索命令" autocomplete="off" spellcheck="false" />
+        <kbd>Esc</kbd>
+      </div>
+      <div id="commandList" class="command-list" role="listbox" aria-label="命令列表"></div>
+      <footer class="command-foot"><span><kbd>↑</kbd><kbd>↓</kbd> 选择</span><span><kbd>Enter</kbd> 执行</span><span class="spacer"></span><span id="commandCount">0 条命令</span></footer>
+    </div>
+  </div>
+
+  <div id="shortcutHelp" class="overlay shortcut-help" hidden role="dialog" aria-modal="true" aria-label="快捷键帮助">
+    <div class="help-box">
+      <header class="help-head"><h2>快捷键</h2><span class="spacer"></span><button id="btnHelpClose" class="icon-btn" type="button" title="关闭（Esc）" aria-label="关闭快捷键帮助"><svg class="icon"><use href="#i-close"/></svg></button></header>
+      <div class="help-grid" id="helpGrid"></div>
+      <footer class="help-foot"><span>输入框内不触发单键快捷键；<kbd>⌘K</kbd> 随时打开命令面板。</span></footer>
+    </div>
+  </div>
+
+  <div id="imageLightbox" class="overlay lightbox" hidden role="dialog" aria-modal="true" aria-label="查看大图">
+    <button id="btnLightboxClose" class="icon-btn lightbox-close" type="button" title="关闭（Esc）" aria-label="关闭大图"><svg class="icon"><use href="#i-close"/></svg></button>
+    <img id="lightboxImage" alt="笔记大图" />
   </div>
 
   <div id="visualModal" class="visual-modal" hidden aria-hidden="true" role="dialog" aria-modal="true" aria-label="生成图文笔记">
@@ -464,6 +655,13 @@
           </label>
         </div>
         <div class="visual-plan" id="visualPlan">—</div>
+        <ol class="visual-steps" id="visualSteps" aria-label="生成步骤">
+          <li data-step="sample"><i></i><span>采样关键帧</span></li>
+          <li data-step="ocr"><i></i><span>本地 OCR</span></li>
+          <li data-step="vlm"><i></i><span>画面理解</span></li>
+          <li data-step="summary"><i></i><span>生成总结</span></li>
+          <li data-step="save"><i></i><span>保存笔记</span></li>
+        </ol>
         <div class="visual-progress" id="visualProgress" hidden>
           <div class="visual-progress-track"><i id="visualProgressBar"></i></div>
           <span id="visualProgressText">准备中…</span>
@@ -479,124 +677,6 @@
     </div>
   </div>
 
-  <aside id="notesDrawer" class="notes-drawer" aria-label="学习笔记" aria-hidden="true">
-    <header class="notes-head">
-      <div class="notes-head-title">
-        <span class="notes-head-icon"><svg class="icon"><use href="#i-note"/></svg></span>
-        <div>
-          <strong>学习笔记</strong>
-          <span id="notesVideoTitle">未加载视频</span>
-        </div>
-      </div>
-      <span class="tag" id="notesCount">0 条</span>
-      <span class="spacer"></span>
-      <button id="btnNotesNew" class="btn btn-primary btn-sm" type="button" title="在当前时间点新建笔记（N）">
-        <svg class="icon"><use href="#i-plus"/></svg><span>新建</span>
-      </button>
-      <button id="btnNotesOutline" class="btn btn-ghost btn-sm" type="button" title="用本次会话字幕生成课程大纲">
-        <svg class="icon"><use href="#i-list"/></svg><span>大纲</span>
-      </button>
-      <button id="btnNotesVisual" class="btn btn-ghost btn-sm" type="button" title="抽取关键帧 + OCR/VLM 生成图文笔记（v0.5）" disabled>
-        <svg class="icon"><use href="#i-image"/></svg><span>图文笔记</span>
-      </button>
-      <details id="notesExportMenu" class="notes-export">
-        <summary class="btn btn-ghost btn-sm" title="导出 Markdown">
-          <svg class="icon"><use href="#i-download"/></svg><span>导出</span>
-        </summary>
-        <div class="notes-menu" role="menu">
-          <button type="button" data-export="copy" role="menuitem">复制 Markdown</button>
-          <button type="button" data-export="download" role="menuitem">下载 .md</button>
-          <button type="button" data-export="write" role="menuitem">写入 data/exports</button>
-          <button type="button" data-export="obsidian" role="menuitem">同步到 Obsidian</button>
-        </div>
-      </details>
-      <button id="btnNotesClose" class="icon-btn" type="button" title="关闭笔记面板（Esc）" aria-label="关闭学习笔记">
-        <svg class="icon"><use href="#i-close"/></svg>
-      </button>
-    </header>
-    <div id="notesOfflineBanner" class="notes-offline" hidden>
-      <svg class="icon"><use href="#i-alert"/></svg>
-      <span>引擎不可用：笔记暂存在浏览器 localStorage，不会丢失。</span>
-      <button id="btnNotesRetry" class="link" type="button">重试同步</button>
-    </div>
-    <div class="notes-toolbar">
-      <div class="notes-search">
-        <svg class="icon"><use href="#i-search"/></svg>
-        <input id="notesSearch" type="search" placeholder="搜索笔记正文 / 引用 / 标签…" aria-label="搜索笔记" spellcheck="false" />
-      </div>
-      <span class="spacer"></span>
-      <span id="notesSaveStatus" class="notes-status" aria-live="polite">—</span>
-    </div>
-    <div class="notes-obsidian" id="notesObsidianBar">
-      <span class="notes-obsidian-dot" id="obsidianDot" aria-hidden="true"></span>
-      <span id="obsidianStatusText" class="notes-obsidian-text">Obsidian：检测中…</span>
-      <span class="spacer"></span>
-      <button id="btnObsidianSync" class="btn btn-ghost btn-sm" type="button" title="把当前视频笔记同步到 Obsidian 目录（含截图与索引）" disabled>
-        <svg class="icon"><use href="#i-sync"/></svg><span>同步 Obsidian</span>
-      </button>
-    </div>
-    <div class="notes-context">
-      <label class="toggle notes-context-toggle" title="每 8-10s 取当前画面做 OCR，作为翻译的术语/语境参考（画面文字不会被翻译）；默认关闭">
-        <input id="toggleVisualContext" type="checkbox" />
-        <span>翻译参考画面文字（OCR）</span>
-      </label>
-      <span class="spacer"></span>
-      <span id="visualContextStatus" class="notes-context-status muted">画面上下文：已关闭</span>
-    </div>
-    <div class="notes-body">
-      <section class="notes-editor-pane" aria-label="笔记编辑器">
-        <div class="notes-tabs" role="tablist" aria-label="编辑或预览">
-          <button id="notesTabEdit" class="notes-tab" type="button" role="tab" aria-selected="true" data-tab="edit">编辑</button>
-          <button id="notesTabPreview" class="notes-tab" type="button" role="tab" aria-selected="false" data-tab="preview">预览</button>
-          <span class="spacer"></span>
-          <span id="notesNoteTime" class="notes-note-time">—</span>
-        </div>
-        <div class="notes-insertbar">
-          <button id="btnInsertQuote" class="btn btn-ghost btn-sm" type="button" title="插入当前双语字幕（含 quote）">
-            <svg class="icon"><use href="#i-subtitles"/></svg><span>当前句</span>
-          </button>
-          <button id="btnInsertTimestamp" class="btn btn-ghost btn-sm" type="button" title="插入当前时间戳锚点">
-            <svg class="icon"><use href="#i-clock"/></svg><span>时间戳</span>
-          </button>
-          <button id="btnInsertCode" class="btn btn-ghost btn-sm" type="button" title="插入代码块（Ctrl/Cmd+Shift+C）">
-            <svg class="icon"><use href="#i-code"/></svg><span>代码块</span>
-          </button>
-          <button id="btnInsertScreenshot" class="btn btn-ghost btn-sm" type="button" title="截取当前视频帧并保存到笔记">
-            <svg class="icon"><use href="#i-camera"/></svg><span>截图</span>
-          </button>
-          <button id="btnCaptureVisual" class="btn btn-ghost btn-sm" type="button" title="捕获当前画面：截图 + 本地 OCR + 当前双语字幕，插入笔记">
-            <svg class="icon"><use href="#i-sparkles"/></svg><span>捕获画面</span>
-          </button>
-          <span class="spacer"></span>
-          <label class="notes-tags">
-            <svg class="icon"><use href="#i-tag"/></svg>
-            <input id="notesTagsInput" type="text" placeholder="标签：ml, 优化" aria-label="笔记标签（逗号分隔）" spellcheck="false" />
-          </label>
-        </div>
-        <textarea id="notesEditor" class="notes-editor" spellcheck="false" aria-label="笔记 Markdown 编辑器" placeholder="用 Markdown 记录：&#10;# 本节要点&#10;- 反方向走一小步&#10;&#10;快捷键：Ctrl/Cmd+Enter 保存、Ctrl/Cmd+Shift+C 插入代码块"></textarea>
-        <div id="notesPreview" class="notes-preview markdown-body" role="tabpanel" hidden></div>
-        <div class="notes-editor-foot">
-          <span id="notesEditorHint">Markdown · 自动保存</span>
-          <span class="spacer"></span>
-          <span id="notesTagsValue">无标签</span>
-        </div>
-      </section>
-      <section class="notes-list-pane" aria-label="笔记时间线">
-        <div class="notes-list-head">
-          <h3><svg class="icon"><use href="#i-list"/></svg>笔记时间线</h3>
-          <span id="notesListCount" class="muted">0 条</span>
-        </div>
-        <div id="notesList" class="notes-list">
-          <div class="notes-empty">载入视频后按 <kbd>N</kbd> 新建第一条笔记</div>
-        </div>
-      </section>
-    </div>
-    <footer class="notes-foot">
-      <span>笔记只保存在本机 <code class="inline-code">data/notes/</code></span>
-      <span class="spacer"></span>
-      <span class="muted">N 新建 · Ctrl/Cmd+Enter 保存 · Esc 关闭</span>
-    </footer>
-  </aside>
 
   <button id="btnSubsOnlyExit" class="float-btn" type="button" hidden>退出仅字幕 <kbd>Esc</kbd></button>
   <button id="btnPanelsShow" class="float-btn" type="button" hidden>显示面板 <kbd>Esc</kbd></button>

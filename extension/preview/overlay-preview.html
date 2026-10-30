@@ -1,0 +1,169 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <title>livedub 字幕浮层 / 快捷面板预览（CS231n Lecture 1）</title>
+    <style>
+      :root { color-scheme: dark; }
+      * { box-sizing: border-box; }
+      html, body { margin: 0; height: 100%; }
+      body {
+        background: #0b1220;
+        color: #e6edf7;
+        font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", "Microsoft YaHei", sans-serif;
+        overflow: hidden;
+      }
+      .lecture {
+        position: fixed; inset: 0;
+        background:
+          radial-gradient(1200px 600px at 18% -10%, rgba(45, 212, 191, 0.16), transparent 60%),
+          radial-gradient(900px 500px at 110% 110%, rgba(96, 165, 250, 0.14), transparent 60%),
+          linear-gradient(160deg, #0a1520 0%, #0b1220 45%, #101a2c 100%);
+        padding: 56px 72px;
+      }
+      .brand { display: flex; align-items: center; gap: 12px; color: #8fa3bd; font-size: 14px; }
+      .brand b { color: #2dd4bf; letter-spacing: 0.4px; }
+      h1 { font-size: 44px; margin: 36px 0 8px; letter-spacing: -0.5px; }
+      .subtitle-line { color: #9fb3c8; font-size: 18px; margin-bottom: 34px; }
+      .grid { display: grid; grid-template-columns: 1.1fr 0.9fr; gap: 28px; max-width: 1100px; }
+      .slide {
+        border-radius: 18px; padding: 26px 28px;
+        background: rgba(255, 255, 255, 0.045);
+        border: 1px solid rgba(255, 255, 255, 0.12);
+        box-shadow: 0 24px 60px rgba(0, 0, 0, 0.35);
+        font-size: 17px; line-height: 1.8; color: #cfe0f2;
+      }
+      .slide h2 { font-size: 20px; color: #eaf3ff; margin: 0 0 12px; }
+      .slide code { color: #7fe3d3; font-family: ui-monospace, Menlo, monospace; }
+      .slide .formula {
+        margin-top: 14px; padding: 12px 16px; border-radius: 12px;
+        background: rgba(45, 212, 191, 0.1); border: 1px solid rgba(45, 212, 191, 0.22);
+        font-family: ui-monospace, Menlo, monospace; font-size: 15px; color: #b9f3ea;
+      }
+      .meta { color: #7f96b3; font-size: 13px; margin-top: 22px; }
+      .dots { display: flex; gap: 6px; margin-top: 18px; }
+      .dots span { width: 7px; height: 7px; border-radius: 50%; background: rgba(255, 255, 255, 0.22); }
+      .dots span:first-child { background: #2dd4bf; }
+      video { position: absolute; width: 1px; height: 1px; opacity: 0; }
+    </style>
+  </head>
+  <body>
+    <div class="lecture">
+      <div class="brand"><b>livedub</b> · 本地实时同传 · CS231n Lecture 1</div>
+      <h1>Gradient Descent</h1>
+      <div class="subtitle-line">CS231n: Deep Learning for Computer Vision · Lecture 1 · 00:02:10</div>
+      <div class="grid">
+        <div class="slide">
+          <h2>Optimization: the core loop</h2>
+          <p>梯度下降是一种<strong>一阶迭代优化算法</strong>：沿着损失函数的负梯度方向更新参数。</p>
+          <div class="formula">θ ← θ − η · ∇<sub>θ</sub>L(θ)</div>
+          <div class="meta">η = learning rate · L = loss function · ∇ = gradient</div>
+        </div>
+        <div class="slide">
+          <h2>Key intuition</h2>
+          <p>从任意初始化点出发，重复「计算梯度 → 沿负方向走一小步」，最终到达局部极小值。</p>
+          <div class="dots"><span></span><span></span><span></span></div>
+        </div>
+      </div>
+      <video playsinline muted></video>
+    </div>
+
+    <script>
+      // ---- 预览配置（必须在 chrome-stub.js 之前）----
+      window.__livedubPreviewSettings = {
+        engineUrl: 'ws://127.0.0.1:8787/ws',
+        voiceMode: 'clone-first',
+        dubEnabled: true,
+        duckRatio: 0.18,
+        showOriginal: true,
+        fontSize: 22,
+        dock: 'bottom',
+        offsetY: 0,
+        dx: 0,
+        subsOpacity: 0.82,
+        subsBg: 'dark',
+        subsDensity: 'auto',
+        captureReplay: true,
+        globalDuck: true,
+        duckRecoverMs: 800,
+        fullscreenWorkaround: true,
+        noteScreenshot: true,
+        visionOcr: true,
+        visionCaption: false,
+        panelCollapsed: false,
+        hidden: false,
+        panelPos: null,
+        langFrom: 'en',
+        langTo: 'zh',
+      };
+      window.__livedubPreviewState = {
+        phase: 'running',
+        connection: 'open',
+        engineState: 'speaking',
+        engineUrl: 'ws://127.0.0.1:8787/ws',
+        tabId: 1,
+        tabTitle: 'CS231n Lecture 1 · 梯度下降',
+        session: { title: 'CS231n Lecture 1', url: 'https://example.com/lecture', langFrom: 'en', langTo: 'zh' },
+        startedAt: Date.now() - 130000,
+        captionCount: 12,
+        ready: {
+          protocol: 1,
+          providers: { asr: 'whisper-local', translate: 'deepseek', tts: 'minimax' },
+          voice: { mode: 'preset', voiceId: 'male-qn-qingse' },
+        },
+        voice: { mode: 'preset', voiceId: 'male-qn-qingse', degraded: false },
+        metrics: { id: 3, asrFinalMs: 240, mtFirstMs: 900, mtDoneMs: 1100, ttsFirstMs: 380, e2eLagMs: 1650 },
+        latencyMs: 1650,
+        noteStats: { date: '2026-10-30', count: 3 },
+        noteQueueCount: 1,
+        lastNote: { at: Date.now() - 4000, tMs: 130000, queued: false, text: '梯度下降是一种优化算法', vision: { ocr: true } },
+        visionHealth: { available: true, ocr: true, vision: true, ocrLabel: 'OCR macos-vision', visionLabel: 'VLM ark-plan' },
+        error: null,
+        notice: '',
+      };
+      window.__livedubPreviewHandleMessage = (message) => ({
+        ok: true,
+        state: window.__livedubPreviewState,
+        settings: window.__livedubPreviewSettings,
+        srt: '1\n00:00:00,000 --> 00:00:02,400\nGradient descent\n梯度下降\n',
+        filename: 'livedub-preview.srt',
+        count: 12,
+        path: 'data/exports/preview.md',
+        toast: '已记笔记 @ 02:10',
+      });
+    </script>
+    <script src="chrome-stub.js"></script>
+    <script src="../content.js"></script>
+    <script>
+      // 模拟 background 广播：状态 + 字幕事件 + 笔记结果/toast 堆叠，并打开面板到「笔记」tab
+      const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+      async function runPreview() {
+        await sleep(500);
+        const dispatch = (message) => window.__livedubPreview.dispatch(message);
+        dispatch({ type: 'livedub:state', state: window.__livedubPreviewState, settings: window.__livedubPreviewSettings });
+        dispatch({ type: 'livedub:event', event: { type: 'partial', id: 'seg-1', text: 'Gradient descent is a first-order iterative optimization algorithm' } });
+        dispatch({ type: 'livedub:event', event: { type: 'segment', id: 'seg-1', t0Ms: 128000, t1Ms: 133000, text: 'Gradient descent is a first-order iterative optimization algorithm' } });
+        await sleep(160);
+        dispatch({ type: 'livedub:event', event: { type: 'translation', id: 'seg-1', text: '梯度下降是一种一阶迭代优化算法', final: true } });
+        dispatch({ type: 'livedub:event', event: { type: 'status', state: 'speaking' } });
+        dispatch({ type: 'livedub:event', event: { type: 'metrics', id: 'seg-1', asrFinalMs: 240, mtFirstMs: 900, mtDoneMs: 1100, ttsFirstMs: 380, e2eLagMs: 1650 } });
+        // 默认打开面板并切到「笔记」tab；?panel=0 只看字幕浮层
+        const params = new URLSearchParams(location.search);
+        if (params.get('panel') === '0') return;
+        const host = document.getElementById('livedub-overlay-host');
+        const shadow = host && host.shadowRoot;
+        if (shadow) {
+          const capsule = shadow.querySelector('[data-part="capsule"]');
+          if (capsule) capsule.click();
+          const notesTab = shadow.querySelector('[data-act="tab"][data-tab="notes"]');
+          if (notesTab) notesTab.click();
+          // toast 堆叠示范（成功 + 排队 + 失败）
+          dispatch({ type: 'livedub:note-result', result: { ok: true, toast: '已记笔记 @ 02:10（含画面文字）', vision: { ocr: true } } });
+          dispatch({ type: 'livedub:note-result', result: { ok: true, queued: true, toast: '引擎未连接，已排队（2）@ 02:12' } });
+          dispatch({ type: 'livedub:note-result', result: { ok: true, imageSkipped: true, toast: '截图失败，已存无图笔记' } });
+        }
+      }
+      runPreview();
+    </script>
+  </body>
+</html>

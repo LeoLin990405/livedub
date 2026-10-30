@@ -33,6 +33,11 @@ final class Settings {
         static let notesVision = prefix + "notesVision"
         static let visualContextEnabled = prefix + "visualContextEnabled"
         static let visualContextInterval = prefix + "visualContextInterval"
+        // v0.7 视觉设置
+        static let captionMode = prefix + "captionMode"
+        static let overlayWidth = prefix + "overlayWidth"
+        static let overlayOpacity = prefix + "overlayOpacity"
+        static let positionMode = prefix + "positionMode"
     }
 
     init(defaults: UserDefaults = .standard) {
@@ -85,14 +90,65 @@ final class Settings {
 
     // MARK: - 浮层
 
-    /// 译文字号（pt），11...40
+    /// 译文字号（pt），22...26，默认 24（v0.7 设计规范；旧值自动钳制迁移）
     var fontSize: Double {
         get {
             let stored = defaults.double(forKey: Key.fontSize)
-            guard stored > 0 else { return 20 }
-            return min(40, max(11, stored))
+            guard stored > 0 else { return OverlayDesign.translationDefault }
+            return OverlayDesign.clampTranslationFont(stored)
         }
-        set { defaults.set(min(40, max(11, newValue)), forKey: Key.fontSize) }
+        set { defaults.set(OverlayDesign.clampTranslationFont(newValue), forKey: Key.fontSize) }
+    }
+
+    /// 字幕显示模式：双语 / 仅译文 / 仅原文
+    var captionMode: CaptionMode {
+        get {
+            if let raw = defaults.string(forKey: Key.captionMode) {
+                return CaptionMode.fromRaw(raw)
+            }
+            // 兼容 v0.6 的 showSourceLine 开关
+            return showSourceLine ? .bilingual : .translationOnly
+        }
+        set {
+            defaults.set(newValue.rawValue, forKey: Key.captionMode)
+            defaults.set(newValue.showsSource, forKey: Key.showSourceLine)
+        }
+    }
+
+    /// 浮层宽度：0 = 自动（随字号 680/760/840），否则 480...1100
+    var overlayWidth: Double {
+        get { OverlayDesign.clampOverlayWidth(defaults.double(forKey: Key.overlayWidth)) }
+        set { defaults.set(OverlayDesign.clampOverlayWidth(newValue), forKey: Key.overlayWidth) }
+    }
+
+    /// 浮层背景不透明度：0.55...1.0，默认 0.92
+    var overlayOpacity: Double {
+        get {
+            guard defaults.object(forKey: Key.overlayOpacity) != nil else {
+                return OverlayDesign.opacityDefault
+            }
+            return OverlayDesign.clampOpacity(defaults.double(forKey: Key.overlayOpacity))
+        }
+        set { defaults.set(OverlayDesign.clampOpacity(newValue), forKey: Key.overlayOpacity) }
+    }
+
+    /// 浮层位置：底部居中 / 顶部居中 / 记住上次位置
+    var positionMode: OverlayPositionMode {
+        get { OverlayPositionMode.fromRaw(defaults.string(forKey: Key.positionMode)) }
+        set { defaults.set(newValue.rawValue, forKey: Key.positionMode) }
+    }
+
+    /// 设置窗口「恢复默认」：只重置外观/字幕呈现相关项（引擎/笔记/视觉能力保持不变）
+    func resetPresentationDefaults() {
+        defaults.removeObject(forKey: Key.fontSize)
+        defaults.removeObject(forKey: Key.captionMode)
+        defaults.removeObject(forKey: Key.overlayWidth)
+        defaults.removeObject(forKey: Key.overlayOpacity)
+        defaults.removeObject(forKey: Key.positionMode)
+        defaults.removeObject(forKey: Key.clickThrough)
+        defaults.set(true, forKey: Key.showSourceLine)
+        defaults.set(OverlayDesign.translationDefault, forKey: Key.fontSize)
+        defaults.set(OverlayDesign.opacityDefault, forKey: Key.overlayOpacity)
     }
 
     var clickThrough: Bool {

@@ -65,6 +65,21 @@ v0.5 迭代（快捷笔记加入画面理解）：
   <VLM 对幻灯片/代码/图表的描述>
   ```
 
+v0.7 迭代（UI 设计优化，jade/teal 学术工具风）：
+- **字幕浮层重设计**：顶部 accent 进度线（说话时高亮，按字幕时长自动走完）、状态 pill
+  （识别中/翻译中/播放中/错误 + 延迟）、译文大字（20–24px 半粗）+ 原文次级（13–14px）、右上角时间码、
+  原声 duck 指示（「原声已压低」）、拖动把手、玻璃质感（`backdrop-filter` 不支持时降级纯色）、
+  宽/紧凑两档（视口 <760px 自动紧凑，也可面板强制）、`prefers-reduced-motion` 降级动效；
+- **快捷面板重设计**：字幕 / 笔记 / 设置三个 tab（aria tablist，方向键切换）、开关 + 分段控件 + 图标按钮
+  （tooltip + aria-label）、设置分组（字幕样式 / 字幕背景 / 快捷笔记 / 配音与原声 / 高级）、
+  「记笔记」按钮带进度态（识别画面文字中… / 已记录 @ mm:ss / 已排队）、统一空态/离线/错误引导卡
+  （`npm start` 一键复制）；Esc 关闭面板；命中区 ≥32px；tab 内容与键盘焦点可见；
+- **popup 重设计**：品牌头 + 引擎状态 pill、主操作卡（开始/停止）、延迟 4 格、笔记卡（今日/待同步/画面能力/
+  记当前句/快捷 grid：笔记库·导出·浮层·工作台/截图与 OCR 开关）、引擎与音色卡、footer（版本 + 快捷键）、
+  亮暗自适应与 focus-visible；
+- **toast 堆叠**：最多 3 条、成功/排队/失败色调、可关闭、loading spinner；按钮 loading/disabled 态；
+- 亮暗自适应：`prefers-color-scheme` 自动切换玻璃底色与 ink 颜色；`prefers-reduced-motion` 关闭过渡/进度动画。
+
 > 协议、时间轴、事件定义见 `docs/CONTRACTS.md` §3；引擎入口 `engine/server.mjs`。
 > 本目录零 npm 依赖、无远程代码 / CDN / 内联脚本，所有资源随扩展本地打包。
 
@@ -83,8 +98,10 @@ extension/
 │   ├── pcm.js             # 纯函数：PCM 编解码、重采样、base64、hello、文本清洗、duck 状态机、dub 排期
 │   ├── ui.js              # v0.2/v0.3 纯函数：全屏宿主/包裹决策、字幕停靠/避让、原声总线增益
 │   ├── srt.js             # v0.2 纯函数：caption -> SRT（时间戳/双语/文件名）
-│   └── notes.js           # v0.4/v0.5 纯函数：videoId/quick note markdown/离线队列/今日计数/
-│                          #   OCR 代码块（围栏自适应）/画面理解/视觉健康解析
+│   ├── notes.js           # v0.4/v0.5 纯函数：videoId/quick note markdown/离线队列/今日计数/
+│   │                      #   OCR 代码块（围栏自适应）/画面理解/视觉健康解析
+│   └── overlay.js         # v0.7 UI 纯函数：tab/状态 pill/密度/进度线/toast 堆叠/笔记按钮状态/引导卡
+└── preview/               # v0.7 离线 UI 预览（chrome stub，不参与 manifest/运行时；见下）
 ├── worklet/pcm-worklet.js # AudioWorklet：100ms 分片 + 兜底重采样到 16kHz + float32→s16
 └── README.md
 tests/extension.test.mjs   # manifest / 静态检查 / 纯函数单测（node --test）
@@ -231,6 +248,12 @@ offscreen: getUserMedia(tab) ─▶ 16k AudioContext + AudioWorklet（100ms）
 | 41 | popup 打开（引擎 v0.5 在线） | 「画面」行显示 `OCR macos-vision · VLM …已配置/未配置`；旧引擎显示「未检测到视觉接口（旧引擎）」 |
 | 42 | 开启「画面理解（VLM，慢）」后记笔记 | 等待 toast 提示 20-30s；完成后笔记追加 `**画面理解**：` 描述；关闭开关后恢复快速记录 |
 | 43 | 用旧版引擎（无 /api/vision/*）记笔记 | 视觉调用静默跳过（控制台无未捕获错误），笔记正常保存且无视觉段落 |
+| 44 | 看视频开始同传，观察字幕浮层 | 玻璃卡片 + 顶部 accent 进度线随每句字幕走完；状态 pill 显示识别中/翻译中/播放中 + 延迟；译文大字、原文次级、右上角时间码 |
+| 45 | 说话时观察浮层右侧 | 出现「原声已压低」胶囊（关闭原声重放时消失）；说话结束淡出 |
+| 46 | 点状态 pill 打开面板 → 依次切「字幕 / 笔记 / 设置」tab | tab 有 aria 状态、方向键可切换、内容分组清晰；拖动标题栏移动面板；Esc 关闭 |
+| 47 | 面板内点击「记笔记」并开启 OCR | 按钮变「识别画面文字中…」+ spinner，完成后变「已记录 @ mm:ss」；toast 堆叠可关闭 |
+| 48 | 系统切换深色/浅色外观（或浏览器 prefers-color-scheme） | 浮层面板/popup 玻璃底色、文字颜色自动适配，字幕在任意页面背景仍可读 |
+| 49 | 窗口缩窄到 <760px 或面板选「紧凑」 | 字幕切紧凑档（更小 padding/字号/隐藏时间码）；系统开启「减少动态效果」时过渡与进度动画消失 |
 
 ## 已知限制 / TODO
 
@@ -246,6 +269,8 @@ offscreen: getUserMedia(tab) ─▶ 16k AudioContext + AudioWorklet（100ms）
 - **画面理解（VLM）慢且消耗模型额度**：默认关闭；开启后每次记笔记多等约 20-30s（超时 45s 会降级为仅 OCR/无视觉），适合「停下来精读某一帧」而不是连续打点。
 - 视觉能力健康状态（popup「画面」行）来自 `GET /api/vision/health`，引擎未启动/旧版时显示不可用，不影响记笔记。
 - 快捷键是 **Chrome 命令**，只在浏览器窗口聚焦时触发（VSCode 等外部编辑器内无法直接触发 OS 级快捷键）；可切回浏览器按 `Alt+Shift+N`，或使用浮层/popup 按钮。
+- `extension/preview/**` 仅为离线 UI 预览 fixture（chrome stub + 假数据，manifest 不加载、运行时不会执行）；
+  安全扫描测试已显式排除该目录，打包时它只是静态资源，不影响扩展行为。
 - 截图是 `captureVisibleTab`（当前可见区域），会包含页面 UI/水印；受 DRM 保护页面可能黑屏或失败，失败自动降级无图。
 - **原生全屏的浏览器限制（v0.3 尽力解决）**：容器型全屏（YouTube/B 站）一直正常；裸 `<video>` 全屏通过
   page-hook 包裹容器解决，但以下情况会回退原生全屏（浮层不可见，并提示）：页面用非标准方式进入全屏
@@ -266,6 +291,40 @@ offscreen: getUserMedia(tab) ─▶ 16k AudioContext + AudioWorklet（100ms）
 - 极端长句会被字幕层折叠为最多 2 行（`maxCharsPerLine` 由引擎 subs 配置控制），超长内容以 … 截断。
 - service worker 被回收后，popup 首次打开可能需要 1 个消息往返恢复状态（<100ms），期间按钮短暂可用属正常。
 
+## UI 预览与截图（v0.7）
+
+`extension/preview/` 是**离线 UI 预览 fixture**（`manifest` 不加载、运行时不会执行；安全扫描测试显式排除）：
+
+- `preview/chrome-stub.js`：最小 `chrome` API stub（runtime 消息 / storage.local / tabs / tabCapture / offscreen），
+  预置演示状态与设置，让真实 `popup.js` / `content.js` 可直接在普通网页里运行；
+- `preview/popup-preview.html`：注入真实 `popup.html` 样式与 DOM 后加载真实 `popup.js`（运行中状态）；
+- `preview/overlay-preview.html`：本地讲座 fixture + 注入 `content.js`，模拟字幕/翻译/状态事件并打开
+  「笔记」tab、展示 toast 堆叠；`?panel=0` 只看字幕浮层；
+- `preview/popup-static-preview.html` / `preview/overlay-static-preview.html`：纯静态截图用页面
+  （真实 popup.html / OVERLAY_CSS / 面板 markup 的快照，无 JS 依赖）。
+
+本地查看：
+
+```bash
+cd livedub/extension
+python3 -m http.server 18790
+# 浏览器打开 http://127.0.0.1:18790/preview/overlay-preview.html
+#           http://127.0.0.1:18790/preview/popup-preview.html
+```
+
+截图（headless Chrome）：
+
+```bash
+"/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" --headless=new --no-sandbox \
+  --disable-gpu --disable-crashpad --disable-breakpad --hide-scrollbars \
+  --user-data-dir=/tmp/livedub-shot-profile --window-size=1440,900 \
+  --screenshot=preview/screenshots/overlay-panel.png --virtual-time-budget=4000 \
+  http://127.0.0.1:18790/preview/overlay-static-preview.html
+```
+
+> 本机沙箱里 Chrome headless 偶发卡在 updater/网络初始化（超时无输出），若截图失败属于环境限制；
+> 静态预览页面本身可用普通浏览器打开验证设计。`preview/screenshots/` 里保留了可用的截图（若生成成功）。
+
 ## 自动化测试
 
 ```bash
@@ -285,6 +344,8 @@ node --test tests/extension.test.mjs
 - `computeDubPlayhead`：dub 按 `startMs` 排期、落后立即播；
 - `lib/notes.js`（v0.4）：videoId 稳定/URL 规范化、quick note 请求体/Markdown、离线队列（入队/上限/flush 成功与失败/持久化）、今日计数、时间码、Notes API URL/响应解析；
 - `lib/notes.js`（v0.5）：画面文字清洗/2000 截断/反引号围栏自适应、画面理解段落、正文拼接（原文结构保留）、quick 文本兜底、OCR/analyze 响应解析、视觉 health 解析（含旧引擎降级）；
+- `lib/overlay.js`（v0.7）：tab 规范化/循环切换、字幕宽度档位、状态 pill 文案、duck 指示、引导卡模型、
+  reduced-motion/主题、字幕时长与进度线、笔记按钮状态、toast 堆叠、快捷操作/快捷键；
 - `page-hook.js`：MAIN world 猴补 `requestFullscreen`、裸 video 包裹/回滚、postMessage 协作协议；
 - content/background/offscreen/popup 的关键实现静态断言（user gesture、offscreen reasons、Shadow DOM、
   v0.3 原声总线 duck/恢复、全局限定压音让位、压音 800ms 等）。

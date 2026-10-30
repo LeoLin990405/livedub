@@ -11,7 +11,7 @@
 [![Node](https://img.shields.io/badge/node-%E2%89%A522-brightgreen.svg)](package.json)
 [![Zero dependencies](https://img.shields.io/badge/runtime%20deps-0-blue.svg)](package.json)
 
-![livedub studio](docs/assets/studio-asr-local.png)
+![livedub studio](docs/assets/ui-dark-home.png)
 
 ![macOS overlay](docs/assets/macos-app-overlay.png)
 
@@ -50,6 +50,16 @@ Measured on this machine (Apple M2 / 16GB, 52.7s demo lecture, real providers):
 | **End-to-end** (speech end → Chinese dub playable) | **~3.0s** default · **~2.4s** fast · **~2.2–2.4s** cloud |
 
 Full numbers: [docs/MEASUREMENTS.md](docs/MEASUREMENTS.md) (Chinese).
+
+## UI design (v0.7)
+
+One design language across the workbench, Chrome extension and macOS overlay: jade/ink palette,
+short motion (120–240ms, `prefers-reduced-motion` aware), visible focus rings, keyboard access.
+See [docs/DESIGN.md](docs/DESIGN.md).
+
+![workbench](docs/assets/ui-dark-home.png)
+![notes workspace](docs/assets/ui-notes-workspace.png)
+![command palette](docs/assets/ui-command-palette.png)
 
 ## Quick start
 

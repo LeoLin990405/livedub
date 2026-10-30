@@ -693,3 +693,50 @@ export function buildCourseOverviewMarkdown({ video = {}, chapters = [], generat
   lines.push('');
   return `${lines.join('\n').replace(/\n{3,}/g, '\n\n').trim()}\n`;
 }
+
+// ==================================================== v0.7 笔记过滤 / 分组
+
+/** 笔记过滤 chip：all | visual | chapter | overview | quick */
+export function matchesNoteFilter(note, filter = 'all') {
+  const value = String(filter ?? 'all');
+  const tags = Array.isArray(note?.tags) ? note.tags : [];
+  if (value === 'all') return true;
+  if (value === 'visual') return note?.kind === 'visual';
+  if (value === 'chapter') return note?.kind === 'visual' && tags.includes('章节');
+  if (value === 'overview') return note?.kind === 'outline' && tags.includes('课程总览');
+  if (value === 'quick') return note?.kind === 'quick';
+  return true;
+}
+
+/**
+ * 笔记工作区分组（课程总览 → 章节 → 其他图文 → 快捷 → 其他），空组不输出。
+ * 返回 [{id,title,notes}]，每组内按 tMs 升序。
+ */
+export function groupNotesForDisplay(notes, filter = 'all') {
+  const list = (Array.isArray(notes) ? notes : []).filter((note) => note && typeof note === 'object');
+  const groups = {
+    overview: { id: 'overview', title: '课程总览', notes: [] },
+    chapters: { id: 'chapters', title: '章节图文', notes: [] },
+    visual: { id: 'visual', title: '图文笔记', notes: [] },
+    quick: { id: 'quick', title: '快捷摘录', notes: [] },
+    notes: { id: 'notes', title: '其他笔记', notes: [] },
+  };
+  for (const note of list) {
+    if (!matchesNoteFilter(note, filter)) continue;
+    const tags = Array.isArray(note.tags) ? note.tags : [];
+    if (note.kind === 'outline' && tags.includes('课程总览')) groups.overview.notes.push(note);
+    else if (note.kind === 'visual' && tags.includes('章节')) groups.chapters.notes.push(note);
+    else if (note.kind === 'visual') groups.visual.notes.push(note);
+    else if (note.kind === 'quick') groups.quick.notes.push(note);
+    else groups.notes.notes.push(note);
+  }
+  const order = filter === 'all' ? ['overview', 'chapters', 'visual', 'quick', 'notes'] : Object.keys(groups).filter((key) => groups[key].notes.length > 0);
+  const result = [];
+  for (const key of order) {
+    const group = groups[key];
+    if (group.notes.length === 0) continue;
+    group.notes.sort((a, b) => (Number(a.tMs) || 0) - (Number(b.tMs) || 0));
+    result.push({ id: group.id, title: group.title, notes: group.notes });
+  }
+  return result;
+}

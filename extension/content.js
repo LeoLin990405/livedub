@@ -64,6 +64,7 @@
     dx: 0,
     subsOpacity: 0.82,
     subsBg: 'dark',
+    subsDensity: 'auto',
     captureReplay: true,
     globalDuck: true,
     duckRecoverMs: 800,
@@ -122,6 +123,13 @@
     /** v0.4：最近一句双语字幕缓存（停止抓音后记笔记仍可用） */
     lastCaption: null, // {src,dst,t0Ms,t1Ms,updatedAt}
     toastTimer: null,
+    /** v0.7 UI 状态：当前面板 tab / note 按钮状态 / toast 堆叠 */
+    activeTab: 'subtitles',
+    notePending: false,
+    toasts: [],
+    progressStartedAt: 0,
+    progressDurationMs: 0,
+    closedByUser: false,
   };
 
   const now = () => (typeof performance !== 'undefined' && performance.now ? performance.now() : Date.now());
@@ -153,6 +161,7 @@
     merged.dx = Math.round(clampNumber(dx, -OFFSET_X_LIMIT, OFFSET_X_LIMIT, 0));
     merged.dock = merged.dock === 'top' ? 'top' : 'bottom';
     merged.subsBg = ['dark', 'light', 'none'].includes(merged.subsBg) ? merged.subsBg : 'dark';
+    merged.subsDensity = ['auto', 'wide', 'compact'].includes(merged.subsDensity) ? merged.subsDensity : 'auto';
     merged.panelCollapsed = merged.panelCollapsed === true;
     merged.dubEnabled = merged.dubEnabled !== false;
     merged.showOriginal = merged.showOriginal !== false;
@@ -201,9 +210,46 @@
     applyOverlayVisibility();
     applySubsLayout();
     applyPanelPosition();
+    applyDensity();
     postPageHookConfig();
     renderSubtitles();
     renderMeta();
+  }
+
+  /** v0.7：字幕宽/紧凑两档（视口 < 760px 自动紧凑；可在面板强制） */
+  function applyDensity() {
+    const setting = runtime.settings.subsDensity || 'auto';
+    const width = typeof window !== 'undefined' ? window.innerWidth : 1920;
+    const density =
+      setting === 'compact' ? 'compact' : setting === 'wide' ? 'wide' : width && width < 760 ? 'compact' : 'wide';
+    if (runtime.els.root) runtime.els.root.setAttribute('data-density', density);
+  }
+
+  /** v0.7：同步 aria（switch/tab/tooltip），保持可访问性 */
+  function syncAriaState() {
+    const panel = runtime.els.panel;
+    if (!panel) return;
+    for (const input of panel.querySelectorAll('input[type="checkbox"][role="switch"]')) {
+      input.setAttribute('aria-checked', input.checked ? 'true' : 'false');
+    }
+    for (const tab of panel.querySelectorAll('[data-act="tab"]')) {
+      const id = tab.getAttribute('data-tab');
+      const selected = id === runtime.activeTab;
+      tab.setAttribute('aria-selected', selected ? 'true' : 'false');
+      tab.setAttribute('tabindex', selected ? '0' : '-1');
+    }
+    for (const tabpanel of panel.querySelectorAll('[data-panel-tab]')) {
+      tabpanel.hidden = tabpanel.getAttribute('data-panel-tab') !== runtime.activeTab;
+    }
+    if (runtime.els.capsule) runtime.els.capsule.setAttribute('aria-expanded', runtime.panelOpen ? 'true' : 'false');
+  }
+
+  /** v0.7：切换面板 tab */
+  function setActiveTab(tab) {
+    const allowed = ['subtitles', 'notes', 'settings'];
+    runtime.activeTab = allowed.includes(tab) ? tab : 'subtitles';
+    syncAriaState();
+    renderStatus();
   }
 
   // ---- v0.3：与 MAIN world page-hook.js 的协作 ----
@@ -259,14 +305,59 @@
       if (valueEl) valueEl.textContent = formatSettingValue(key, runtime.settings[key]);
     }
     for (const button of panel.querySelectorAll('[data-act^="dock-"]')) {
-      const active = button.getAttribute('data-act') === `dock-${runtime.settings.dock}`;
-      button.classList.toggle('active', active);
+      button.classList.toggle('active', button.getAttribute('data-act') === `dock-${runtime.settings.dock}`);
+    }
+    const density = runtime.settings.subsDensity || 'auto';
+    for (const button of panel.querySelectorAll('[data-act^="density-"]')) {
+      const value = button.getAttribute('data-act').replace('density-', '');
+      button.classList.toggle('active', density === value || (density === 'auto' && value === 'wide'));
     }
     if (runtime.els.panelBody) runtime.els.panelBody.hidden = runtime.settings.panelCollapsed;
     if (runtime.els.collapseButton) {
       runtime.els.collapseButton.textContent = runtime.settings.panelCollapsed ? '▸' : '▾';
       runtime.els.collapseButton.title = runtime.settings.panelCollapsed ? '展开设置' : '收起设置';
+      runtime.els.collapseButton.setAttribute('aria-expanded', runtime.settings.panelCollapsed ? 'true' : 'false');
     }
+    syncAriaState();
+    renderNoteSummary();
+    renderNoteButton();
+  }
+
+  /** v0.7：笔记卡摘要（今日/待同步） */
+  function renderNoteSummary() {
+    const el = runtime.els.noteSummary;
+    if (!el) return;
+    const stats = runtime.bgState && runtime.bgState.noteStats;
+    const today = stats && Number.isFinite(stats.count) ? stats.count : 0;
+    const queue = (runtime.bgState && runtime.bgState.noteQueueCount) || 0;
+    el.textContent = `今日 ${today} 条 · 待同步 ${queue}`;
+  }
+
+  /** v0.7：记笔记按钮进度/完成态（识别画面中 / 已记录 @ mm:ss / 已排队） */
+  function renderNoteButton() {
+    const button = runtime.els.noteButton;
+    if (!button) return;
+    const lastNote = runtime.bgState && runtime.bgState.lastNote;
+    const pending = runtime.notePending === true;
+    let label = '记笔记';
+    let state = 'idle';
+    if (pending) {
+      state = 'loading';
+      label = '识别画面文字中…';
+    } else if (lastNote && Number.isFinite(lastNote.at)) {
+      const timeMs = Number.isFinite(lastNote.tMs) ? Math.max(0, Math.round(lastNote.tMs)) : 0;
+      const total = Math.floor(timeMs / 1000);
+      const stamp = `${String(Math.floor(total / 60)).padStart(2, '0')}:${String(total % 60).padStart(2, '0')}`;
+      if (Date.now() - lastNote.at < 12_000) {
+        label = lastNote.queued ? `已排队 @ ${stamp}` : `已记录 @ ${stamp}`;
+        state = lastNote.queued ? 'queued' : 'done';
+      }
+    }
+    button.setAttribute('data-state', state);
+    button.setAttribute('aria-busy', pending ? 'true' : 'false');
+    button.disabled = pending;
+    if (pending) button.innerHTML = '<span class="spin" aria-hidden="true"></span>识别画面文字中…';
+    else button.textContent = label;
   }
 
   // -------------------------------------------------------------------------
@@ -278,161 +369,383 @@
     .livedub-root {
       position: fixed; inset: 0; pointer-events: none;
       font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
-      color: #fff;
+      color: var(--livedub-ink);
+      --livedub-accent: #2dd4bf;
+      --livedub-accent-strong: #14b8a6;
+      --livedub-accent-soft: rgba(45, 212, 191, 0.14);
+      --livedub-ink: #f2f7f6;
+      --livedub-ink-dim: #a9bcba;
+      --livedub-ink-mute: #7f9694;
+      --livedub-glass: rgba(12, 20, 20, 0.76);
+      --livedub-glass-strong: rgba(10, 17, 17, 0.92);
+      --livedub-glass-border: rgba(255, 255, 255, 0.12);
+      --livedub-shadow: 0 10px 34px rgba(0, 0, 0, 0.42);
+      --livedub-danger: #fb7185;
+      --livedub-warn: #fbbf24;
+      --livedub-radius: 16px;
+      --livedub-radius-sm: 12px;
+      --livedub-dur: 170ms;
     }
+    @media (prefers-color-scheme: light) {
+      .livedub-root {
+        --livedub-ink: #12201f;
+        --livedub-ink-dim: #43595a;
+        --livedub-ink-mute: #67807f;
+        --livedub-glass: rgba(250, 253, 252, 0.88);
+        --livedub-glass-strong: rgba(252, 255, 254, 0.96);
+        --livedub-glass-border: rgba(15, 40, 38, 0.12);
+        --livedub-shadow: 0 10px 30px rgba(15, 40, 38, 0.16);
+        --livedub-accent-soft: rgba(20, 184, 166, 0.12);
+      }
+    }
+    @media (prefers-reduced-motion: reduce) {
+      .livedub-root * { transition: none !important; animation: none !important; }
+    }
+    .livedub-glass {
+      background: var(--livedub-glass);
+      border: 1px solid var(--livedub-glass-border);
+      box-shadow: var(--livedub-shadow);
+      -webkit-backdrop-filter: blur(14px) saturate(1.2);
+      backdrop-filter: blur(14px) saturate(1.2);
+    }
+    @supports not ((backdrop-filter: blur(1px)) or (-webkit-backdrop-filter: blur(1px))) {
+      .livedub-glass { background: var(--livedub-glass-strong); }
+    }
+    /* ---------- 状态 pill ---------- */
     .livedub-capsule {
       position: fixed; top: 14px; right: 14px;
-      display: flex; align-items: center; gap: 8px;
-      padding: 7px 12px; border-radius: 999px;
-      background: rgba(14, 16, 24, 0.78);
-      border: 1px solid rgba(255, 255, 255, 0.14);
-      box-shadow: 0 4px 18px rgba(0, 0, 0, 0.35);
-      backdrop-filter: blur(8px);
-      font-size: 13px; line-height: 1; cursor: pointer;
+      display: inline-flex; align-items: center; gap: 8px;
+      min-height: 32px; padding: 6px 12px; border-radius: 999px;
+      background: var(--livedub-glass);
+      border: 1px solid var(--livedub-glass-border);
+      box-shadow: var(--livedub-shadow);
+      -webkit-backdrop-filter: blur(14px); backdrop-filter: blur(14px);
+      color: var(--livedub-ink);
+      font-size: 12.5px; line-height: 1; cursor: pointer;
       pointer-events: auto; user-select: none;
-      color: #f2f3f7;
+      transition: transform var(--livedub-dur) ease, background var(--livedub-dur) ease;
     }
-    .livedub-capsule .dot { width: 8px; height: 8px; border-radius: 50%; background: #8b8fa3; }
-    .livedub-capsule[data-tone="live"] .dot { background: #3ddc84; box-shadow: 0 0 6px #3ddc84; }
-    .livedub-capsule[data-tone="busy"] .dot { background: #f5b93f; }
-    .livedub-capsule[data-tone="translate"] .dot { background: #5aa9ff; }
-    .livedub-capsule[data-tone="speak"] .dot { background: #b48cff; box-shadow: 0 0 6px #b48cff; }
-    .livedub-capsule[data-tone="error"] .dot { background: #ff5c6c; }
-    .livedub-capsule .lat { color: #b8bdd0; font-variant-numeric: tabular-nums; }
-    .livedub-capsule .gear { color: #b8bdd0; font-size: 12px; }
+    .livedub-capsule:hover { transform: translateY(-1px); }
+    .livedub-capsule:focus-visible,
+    .livedub-panel button:focus-visible,
+    .livedub-panel input:focus-visible,
+    .livedub-panel select:focus-visible,
+    .livedub-panel [role="tab"]:focus-visible,
+    .livedub-toast button:focus-visible {
+      outline: 2px solid var(--livedub-accent);
+      outline-offset: 2px;
+    }
+    .livedub-capsule .dot {
+      width: 8px; height: 8px; border-radius: 50%;
+      background: var(--livedub-ink-mute); flex: none;
+      transition: background var(--livedub-dur) ease, box-shadow var(--livedub-dur) ease;
+    }
+    .livedub-capsule[data-tone="live"] .dot { background: var(--livedub-accent); box-shadow: 0 0 0 3px var(--livedub-accent-soft); }
+    .livedub-capsule[data-tone="busy"] .dot { background: var(--livedub-warn); animation: livedub-pulse 1.4s ease-in-out infinite; }
+    .livedub-capsule[data-tone="translate"] .dot { background: #60a5fa; }
+    .livedub-capsule[data-tone="speak"] .dot { background: var(--livedub-accent-strong); box-shadow: 0 0 0 3px var(--livedub-accent-soft); }
+    .livedub-capsule[data-tone="error"] .dot { background: var(--livedub-danger); }
+    .livedub-capsule .state { font-weight: 600; letter-spacing: 0.2px; }
+    .livedub-capsule .lat {
+      color: var(--livedub-ink-dim); font-variant-numeric: tabular-nums;
+      padding-left: 8px; border-left: 1px solid var(--livedub-glass-border);
+    }
+    .livedub-capsule .gear { color: var(--livedub-ink-dim); font-size: 12px; }
+    @keyframes livedub-pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.35; } }
+    /* ---------- 快捷面板 ---------- */
     .livedub-panel {
-      position: fixed; top: 52px; right: 14px; width: 292px;
-      max-height: calc(100vh - 78px); overflow-y: auto; overflow-x: hidden;
-      padding: 11px 13px; border-radius: 14px;
-      background: rgba(14, 16, 24, 0.94);
-      border: 1px solid rgba(255, 255, 255, 0.14);
-      box-shadow: 0 12px 32px rgba(0, 0, 0, 0.45);
-      backdrop-filter: blur(10px);
-      pointer-events: auto; font-size: 13px; color: #e9ebf3;
+      position: fixed; top: 56px; right: 14px; width: 318px;
+      max-height: calc(100vh - 82px); overflow-y: auto; overflow-x: hidden;
+      padding: 0; border-radius: var(--livedub-radius);
+      background: var(--livedub-glass-strong);
+      border: 1px solid var(--livedub-glass-border);
+      box-shadow: var(--livedub-shadow);
+      -webkit-backdrop-filter: blur(16px); backdrop-filter: blur(16px);
+      pointer-events: auto; font-size: 12.5px; color: var(--livedub-ink);
       scrollbar-width: thin;
     }
     .livedub-panel[hidden] { display: none; }
     .livedub-panel-head {
-      display: flex; align-items: center; justify-content: space-between; gap: 8px;
-      padding-bottom: 7px; margin-bottom: 6px;
-      border-bottom: 1px solid rgba(255, 255, 255, 0.10);
+      position: sticky; top: 0; z-index: 2;
+      display: flex; align-items: center; gap: 8px;
+      min-height: 44px; padding: 8px 10px 8px 12px;
+      border-bottom: 1px solid var(--livedub-glass-border);
+      background: var(--livedub-glass-strong);
       cursor: grab; user-select: none;
     }
     .livedub-panel-head:active { cursor: grabbing; }
-    .livedub-panel-title { font-size: 12.5px; font-weight: 600; letter-spacing: 0.2px; }
-    .livedub-panel-title .brand { color: #7c9cff; }
-    .livedub-panel-head button {
-      flex: none; width: 24px; height: 21px; padding: 0;
-      background: rgba(255, 255, 255, 0.08); border: 1px solid rgba(255, 255, 255, 0.16);
-      border-radius: 6px; color: #b8bdd0; font-size: 12px; line-height: 1; cursor: pointer;
+    .livedub-panel-title { font-size: 12.5px; font-weight: 700; letter-spacing: 0.3px; white-space: nowrap; }
+    .livedub-panel-title .brand { color: var(--livedub-accent-strong); }
+    .livedub-panel-head .spacer { flex: 1; }
+    .livedub-icon-btn {
+      flex: none; width: 32px; height: 32px; padding: 0;
+      display: inline-flex; align-items: center; justify-content: center;
+      background: transparent; border: 1px solid transparent; border-radius: 9px;
+      color: var(--livedub-ink-dim); font-size: 15px; line-height: 1; cursor: pointer;
+      transition: background var(--livedub-dur) ease, color var(--livedub-dur) ease;
+    }
+    .livedub-icon-btn:hover { background: var(--livedub-accent-soft); color: var(--livedub-ink); }
+    .livedub-tabs { display: flex; gap: 2px; padding: 8px 10px 0; }
+    .livedub-tabs [role="tab"] {
+      flex: 1; min-height: 32px; padding: 6px 8px;
+      background: transparent; border: none; border-bottom: 2px solid transparent;
+      border-radius: 8px 8px 0 0; color: var(--livedub-ink-mute);
+      font-size: 12.5px; font-weight: 600; font-family: inherit; cursor: pointer;
+      transition: color var(--livedub-dur) ease, border-color var(--livedub-dur) ease, background var(--livedub-dur) ease;
+    }
+    .livedub-tabs [role="tab"]:hover { color: var(--livedub-ink); background: var(--livedub-accent-soft); }
+    .livedub-tabs [role="tab"][aria-selected="true"] {
+      color: var(--livedub-ink); border-bottom-color: var(--livedub-accent);
     }
     .livedub-panel-body[hidden] { display: none; }
-    .livedub-panel .row { display: flex; align-items: center; gap: 8px; margin: 7px 0; }
-    .livedub-panel .row label { display: flex; align-items: center; gap: 6px; flex: 1; min-width: 0; }
-    .livedub-panel .row .row-label { color: #b8bdd0; flex: none; }
-    .livedub-panel .row input[type="range"] { flex: 1; min-width: 0; accent-color: #7c9cff; }
-    .livedub-panel .row select {
-      flex: 1; min-width: 0; padding: 4px 6px; border-radius: 7px;
-      background: rgba(255, 255, 255, 0.08); border: 1px solid rgba(255, 255, 255, 0.16);
-      color: #e9ebf3; font-size: 12px; font-family: inherit;
+    .livedub-tabpanel { padding: 10px 12px 6px; }
+    .livedub-tabpanel[hidden] { display: none; }
+    .livedub-group { margin: 0 0 12px; }
+    .livedub-group-title {
+      font-size: 10.5px; font-weight: 700; letter-spacing: 0.8px; text-transform: uppercase;
+      color: var(--livedub-ink-mute); margin: 2px 0 7px;
     }
-    .livedub-panel .row select option { background: #1a1d28; color: #e9ebf3; }
-    .livedub-panel .row .val { min-width: 40px; text-align: right; color: #b8bdd0; font-variant-numeric: tabular-nums; font-size: 11.5px; }
-    .livedub-panel .seg { display: inline-flex; gap: 4px; flex: 1; justify-content: flex-end; }
-    .livedub-panel .seg button { flex: none; padding: 4px 10px; font-size: 12px; }
-    .livedub-panel .seg button.active { background: #3f5bd9; border-color: #5a74e8; color: #fff; }
-    .livedub-panel .actions { gap: 6px; margin-top: 10px; flex-wrap: wrap; }
-    .livedub-panel button {
-      padding: 6px 9px; border-radius: 9px; border: 1px solid rgba(255, 255, 255, 0.18);
-      background: rgba(255, 255, 255, 0.10); color: #f2f3f7; font-size: 12px; cursor: pointer;
-      font-family: inherit; transition: background 0.15s ease, opacity 0.15s ease;
+    .livedub-row {
+      display: flex; align-items: center; gap: 8px;
+      min-height: 34px; margin: 4px 0;
     }
-    .livedub-panel button:hover:not(:disabled) { background: rgba(255, 255, 255, 0.18); }
-    .livedub-panel button:disabled { opacity: 0.45; cursor: default; }
-    .livedub-panel .actions button { flex: 1; min-width: 78px; }
-    .livedub-panel button[data-act="toggle"] { background: #3f5bd9; border-color: #5a74e8; }
-    .livedub-panel button[data-act="toggle"]:hover:not(:disabled) { background: #4a67ec; }
-    .livedub-panel .hint { color: #8f94a8; font-size: 11px; line-height: 1.5; margin: 6px 0 0; }
-    .livedub-guide {
-      margin: 8px 0; padding: 9px 10px; border-radius: 10px;
-      background: rgba(90, 169, 255, 0.13); border: 1px solid rgba(90, 169, 255, 0.32);
-      font-size: 11.5px; line-height: 1.55; color: #d6e6ff;
+    .livedub-row .row-label { color: var(--livedub-ink-dim); flex: none; min-width: 44px; }
+    .livedub-row .val { min-width: 42px; text-align: right; color: var(--livedub-ink-dim); font-variant-numeric: tabular-nums; font-size: 11px; }
+    .livedub-row input[type="range"] { flex: 1; min-width: 0; accent-color: var(--livedub-accent-strong); height: 32px; }
+    .livedub-row select {
+      flex: 1; min-width: 0; min-height: 32px; padding: 4px 8px; border-radius: 9px;
+      background: var(--livedub-accent-soft); border: 1px solid var(--livedub-glass-border);
+      color: var(--livedub-ink); font-size: 12px; font-family: inherit;
     }
-    .livedub-guide[hidden] { display: none; }
-    .livedub-guide .guide-title { font-weight: 600; margin-bottom: 3px; }
-    .livedub-guide .guide-body { white-space: pre-line; color: #b9cbe4; }
-    .livedub-guide .guide-actions { display: flex; gap: 6px; margin-top: 7px; }
-    .livedub-guide .guide-actions button { flex: 1; font-size: 11.5px; padding: 5px 8px; }
+    .livedub-row select option { background: #0f1a19; color: #eef7f6; }
+    @media (prefers-color-scheme: light) { .livedub-row select option { background: #ffffff; color: #12201f; } }
+    /* 开关（switch） */
+    .livedub-switch { position: relative; display: inline-flex; align-items: center; gap: 8px; flex: 1; min-height: 32px; cursor: pointer; }
+    .livedub-switch input {
+      appearance: none; -webkit-appearance: none; flex: none;
+      width: 34px; height: 20px; margin: 0; border-radius: 999px;
+      background: var(--livedub-glass-border); border: 1px solid var(--livedub-glass-border);
+      cursor: pointer; transition: background var(--livedub-dur) ease;
+    }
+    .livedub-switch input::after {
+      content: ""; display: block; width: 14px; height: 14px; margin: 2px;
+      border-radius: 50%; background: var(--livedub-ink-dim);
+      transition: transform var(--livedub-dur) ease, background var(--livedub-dur) ease;
+    }
+    .livedub-switch input:checked { background: var(--livedub-accent-soft); border-color: var(--livedub-accent-strong); }
+    .livedub-switch input:checked::after { transform: translateX(14px); background: var(--livedub-accent-strong); }
+    .livedub-switch .switch-label { color: var(--livedub-ink); font-size: 12.5px; }
+    /* 分段控件 */
+    .livedub-seg {
+      display: inline-flex; gap: 2px; padding: 2px; flex: 1;
+      background: var(--livedub-accent-soft); border: 1px solid var(--livedub-glass-border);
+      border-radius: 10px;
+    }
+    .livedub-seg button {
+      flex: 1; min-height: 28px; padding: 4px 8px;
+      background: transparent; border: none; border-radius: 8px;
+      color: var(--livedub-ink-dim); font-size: 12px; font-family: inherit; cursor: pointer;
+      transition: background var(--livedub-dur) ease, color var(--livedub-dur) ease;
+    }
+    .livedub-seg button:hover { color: var(--livedub-ink); }
+    .livedub-seg button.active { background: var(--livedub-glass-strong); color: var(--livedub-ink); box-shadow: 0 1px 3px rgba(0,0,0,0.2); }
+    /* 按钮 */
+    .livedub-panel button.livedub-btn {
+      min-height: 34px; padding: 7px 10px; border-radius: 10px;
+      border: 1px solid var(--livedub-glass-border);
+      background: var(--livedub-accent-soft); color: var(--livedub-ink);
+      font-size: 12px; font-family: inherit; cursor: pointer;
+      transition: background var(--livedub-dur) ease, opacity var(--livedub-dur) ease;
+    }
+    .livedub-panel button.livedub-btn:hover:not(:disabled) { background: var(--livedub-glass); }
+    .livedub-panel button.livedub-btn:disabled { opacity: 0.45; cursor: default; }
+    .livedub-panel button.livedub-btn-primary {
+      background: linear-gradient(135deg, var(--livedub-accent-strong), var(--livedub-accent));
+      border-color: transparent; color: #062622; font-weight: 700;
+    }
+    .livedub-panel button.livedub-btn-primary:hover:not(:disabled) { filter: brightness(1.05); }
+    .livedub-panel .livedub-actions { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 8px; }
+    .livedub-panel .livedub-actions button { flex: 1; min-width: 84px; }
+    .livedub-note-btn { width: 100%; margin-top: 4px; }
+    .livedub-note-btn .spin {
+      display: inline-block; width: 11px; height: 11px; margin-right: 6px;
+      border: 2px solid currentColor; border-right-color: transparent; border-radius: 50%;
+      animation: livedub-spin 0.8s linear infinite; vertical-align: -1px;
+    }
+    @keyframes livedub-spin { to { transform: rotate(360deg); } }
     .livedub-meta {
-      margin: 7px 0 0; padding-top: 7px;
-      border-top: 1px dashed rgba(255, 255, 255, 0.12);
-      font-size: 11px; color: #9aa0b4; line-height: 1.6; white-space: pre-line;
+      margin: 8px 0 0; padding-top: 8px;
+      border-top: 1px dashed var(--livedub-glass-border);
+      font-size: 11px; color: var(--livedub-ink-mute); line-height: 1.6; white-space: pre-line;
     }
     .livedub-meta[hidden] { display: none; }
+    .livedub-note-summary { font-size: 11.5px; color: var(--livedub-ink-dim); padding: 2px 0 6px; }
+    .livedub-guide {
+      margin: 8px 0 2px; padding: 10px; border-radius: var(--livedub-radius-sm);
+      background: var(--livedub-accent-soft); border: 1px solid rgba(45, 212, 191, 0.28);
+      font-size: 11.5px; line-height: 1.55; color: var(--livedub-ink);
+    }
+    .livedub-guide[hidden] { display: none; }
+    .livedub-guide .guide-title { font-weight: 700; margin-bottom: 4px; }
+    .livedub-guide .guide-body { white-space: pre-line; color: var(--livedub-ink-dim); }
+    .livedub-guide .guide-actions { display: flex; gap: 6px; margin-top: 8px; }
+    .livedub-guide .guide-actions button { flex: 1; }
+    .livedub-cmd {
+      display: flex; align-items: center; gap: 6px; margin-top: 8px;
+      padding: 6px 8px; border-radius: 9px;
+      background: var(--livedub-glass); border: 1px solid var(--livedub-glass-border);
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11.5px; color: var(--livedub-ink);
+    }
+    .livedub-cmd code { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .livedub-cmd button { min-height: 26px; padding: 3px 8px; flex: none; }
+    .livedub-panel-footer {
+      padding: 8px 12px 10px; border-top: 1px solid var(--livedub-glass-border);
+      color: var(--livedub-ink-mute); font-size: 10.5px; line-height: 1.5;
+    }
+    .livedub-panel-footer kbd {
+      font-family: inherit; padding: 1px 5px; border-radius: 5px;
+      border: 1px solid var(--livedub-glass-border); background: var(--livedub-accent-soft);
+      color: var(--livedub-ink-dim);
+    }
     .livedub-error {
-      margin-top: 8px; padding: 7px 9px; border-radius: 9px;
-      background: rgba(255, 92, 108, 0.18); border: 1px solid rgba(255, 92, 108, 0.4);
-      color: #ffd3d7; font-size: 12px; line-height: 1.45;
+      margin-top: 8px; padding: 8px 10px; border-radius: var(--livedub-radius-sm);
+      background: rgba(251, 113, 133, 0.14); border: 1px solid rgba(251, 113, 133, 0.36);
+      color: var(--livedub-ink); font-size: 11.5px; line-height: 1.45;
     }
     .livedub-error[hidden] { display: none; }
     .livedub-error[data-kind="info"] {
-      background: rgba(90, 169, 255, 0.16); border-color: rgba(90, 169, 255, 0.38); color: #cfe4ff;
+      background: var(--livedub-accent-soft); border-color: rgba(45, 212, 191, 0.32);
+    }
+    /* ---------- toast 堆叠 ---------- */
+    .livedub-toasts {
+      position: fixed; top: 56px; left: 50%; transform: translateX(-50%);
+      display: flex; flex-direction: column; gap: 8px; align-items: center;
+      pointer-events: none; max-width: min(78vw, 760px); z-index: 3;
     }
     .livedub-toast {
-      position: fixed; top: 58px; left: 50%; transform: translateX(-50%);
-      max-width: min(72vw, 720px);
-      padding: 8px 14px; border-radius: 999px;
-      background: rgba(20, 24, 34, 0.92);
-      border: 1px solid rgba(255, 255, 255, 0.16);
-      box-shadow: 0 8px 24px rgba(0, 0, 0, 0.42);
-      color: #eaf0ff; font-size: 12.5px; line-height: 1.35;
-      pointer-events: none; white-space: pre-line; text-align: center;
-      backdrop-filter: blur(8px);
+      display: flex; align-items: center; gap: 8px;
+      min-height: 36px; padding: 7px 8px 7px 12px; border-radius: 999px;
+      background: var(--livedub-glass-strong);
+      border: 1px solid var(--livedub-glass-border);
+      box-shadow: var(--livedub-shadow);
+      -webkit-backdrop-filter: blur(14px); backdrop-filter: blur(14px);
+      color: var(--livedub-ink); font-size: 12.5px; line-height: 1.35;
+      pointer-events: auto; white-space: pre-line; text-align: center;
+      animation: livedub-toast-in var(--livedub-dur) ease both;
     }
-    .livedub-toast[hidden] { display: none; }
-    .livedub-toast[data-kind="warn"] { border-color: rgba(245, 185, 63, 0.5); color: #ffe6b8; }
-    .livedub-toast[data-kind="error"] { border-color: rgba(255, 92, 108, 0.5); color: #ffd3d7; }
+    @keyframes livedub-toast-in { from { opacity: 0; transform: translateY(-6px); } to { opacity: 1; transform: translateY(0); } }
+    .livedub-toast[data-kind="warn"] { border-color: rgba(251, 191, 36, 0.42); }
+    .livedub-toast[data-kind="error"] { border-color: rgba(251, 113, 133, 0.48); }
+    .livedub-toast .toast-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--livedub-accent); flex: none; }
+    .livedub-toast[data-kind="warn"] .toast-dot { background: var(--livedub-warn); }
+    .livedub-toast[data-kind="error"] .toast-dot { background: var(--livedub-danger); }
+    .livedub-toast .toast-spin {
+      width: 12px; height: 12px; border: 2px solid currentColor; border-right-color: transparent;
+      border-radius: 50%; animation: livedub-spin 0.8s linear infinite; flex: none;
+    }
+    .livedub-toast .toast-close {
+      flex: none; width: 32px; height: 32px; margin: -4px -4px -4px 0;
+      display: inline-flex; align-items: center; justify-content: center;
+      background: transparent; border: none; border-radius: 999px;
+      color: var(--livedub-ink-mute); font-size: 15px; cursor: pointer;
+    }
+    .livedub-toast .toast-close:hover { background: var(--livedub-accent-soft); color: var(--livedub-ink); }
+    /* ---------- 字幕 ---------- */
     .livedub-subs {
       position: fixed; left: 50%; bottom: 8vh;
       transform: translateX(-50%);
-      max-width: min(78vw, 980px);
+      width: fit-content; max-width: min(78vw, 980px);
       display: flex; flex-direction: column; gap: 6px;
-      pointer-events: auto; cursor: grab; user-select: none;
+      pointer-events: auto; user-select: none;
       --livedub-subs-alpha: 0.72;
+      --livedub-subs-accent: var(--livedub-accent);
     }
     .livedub-subs[hidden] { display: none; }
-    .livedub-subs:active { cursor: grabbing; }
+    .livedub-subs-handle {
+      align-self: center; width: 56px; height: 18px; margin-bottom: -2px;
+      display: inline-flex; align-items: center; justify-content: center;
+      border-radius: 999px; background: var(--livedub-glass);
+      border: 1px solid var(--livedub-glass-border);
+      color: var(--livedub-ink-mute); font-size: 11px; letter-spacing: 2px;
+      cursor: grab; pointer-events: auto; opacity: 0.55;
+      transition: opacity var(--livedub-dur) ease, background var(--livedub-dur) ease;
+    }
+    .livedub-subs:hover .livedub-subs-handle { opacity: 1; }
+    .livedub-subs-handle:active { cursor: grabbing; }
+    .livedub-stack { display: flex; flex-direction: column; gap: 6px; }
     .livedub-block {
-      padding: 9px 16px; border-radius: 13px;
-      background: rgba(10, 12, 20, var(--livedub-subs-alpha, 0.72));
-      border: 1px solid rgba(255, 255, 255, 0.08);
-      box-shadow: 0 6px 22px rgba(0, 0, 0, 0.38);
-      backdrop-filter: blur(6px);
+      position: relative; overflow: hidden;
+      padding: 11px 18px 12px; border-radius: var(--livedub-radius);
+      background: rgba(8, 15, 15, var(--livedub-subs-alpha, 0.72));
+      border: 1px solid rgba(255, 255, 255, 0.09);
+      box-shadow: 0 10px 30px rgba(0, 0, 0, 0.4);
+      -webkit-backdrop-filter: blur(10px) saturate(1.1); backdrop-filter: blur(10px) saturate(1.1);
       text-align: center;
+      transition: border-color var(--livedub-dur) ease;
+    }
+    @supports not ((backdrop-filter: blur(1px)) or (-webkit-backdrop-filter: blur(1px))) {
+      .livedub-block { background: rgba(8, 15, 15, 0.92); }
     }
     .livedub-root[data-bg="light"] .livedub-block {
-      background: rgba(248, 249, 252, var(--livedub-subs-alpha, 0.86));
-      border-color: rgba(0, 0, 0, 0.08);
-      box-shadow: 0 6px 22px rgba(0, 0, 0, 0.22);
+      background: rgba(248, 252, 251, var(--livedub-subs-alpha, 0.9));
+      border-color: rgba(15, 40, 38, 0.1);
+      box-shadow: 0 8px 26px rgba(15, 40, 38, 0.2);
     }
-    .livedub-root[data-bg="light"] .livedub-block .dst { color: #10131c; text-shadow: none; }
-    .livedub-root[data-bg="light"] .livedub-block .src { color: #4a4f60; }
     .livedub-root[data-bg="none"] .livedub-block {
       background: transparent; border-color: transparent;
-      box-shadow: none; backdrop-filter: none;
-      padding: 2px 6px;
+      box-shadow: none; -webkit-backdrop-filter: none; backdrop-filter: none;
+      padding: 4px 8px 6px;
     }
-    .livedub-block .src {
-      color: #b4b9c9; line-height: 1.35; margin-bottom: 3px;
-      font-size: 0.68em; white-space: pre-line;
+    .livedub-progress {
+      height: 2px; border-radius: 999px; margin: 0 2px -2px;
+      background: rgba(255, 255, 255, 0.12); overflow: hidden;
     }
+    .livedub-root[data-bg="light"] .livedub-progress { background: rgba(15, 40, 38, 0.12); }
+    .livedub-progress > span {
+      display: block; height: 100%; width: 0;
+      background: linear-gradient(90deg, var(--livedub-accent), var(--livedub-accent-strong));
+      border-radius: 999px;
+    }
+    .livedub-root[data-speaking="true"] .livedub-progress > span { box-shadow: 0 0 8px var(--livedub-accent); }
+    .livedub-block .time {
+      position: absolute; top: 6px; right: 10px;
+      font-size: 10px; color: var(--livedub-ink-mute); font-variant-numeric: tabular-nums;
+      opacity: 0.8;
+    }
+    .livedub-root[data-bg="light"] .livedub-block .time { color: #5d7675; }
     .livedub-block .dst {
-      color: #ffffff; font-weight: 600; line-height: 1.38;
-      text-shadow: 0 1px 3px rgba(0, 0, 0, 0.6); white-space: pre-line;
+      color: #ffffff; font-weight: 600;
+      font-size: 1em; line-height: 1.4;
+      text-shadow: 0 1px 3px rgba(0, 0, 0, 0.5); white-space: pre-line;
+      letter-spacing: 0.1px;
     }
-    .livedub-block .dst.draft { color: #e3e6f0; opacity: 0.82; font-weight: 500; }
-    .livedub-root[data-bg="light"] .livedub-block .dst.draft { color: #3a3f52; }
+    .livedub-block .dst.draft { opacity: 0.78; font-weight: 500; }
+    .livedub-block .src {
+      color: #a8bcba; font-size: 0.62em; line-height: 1.4;
+      margin-bottom: 4px; white-space: pre-line; font-weight: 500;
+    }
     .livedub-block .src[hidden] { display: none; }
+    .livedub-root[data-bg="light"] .livedub-block .dst { color: #0c1a19; text-shadow: none; }
+    .livedub-root[data-bg="light"] .livedub-block .src { color: #4d6665; }
+    .livedub-root[data-bg="light"] .livedub-block .dst.draft { color: #243b3a; }
+    /* 原声 duck 指示 */
+    .livedub-duck {
+      position: fixed; right: 14px; bottom: calc(8vh + 2px);
+      display: inline-flex; align-items: center; gap: 5px;
+      min-height: 22px; padding: 2px 9px; border-radius: 999px;
+      background: var(--livedub-glass); border: 1px solid var(--livedub-glass-border);
+      color: var(--livedub-ink-dim); font-size: 10.5px;
+      pointer-events: none; opacity: 0; transform: translateY(4px);
+      transition: opacity var(--livedub-dur) ease, transform var(--livedub-dur) ease;
+    }
+    .livedub-duck[data-visible="true"] { opacity: 1; transform: translateY(0); }
+    .livedub-duck .duck-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--livedub-accent); }
+    /* 宽/紧凑两档 */
+    .livedub-root[data-density="compact"] .livedub-block { padding: 8px 14px 9px; border-radius: var(--livedub-radius-sm); }
+    .livedub-root[data-density="compact"] .livedub-block .dst { font-size: 0.92em; line-height: 1.32; }
+    .livedub-root[data-density="compact"] .livedub-block .src { font-size: 0.58em; margin-bottom: 2px; }
+    .livedub-root[data-density="compact"] .livedub-subs { max-width: min(86vw, 760px); }
+    .livedub-root[data-density="compact"] .livedub-block .time { display: none; }
   `;
 
   function attachShadowStyles(shadow) {
@@ -459,57 +772,166 @@
     const shadow = host.attachShadow({ mode: 'open' });
     attachShadowStyles(shadow);
     shadow.innerHTML = `
-      <div class="livedub-root" data-part="root" data-bg="dark">
-        <div class="livedub-capsule" data-part="capsule" role="button" tabindex="0" title="livedub：点击打开设置">
-          <span class="dot"></span>
+      <div class="livedub-root" data-part="root" data-bg="dark" data-density="wide" data-speaking="false">
+        <div class="livedub-capsule" data-part="capsule" role="button" tabindex="0"
+             aria-haspopup="dialog" aria-expanded="false" aria-label="livedub：打开快捷面板"
+             title="livedub 快捷面板（Esc 关闭）">
+          <span class="dot" aria-hidden="true"></span>
           <span class="state" data-part="state">未连接</span>
           <span class="lat" data-part="lat">—</span>
-          <span class="gear">⚙</span>
+          <span class="gear" aria-hidden="true">⚙</span>
         </div>
-        <div class="livedub-panel" data-part="panel" hidden>
-          <div class="livedub-panel-head" data-part="panel-head" title="拖动移动设置面板">
-            <span class="livedub-panel-title"><span class="brand">livedub</span> 设置</span>
-            <button type="button" data-act="collapse" data-part="collapse" title="收起设置">▾</button>
+
+        <div class="livedub-panel" data-part="panel" role="dialog" aria-modal="false"
+             aria-label="livedub 快捷面板" hidden>
+          <div class="livedub-panel-head" data-part="panel-head" title="拖动移动面板">
+            <span class="livedub-panel-title"><span class="brand">livedub</span> 快捷面板</span>
+            <span class="spacer"></span>
+            <button type="button" class="livedub-icon-btn" data-act="collapse" data-part="collapse"
+                    title="收起面板" aria-label="收起面板">▾</button>
+            <button type="button" class="livedub-icon-btn" data-act="close-panel" data-part="close"
+                    title="关闭面板（Esc）" aria-label="关闭面板">✕</button>
           </div>
           <div class="livedub-panel-body" data-part="panel-body">
-            <div class="row"><label><input type="checkbox" data-set="dubEnabled" /> 中文配音</label></div>
-            <div class="row"><label><input type="checkbox" data-set="captureReplay" /> 原声重放（关闭 = 只听配音）</label></div>
-            <div class="row"><label><input type="checkbox" data-set="globalDuck" /> 全局限定压音（iframe/WebAudio 也生效）</label></div>
-            <div class="row"><label>压音 <input type="range" data-set="duckRatio" min="0.02" max="0.6" step="0.01" /></label><span class="val" data-val="duckRatio"></span></div>
-            <div class="row"><label>恢复延迟 <input type="range" data-set="duckRecoverMs" min="300" max="3000" step="100" /></label><span class="val" data-val="duckRecoverMs"></span></div>
-            <div class="row"><label><input type="checkbox" data-set="showOriginal" /> 显示原文</label></div>
-            <div class="row"><label>字号 <input type="range" data-set="fontSize" min="14" max="32" step="1" /></label><span class="val" data-val="fontSize"></span></div>
-            <div class="row"><span class="row-label">位置</span><span class="seg"><button type="button" data-act="dock-bottom">底部</button><button type="button" data-act="dock-top">顶部</button></span></div>
-            <div class="row"><label>避让 <input type="range" data-set="offsetY" min="-200" max="320" step="10" /></label><span class="val" data-val="offsetY"></span></div>
-            <div class="row"><label>背景 <select data-set="subsBg"><option value="dark">深色</option><option value="light">浅色</option><option value="none">无背景</option></select></label></div>
-            <div class="row"><label>不透明度 <input type="range" data-set="subsOpacity" min="0.2" max="1" step="0.02" /></label><span class="val" data-val="subsOpacity"></span></div>
-            <div class="row"><label><input type="checkbox" data-set="fullscreenWorkaround" /> video 全屏兼容（包裹容器）</label></div>
-            <div class="row note-row">
-              <label><input type="checkbox" data-set="noteScreenshot" /> 附页面截图</label>
-              <button type="button" data-act="note">记笔记</button>
+            <div class="livedub-tabs" role="tablist" aria-label="快捷面板分区">
+              <button type="button" role="tab" data-act="tab" data-tab="subtitles"
+                      id="livedub-tab-subtitles" aria-controls="livedub-panel-subtitles"
+                      aria-selected="true" tabindex="0">字幕</button>
+              <button type="button" role="tab" data-act="tab" data-tab="notes"
+                      id="livedub-tab-notes" aria-controls="livedub-panel-notes"
+                      aria-selected="false" tabindex="-1">笔记</button>
+              <button type="button" role="tab" data-act="tab" data-tab="settings"
+                      id="livedub-tab-settings" aria-controls="livedub-panel-settings"
+                      aria-selected="false" tabindex="-1">设置</button>
             </div>
-            <div class="row"><label><input type="checkbox" data-set="visionOcr" /> 识别画面文字（OCR，快 ~1s）</label></div>
-            <div class="row"><label><input type="checkbox" data-set="visionCaption" /> 画面理解（VLM，慢 20-30s）</label></div>
-            <div class="livedub-guide" data-part="guide" hidden>
+
+            <div class="livedub-guide" data-part="guide" hidden role="status">
               <div class="guide-title" data-part="guide-title"></div>
               <div class="guide-body" data-part="guide-body"></div>
               <div class="guide-actions">
-                <button type="button" data-act="reconnect">重试连接</button>
-                <button type="button" data-act="start">开始同传</button>
+                <button type="button" class="livedub-btn" data-act="reconnect" aria-label="立即重连引擎">立即重连</button>
+                <button type="button" class="livedub-btn livedub-btn-primary" data-act="start" aria-label="开始同传">开始同传</button>
+              </div>
+              <div class="livedub-cmd" data-part="guide-cmd" hidden>
+                <code>npm start</code>
+                <button type="button" class="livedub-btn" data-act="copy-command"
+                        title="复制启动命令" aria-label="复制启动命令">复制</button>
               </div>
             </div>
-            <div class="livedub-meta" data-part="meta" hidden></div>
-            <div class="row actions">
-              <button type="button" data-act="toggle">开始同传</button>
-              <button type="button" data-act="export">导出 SRT</button>
-              <button type="button" data-act="hide">隐藏浮层</button>
+
+            <div class="livedub-tabpanel" data-panel-tab="subtitles" id="livedub-panel-subtitles"
+                 role="tabpanel" aria-labelledby="livedub-tab-subtitles">
+              <div class="livedub-group">
+                <div class="livedub-group-title">字幕样式</div>
+                <div class="livedub-row">
+                  <span class="row-label">宽度</span>
+                  <span class="livedub-seg" role="group" aria-label="字幕宽度">
+                    <button type="button" data-act="density-wide" title="宽屏字幕（默认）" aria-label="宽屏字幕">宽</button>
+                    <button type="button" data-act="density-compact" title="紧凑字幕（小窗口）" aria-label="紧凑字幕">紧凑</button>
+                  </span>
+                </div>
+                <div class="livedub-row">
+                  <span class="row-label">位置</span>
+                  <span class="livedub-seg" role="group" aria-label="字幕停靠位置">
+                    <button type="button" data-act="dock-bottom" title="字幕停靠底部" aria-label="字幕停靠底部">底部</button>
+                    <button type="button" data-act="dock-top" title="字幕停靠顶部" aria-label="字幕停靠顶部">顶部</button>
+                  </span>
+                </div>
+                <div class="livedub-row">
+                  <label for="livedub-offset">避让 <input id="livedub-offset" type="range" data-set="offsetY" min="-200" max="320" step="10" aria-label="字幕垂直避让像素" /></label>
+                  <span class="val" data-val="offsetY"></span>
+                </div>
+                <div class="livedub-row">
+                  <label for="livedub-font">字号 <input id="livedub-font" type="range" data-set="fontSize" min="14" max="32" step="1" aria-label="字幕字号" /></label>
+                  <span class="val" data-val="fontSize"></span>
+                </div>
+                <div class="livedub-row">
+                  <label class="livedub-switch"><input type="checkbox" data-set="showOriginal" role="switch" aria-label="显示原文" /><span class="switch-label">显示原文</span></label>
+                </div>
+              </div>
+              <div class="livedub-group">
+                <div class="livedub-group-title">字幕背景</div>
+                <div class="livedub-row">
+                  <label for="livedub-subsbg">背景 <select id="livedub-subsbg" data-set="subsBg" aria-label="字幕背景风格"><option value="dark">深色玻璃</option><option value="light">浅色玻璃</option><option value="none">无背景</option></select></label>
+                </div>
+                <div class="livedub-row">
+                  <label for="livedub-subsopacity">不透明度 <input id="livedub-subsopacity" type="range" data-set="subsOpacity" min="0.2" max="1" step="0.02" aria-label="字幕背景不透明度" /></label>
+                  <span class="val" data-val="subsOpacity"></span>
+                </div>
+              </div>
             </div>
-            <div class="hint">Alt+Shift+N 记笔记（截图 + 画面文字 OCR）· Alt+Shift+L 开始/停止。开始/停止需要用户手势；字幕可拖动，位置/样式自动保存。</div>
-            <div class="livedub-error" data-part="error" hidden></div>
+
+            <div class="livedub-tabpanel" data-panel-tab="notes" id="livedub-panel-notes"
+                 role="tabpanel" aria-labelledby="livedub-tab-notes" hidden>
+              <div class="livedub-group">
+                <div class="livedub-group-title">快捷笔记</div>
+                <div class="livedub-note-summary" data-part="note-summary">今日 0 条 · 待同步 0</div>
+                <button type="button" class="livedub-btn livedub-btn-primary livedub-note-btn" data-act="note"
+                        data-part="note-btn" aria-label="记录当前句为笔记（Alt+Shift+N）" title="记录当前句（Alt+Shift+N）">记笔记</button>
+                <div class="livedub-row">
+                  <label class="livedub-switch"><input type="checkbox" data-set="noteScreenshot" role="switch" aria-label="附页面截图" /><span class="switch-label">附页面截图</span></label>
+                </div>
+                <div class="livedub-row">
+                  <label class="livedub-switch"><input type="checkbox" data-set="visionOcr" role="switch" aria-label="识别画面文字 OCR" /><span class="switch-label">识别画面文字（OCR，快）</span></label>
+                </div>
+                <div class="livedub-row">
+                  <label class="livedub-switch"><input type="checkbox" data-set="visionCaption" role="switch" aria-label="画面理解 VLM" /><span class="switch-label">画面理解（VLM，慢 20-30s）</span></label>
+                </div>
+                <div class="livedub-actions">
+                  <button type="button" class="livedub-btn" data-act="export" aria-label="导出本次字幕 SRT" title="导出本次字幕 SRT">导出 SRT</button>
+                </div>
+              </div>
+              <div class="livedub-meta" data-part="meta" hidden></div>
+            </div>
+
+            <div class="livedub-tabpanel" data-panel-tab="settings" id="livedub-panel-settings"
+                 role="tabpanel" aria-labelledby="livedub-tab-settings" hidden>
+              <div class="livedub-group">
+                <div class="livedub-group-title">配音与原声</div>
+                <div class="livedub-row">
+                  <label class="livedub-switch"><input type="checkbox" data-set="dubEnabled" role="switch" aria-label="中文配音" /><span class="switch-label">中文配音</span></label>
+                </div>
+                <div class="livedub-row">
+                  <label class="livedub-switch"><input type="checkbox" data-set="captureReplay" role="switch" aria-label="原声重放" /><span class="switch-label">原声重放（关闭 = 只听配音）</span></label>
+                </div>
+                <div class="livedub-row">
+                  <label class="livedub-switch"><input type="checkbox" data-set="globalDuck" role="switch" aria-label="全局限定压音" /><span class="switch-label">全局限定压音（iframe/WebAudio）</span></label>
+                </div>
+                <div class="livedub-row">
+                  <label for="livedub-duck">压音 <input id="livedub-duck" type="range" data-set="duckRatio" min="0.02" max="0.6" step="0.01" aria-label="压音比例" /></label>
+                  <span class="val" data-val="duckRatio"></span>
+                </div>
+                <div class="livedub-row">
+                  <label for="livedub-recover">恢复延迟 <input id="livedub-recover" type="range" data-set="duckRecoverMs" min="300" max="3000" step="100" aria-label="压音恢复延迟" /></label>
+                  <span class="val" data-val="duckRecoverMs"></span>
+                </div>
+              </div>
+              <div class="livedub-group">
+                <div class="livedub-group-title">高级</div>
+                <div class="livedub-row">
+                  <label class="livedub-switch"><input type="checkbox" data-set="fullscreenWorkaround" role="switch" aria-label="video 全屏兼容" /><span class="switch-label">video 全屏兼容（包裹容器）</span></label>
+                </div>
+                <div class="livedub-actions">
+                  <button type="button" class="livedub-btn livedub-btn-primary" data-act="toggle" aria-label="开始或停止同传">开始同传</button>
+                  <button type="button" class="livedub-btn" data-act="hide" aria-label="隐藏字幕浮层">隐藏浮层</button>
+                </div>
+              </div>
+            </div>
+
+            <div class="livedub-error" data-part="error" role="alert" hidden></div>
+          </div>
+          <div class="livedub-panel-footer">
+            <kbd>Alt</kbd>+<kbd>Shift</kbd>+<kbd>N</kbd> 记笔记 · <kbd>Alt</kbd>+<kbd>Shift</kbd>+<kbd>L</kbd> 开始/停止 · <kbd>Esc</kbd> 关闭面板
           </div>
         </div>
-        <div class="livedub-toast" data-part="toast" data-kind="ok" hidden></div>
-        <div class="livedub-subs" data-part="subs" hidden><div class="livedub-sub-list" data-part="sublist"></div></div>
+
+        <div class="livedub-toasts" data-part="toast" role="status" aria-live="polite" aria-atomic="false"></div>
+        <div class="livedub-duck" data-part="duck" data-visible="false" aria-hidden="true"><span class="duck-dot"></span><span data-part="duck-label"></span></div>
+        <div class="livedub-subs" data-part="subs" hidden>
+          <div class="livedub-subs-handle" data-part="subs-handle" title="拖动字幕位置" aria-label="拖动字幕位置">⋯⋯</div>
+          <div class="livedub-progress" data-part="progress" aria-hidden="true"><span data-part="progress-fill"></span></div>
+          <div class="livedub-stack livedub-sub-list" data-part="sublist"></div>
+        </div>
       </div>`;
 
     runtime.host = host;
@@ -523,16 +945,25 @@
       panelHead: shadow.querySelector('[data-part="panel-head"]'),
       panelBody: shadow.querySelector('[data-part="panel-body"]'),
       collapseButton: shadow.querySelector('[data-part="collapse"]'),
+      closeButton: shadow.querySelector('[data-part="close"]'),
       guide: shadow.querySelector('[data-part="guide"]'),
       guideTitle: shadow.querySelector('[data-part="guide-title"]'),
       guideBody: shadow.querySelector('[data-part="guide-body"]'),
+      guideCmd: shadow.querySelector('[data-part="guide-cmd"]'),
       meta: shadow.querySelector('[data-part="meta"]'),
       error: shadow.querySelector('[data-part="error"]'),
       subs: shadow.querySelector('[data-part="subs"]'),
       sublist: shadow.querySelector('[data-part="sublist"]'),
       toast: shadow.querySelector('[data-part="toast"]'),
+      duck: shadow.querySelector('[data-part="duck"]'),
+      duckLabel: shadow.querySelector('[data-part="duck-label"]'),
+      progress: shadow.querySelector('[data-part="progress"]'),
+      progressFill: shadow.querySelector('[data-part="progress-fill"]'),
+      noteSummary: shadow.querySelector('[data-part="note-summary"]'),
+      noteButton: shadow.querySelector('[data-part="note-btn"]'),
     };
     bindOverlayEvents();
+
     applyOverlayVisibility();
     applySubsLayout();
     applyPanelPosition();
@@ -694,12 +1125,21 @@
       panel.addEventListener('click', onPanelClick);
       panel.addEventListener('change', onPanelChange);
       panel.addEventListener('input', onPanelChange);
+      panel.addEventListener('keydown', onPanelKeydown);
     }
     if (runtime.els.panelHead) {
       runtime.els.panelHead.addEventListener('pointerdown', onPanelPointerDown);
     }
     if (subs) {
       subs.addEventListener('pointerdown', onSubtitlePointerDown);
+    }
+    if (runtime.els.toast) {
+      runtime.els.toast.addEventListener('click', (event) => {
+        const button = event.target && event.target.closest ? event.target.closest('button[data-toast-id]') : null;
+        if (!button) return;
+        event.stopPropagation();
+        dismissToast(button.getAttribute('data-toast-id'));
+      });
     }
     document.addEventListener(
       'click',
@@ -711,9 +1151,23 @@
       },
       true,
     );
+    document.addEventListener(
+      'keydown',
+      (event) => {
+        if (event.key !== 'Escape') return;
+        if (runtime.panelOpen) {
+          event.preventDefault();
+          togglePanel(false);
+          return;
+        }
+        if (runtime.toasts.length > 0) dismissToast(runtime.toasts[runtime.toasts.length - 1].id);
+      },
+      true,
+    );
     window.addEventListener('resize', () => {
       applySubsLayout();
       applyPanelPosition();
+      applyDensity();
     });
     window.addEventListener('beforeunload', () => {
       restoreVolumes();
@@ -724,11 +1178,33 @@
     window.addEventListener('message', onPageHookMessage);
   }
 
+  /** 面板内键盘导航：tab 左右切换；Esc 由 document 统一处理 */
+  function onPanelKeydown(event) {
+    if (!event.target || !event.target.closest) return;
+    const tab = event.target.closest('[data-act="tab"]');
+    if (tab && (event.key === 'ArrowLeft' || event.key === 'ArrowRight')) {
+      event.preventDefault();
+      const tabs = [...runtime.els.panel.querySelectorAll('[data-act="tab"]')].map((el) => el.getAttribute('data-tab'));
+      const current = tabs.indexOf(runtime.activeTab);
+      const next = tabs[(current + (event.key === 'ArrowRight' ? 1 : -1) + tabs.length) % tabs.length];
+      setActiveTab(next);
+      const nextTab = runtime.els.panel.querySelector(`[data-act="tab"][data-tab="${next}"]`);
+      if (nextTab) nextTab.focus();
+    }
+  }
+
   function togglePanel(force) {
     const next = typeof force === 'boolean' ? force : !runtime.panelOpen;
     runtime.panelOpen = next;
     if (runtime.els.panel) runtime.els.panel.hidden = !next;
-    if (next && runtime.settings.panelCollapsed) void saveSettings({ panelCollapsed: false });
+    if (runtime.els.capsule) {
+      runtime.els.capsule.setAttribute('aria-expanded', next ? 'true' : 'false');
+      runtime.els.capsule.dataset.open = next ? 'true' : 'false';
+    }
+    if (next) {
+      if (runtime.settings.panelCollapsed) void saveSettings({ panelCollapsed: false });
+      renderStatus();
+    }
   }
 
   function onPanelClick(event) {
@@ -759,11 +1235,60 @@
       case 'dock-top':
         void saveSettings({ dock: 'top' });
         break;
+      case 'density-wide':
+        void saveSettings({ subsDensity: 'wide' });
+        break;
+      case 'density-compact':
+        void saveSettings({ subsDensity: 'compact' });
+        break;
+      case 'tab':
+        setActiveTab(button.getAttribute('data-tab'));
+        break;
+      case 'close-panel':
+        togglePanel(false);
+        break;
+      case 'copy-command':
+        void copyText('npm start', button);
+        break;
       case 'note':
         void captureNote();
         break;
       default:
         break;
+    }
+  }
+
+  /** v0.7：复制命令（引导卡） */
+  async function copyText(text, button) {
+    let copied = false;
+    try {
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        await navigator.clipboard.writeText(text);
+        copied = true;
+      }
+    } catch {
+      copied = false;
+    }
+    if (!copied) {
+      try {
+        const area = document.createElement('textarea');
+        area.value = text;
+        area.style.cssText = 'position:fixed;opacity:0;';
+        document.body.appendChild(area);
+        area.select();
+        copied = document.execCommand('copy');
+        area.remove();
+      } catch {
+        copied = false;
+      }
+    }
+    showToast(copied ? `已复制：${text}` : `请手动执行：${text}`, copied ? 'ok' : 'warn', 2600);
+    if (copied && button) {
+      const original = button.textContent;
+      button.textContent = '已复制';
+      setTimeout(() => {
+        button.textContent = original;
+      }, 1400);
     }
   }
 
@@ -1116,6 +1641,7 @@
     return lines;
   }
 
+  /** v0.7：状态 pill + duck 指示 + 笔记按钮/摘要 + 进度线 */
   function renderStatus() {
     const capsule = runtime.els.capsule;
     if (!capsule) return;
@@ -1128,10 +1654,30 @@
     for (const button of runtime.els.panel ? runtime.els.panel.querySelectorAll('button[data-act="toggle"]') : []) {
       button.textContent = active ? '停止同传' : '开始同传';
     }
-    capsule.title = `livedub：${summary.label}${state && state.engineState ? `（引擎 ${state.engineState}）` : ''}，点击打开设置`;
+    capsule.title = `livedub：${summary.label}${state && state.engineState ? `（引擎 ${state.engineState}）` : ''}，点击打开快捷面板`;
+    if (runtime.els.root) {
+      runtime.els.root.setAttribute('data-speaking', state && state.engineState === 'speaking' ? 'true' : 'false');
+    }
+    renderDuckIndicator(state);
+    renderNoteSummary();
+    renderNoteButton();
+    syncAriaState();
     renderGuidance();
     renderMeta();
     renderExportState();
+  }
+
+  /** 原声 duck 指示：说话且重放原声时显示「原声已压低」 */
+  function renderDuckIndicator(state) {
+    const el = runtime.els.duck;
+    if (!el) return;
+    const speaking = !!state && state.engineState === 'speaking';
+    const visible = speaking && runtime.settings.captureReplay !== false;
+    el.setAttribute('data-visible', visible ? 'true' : 'false');
+    if (runtime.els.duckLabel) {
+      runtime.els.duckLabel.textContent =
+        runtime.settings.globalDuck === false ? '页面音量压音中' : '原声已压低';
+    }
   }
 
   function renderExportState() {
@@ -1139,11 +1685,12 @@
     const button = runtime.els.panel ? runtime.els.panel.querySelector('button[data-act="export"]') : null;
     if (button) {
       button.disabled = count === 0;
-      button.title =
-        count === 0 ? '先开始同传并让视频说几句话，才有字幕可导出' : `导出本次 ${count} 条字幕（SRT）`;
+      button.title = count === 0 ? '先开始同传并让视频说几句话，才有字幕可导出' : `导出本次 ${count} 条字幕（SRT）`;
+      button.setAttribute('aria-disabled', count === 0 ? 'true' : 'false');
     }
   }
 
+  /** 统一引导卡：空态（npm start 可复制）/ 断线重连 / 抓音失败 */
   function renderGuidance() {
     const guide = runtime.els.guide;
     if (!guide) return;
@@ -1153,24 +1700,26 @@
     if (!state || (!active && !state.error)) {
       info = {
         title: '未连接本地引擎',
-        body:
-          '① 在 livedub 目录执行 npm start（或 node engine/server.mjs）\n② 确认 http://127.0.0.1:8787/health 可访问\n③ 点击工具栏 livedub 图标 → 开始同传',
+        body: '① 在 livedub 目录执行 npm start\n② 确认 http://127.0.0.1:8787/health 可访问\n③ 打开视频后点「开始同传」',
         showRetry: false,
         showStart: true,
+        copyCommand: 'npm start',
       };
     } else if (active && state.connection === 'closed') {
       info = {
         title: '引擎连接断开，正在自动重连…',
-        body: '请确认引擎进程仍在运行（npm start）。也可以点「重试连接」立即重连，无需重新开始抓音。',
+        body: '确认引擎进程仍在运行（npm start），或点「立即重连」跳过退避重试。',
         showRetry: true,
         showStart: false,
+        copyCommand: 'npm start',
       };
     } else if (state.phase === 'error') {
       info = {
         title: '抓音失败',
-        body: `${(state.error && state.error.message) || '请检查页面与引擎状态后重试。'}\n可先确认引擎已启动（npm start），再点「开始同传」。`,
+        body: `${(state.error && state.error.message) || '请检查页面与引擎状态后重试。'}\n确认引擎已启动后再点「开始同传」。`,
         showRetry: false,
         showStart: true,
+        copyCommand: 'npm start',
       };
     }
     guide.hidden = !info;
@@ -1181,6 +1730,7 @@
     const startButton = guide.querySelector('button[data-act="start"]');
     if (retryButton) retryButton.style.display = info.showRetry ? '' : 'none';
     if (startButton) startButton.style.display = info.showStart ? '' : 'none';
+    if (runtime.els.guideCmd) runtime.els.guideCmd.hidden = !info.copyCommand;
   }
 
   function renderMeta() {
@@ -1215,18 +1765,70 @@
     meta.textContent = lines.join('\n');
   }
 
-  /** v0.4：浮层 toast（记笔记结果等），2.6s 自动消失 */
-  function showToast(message, kind = 'ok', durationMs = 2600) {
-    const toast = runtime.els.toast;
-    if (!toast) return;
-    if (runtime.toastTimer) clearTimeout(runtime.toastTimer);
-    toast.hidden = false;
-    toast.setAttribute('data-kind', kind);
-    toast.textContent = String(message || '');
-    runtime.toastTimer = setTimeout(() => {
-      runtime.toastTimer = null;
-      if (runtime.els.toast) runtime.els.toast.hidden = true;
-    }, Math.max(800, durationMs));
+  /** v0.7：toast 堆叠（最多 3 条，可关闭；成功/排队/失败不同色调） */
+  function planToastStackInline({ existing = [], next = null, max = 3 } = {}) {
+    const limit = Math.max(1, max);
+    const items = Array.isArray(existing) ? existing.slice(-limit) : [];
+    if (!next) return { items };
+    items.push(next);
+    while (items.length > limit) items.shift();
+    return { items };
+  }
+
+  function renderToasts() {
+    const container = runtime.els.toast;
+    if (!container) return;
+    container.textContent = '';
+    for (const item of runtime.toasts) {
+      const toast = document.createElement('div');
+      toast.className = 'livedub-toast';
+      toast.setAttribute('data-kind', item.kind || 'ok');
+      toast.setAttribute('data-toast-id', item.id);
+      const dot = document.createElement('span');
+      dot.className = item.loading ? 'toast-spin' : 'toast-dot';
+      dot.setAttribute('aria-hidden', 'true');
+      const text = document.createElement('span');
+      text.className = 'toast-text';
+      text.textContent = item.text;
+      const close = document.createElement('button');
+      close.type = 'button';
+      close.className = 'toast-close';
+      close.setAttribute('data-toast-id', item.id);
+      close.setAttribute('aria-label', '关闭提示');
+      close.title = '关闭提示';
+      close.textContent = '✕';
+      toast.appendChild(dot);
+      toast.appendChild(text);
+      toast.appendChild(close);
+      container.appendChild(toast);
+    }
+  }
+
+  function showToast(message, kind = 'ok', durationMs = 2600, options = {}) {
+    const container = runtime.els.toast;
+    if (!container) return;
+    const id = `toast-${Date.now()}-${Math.round(Math.random() * 9999)}`;
+    const next = {
+      id,
+      text: String(message || ''),
+      kind,
+      loading: options.loading === true,
+      createdAt: Date.now(),
+    };
+    runtime.toasts = planToastStackInline({ existing: runtime.toasts, next, max: 3 }).items;
+    renderToasts();
+    if (runtime.toastTimers == null) runtime.toastTimers = new Map();
+    const timer = setTimeout(() => dismissToast(id), Math.max(900, durationMs));
+    runtime.toastTimers.set(id, timer);
+  }
+
+  function dismissToast(id) {
+    runtime.toasts = runtime.toasts.filter((item) => item.id !== id);
+    if (runtime.toastTimers && runtime.toastTimers.has(id)) {
+      clearTimeout(runtime.toastTimers.get(id));
+      runtime.toastTimers.delete(id);
+    }
+    renderToasts();
   }
 
   /** 找页面主视频（优先正在播放、其次有 duration 的） */
@@ -1295,6 +1897,9 @@
 
   /** 面板「记笔记」按钮：交给 background 处理截图 + POST（需要用户手势已由点击提供） */
   async function captureNote() {
+    if (runtime.notePending) return;
+    runtime.notePending = true;
+    renderNoteButton();
     try {
       const response = await chrome.runtime.sendMessage({
         type: M.CAPTURE_NOTE,
@@ -1308,6 +1913,9 @@
       }
     } catch (err) {
       showToast(`记笔记失败：${String((err && err.message) || err)}`, 'error', 5200);
+    } finally {
+      runtime.notePending = false;
+      renderNoteButton();
     }
   }
 
@@ -1338,6 +1946,7 @@
     const existing = runtime.items.get(key);
     const item = existing ? { ...existing, ...patch } : { key, src: '', dst: '', draft: false, ts: now(), ...patch };
     item.ts = now();
+    if (!existing) restartCaptionProgress(item);
     if (patch.dst != null) item.dst = cleanText(patch.dst, 600);
     if (patch.src != null) item.src = cleanText(patch.src, 600);
     runtime.items.set(key, item);
@@ -1356,6 +1965,53 @@
     }
   }
 
+  /** 时间码 mm:ss（>=1h 为 h:mm:ss） */
+  function formatTimecodeUi(ms) {
+    const value = Number.isFinite(ms) ? Math.max(0, Math.round(ms)) : 0;
+    const total = Math.floor(value / 1000);
+    const hours = Math.floor(total / 3600);
+    const minutes = Math.floor((total % 3600) / 60);
+    const seconds = total % 60;
+    const pad = (n) => String(n).padStart(2, '0');
+    return hours > 0 ? `${hours}:${pad(minutes)}:${pad(seconds)}` : `${pad(minutes)}:${pad(seconds)}`;
+  }
+
+  /** 估算字幕展示时长（进度线动画） */
+  function estimateCaptionDurationUIMs({ text = '', t0Ms = null, t1Ms = null } = {}) {
+    const span = Number.isFinite(t0Ms) && Number.isFinite(t1Ms) && t1Ms > t0Ms ? Math.round(t1Ms - t0Ms) : 0;
+    if (span > 0) return Math.min(8000, Math.max(1200, span));
+    const chars = String(text == null ? '' : text).replace(/\s+/g, '').length;
+    return Math.min(6000, Math.max(1200, Math.round(900 + chars * 55)));
+  }
+
+  /** 新一句字幕到达：重置顶部 accent 进度线 */
+  function restartCaptionProgress(item) {
+    const fill = runtime.els.progressFill;
+    if (!fill) return;
+    const duration = estimateCaptionDurationUIMs({
+      text: (item && (item.src || item.dst)) || '',
+      t0Ms: item && item.t0Ms,
+      t1Ms: item && item.t1Ms,
+    });
+    runtime.progressStartedAt = Date.now();
+    runtime.progressDurationMs = duration;
+    const reduced =
+      typeof window.matchMedia === 'function' && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+    if (reduced) {
+      fill.style.transition = 'none';
+      fill.style.width = '100%';
+      return;
+    }
+    fill.style.transition = 'none';
+    fill.style.width = '0%';
+    void fill.offsetWidth;
+    fill.style.transition = `width ${duration}ms linear`;
+    requestAnimationFrame(() => {
+      fill.style.width = '100%';
+    });
+  }
+
+  /** 双语字幕块：译文大字优先、原文次级、右上角时间码 */
   function renderSubtitles() {
     const { subs, sublist } = runtime.els;
     if (!subs || !sublist) return;
@@ -1371,6 +2027,10 @@
       const block = document.createElement('div');
       block.className = 'livedub-block';
       block.setAttribute('data-block-id', item.key);
+      const time = document.createElement('span');
+      time.className = 'time';
+      time.textContent = formatTimecodeUi(Number.isFinite(item.t0Ms) ? item.t0Ms : item.ts);
+      time.setAttribute('aria-hidden', 'true');
       const src = document.createElement('div');
       src.className = 'src';
       src.textContent = runtime.settings.showOriginal ? item.src : '';
@@ -1384,6 +2044,7 @@
         if (item.draft) dst.classList.add('draft');
         dst.textContent = item.dst;
       }
+      block.appendChild(time);
       block.appendChild(src);
       block.appendChild(dst);
       sublist.appendChild(block);
@@ -1412,7 +2073,12 @@
           const last = [...runtime.items.values()].pop();
           if (last && last.draft) runtime.items.delete(last.key);
         }
-        upsertItem(key, { src: event.text, draft: false });
+        upsertItem(key, {
+          src: event.text,
+          draft: false,
+          t0Ms: Number.isFinite(event.t0Ms) ? event.t0Ms : null,
+          t1Ms: Number.isFinite(event.t1Ms) ? event.t1Ms : null,
+        });
         break;
       }
       case 'translation':
@@ -1427,6 +2093,9 @@
         else duckIdle();
         if (runtime.bgState) {
           runtime.bgState = { ...runtime.bgState, engineState: event.state || runtime.bgState.engineState };
+          if (runtime.els.root) {
+            runtime.els.root.setAttribute('data-speaking', event.state === 'speaking' ? 'true' : 'false');
+          }
           renderStatus();
         }
         break;
@@ -1570,13 +2239,19 @@
       case M.NOTE_RESULT: {
         const result = message.result || {};
         if (result.pending) {
-          // v0.5：正在等 OCR/VLM（VLM 可能 20-30s）
-          if (result.toast) showToast(result.toast, 'warn', 4000);
-        } else if (result.toast) {
-          const suffix = result.vision && (result.vision.ocr || result.vision.caption) ? '（含画面文字）' : '';
-          showToast(`${result.toast}${suffix}`, result.queued ? 'warn' : 'ok');
-        } else if (result.ok) {
-          showToast('已记笔记', 'ok');
+          // v0.5/v0.7：正在等 OCR/VLM（VLM 可能 20-30s）——按钮进入 loading，toast 带 spinner
+          runtime.notePending = true;
+          renderNoteButton();
+          if (result.toast) showToast(result.toast, 'warn', 4000, { loading: true });
+        } else {
+          runtime.notePending = false;
+          renderNoteButton();
+          if (result.toast) {
+            const suffix = result.vision && (result.vision.ocr || result.vision.caption) ? '（含画面文字）' : '';
+            showToast(`${result.toast}${suffix}`, result.queued ? 'warn' : 'ok');
+          } else if (result.ok) {
+            showToast('已记笔记', 'ok');
+          }
         }
         sendResponse({ ok: true });
         return false;
@@ -1616,6 +2291,7 @@
       tickCount += 1;
       ensureMounted();
       duckTick();
+      if (tickCount % 2 === 0) renderNoteButton();
       if (tickCount % 4 === 0) pruneItems();
       // 运行中每 2s 收集一次新媒体元素（SPA 换播放器 / 新视频）
       if (runtime.duck.ducking && tickCount % 2 === 0) duckActivity();

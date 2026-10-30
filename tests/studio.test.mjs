@@ -68,6 +68,8 @@ import {
   localNotesKey,
   makeQuote,
   makeVideoId,
+  groupNotesForDisplay,
+  matchesNoteFilter,
   noteExcerpt,
   parseTags,
   renderMarkdown,
@@ -88,6 +90,10 @@ import {
   normalizeAsrEngine,
   normalizeSubsStyle,
   normalizeTheme,
+  filterCommands,
+  fuzzyMatch,
+  nextTabIndex,
+  progressStepStates,
   resolveShortcut,
 } from '../studio/ui-kit.mjs';
 
@@ -443,6 +449,30 @@ test('HTTP 静态服务：/ -> /studio/、/studio/ 与 /replay/ 200、缺失 404
     assert.ok(appJs.body.includes('sendJson(message)'), '画面上下文应通过现有 WS 发送');
     assert.ok(appJs.body.includes('/api/notes/obsidian/status'));
     assert.ok(appJs.body.includes("target: 'obsidian'"));
+    // v0.7：dock / 命令面板 / 快捷键帮助 / lightbox / 设计 token / 无障碍
+    assert.ok(studio.body.includes('dock-rail'), 'dock tab rail 应存在');
+    assert.ok(studio.body.includes('role="tablist"'));
+    assert.ok(studio.body.includes('role="tabpanel"'));
+    assert.ok(studio.body.includes('commandPalette'));
+    assert.ok(studio.body.includes('shortcutHelp'));
+    assert.ok(studio.body.includes('imageLightbox'));
+    assert.ok(studio.body.includes('notesFilters'));
+    assert.ok(studio.body.includes('visualSteps'));
+    assert.ok(studio.body.includes('aria-label="命令面板"'));
+    assert.ok(studio.body.includes('aria-label="快捷键帮助"'));
+    assert.ok(studio.body.includes('data-dock-tab="notes"'));
+    const css = await httpRequest(srv.port, '/studio/styles.css');
+    assert.equal(css.status, 200);
+    for (const token of ['--surface-1', '--surface-2', '--surface-3', '--text-2', '--text-3', '--focus-ring', '--ease-out', '--dur-fast', '--dur-base', '--dur-slow']) {
+      assert.ok(css.body.includes(token), `styles.css 应定义设计 token ${token}`);
+    }
+    assert.ok(css.body.includes('prefers-reduced-motion: reduce'), '应尊重 reduced-motion');
+    assert.ok(css.body.includes(':focus-visible'), '应提供 focus-visible 焦点环');
+    assert.ok(appJs.body.includes('openCommandPalette') && appJs.body.includes('openShortcutHelp') && appJs.body.includes('openLightbox'));
+    const replayHtml = await httpRequest(srv.port, '/replay/');
+    assert.ok(replayHtml.body.includes('/studio/styles.css'), 'replay 应复用统一设计系统 CSS');
+    assert.ok(replayHtml.body.includes('dataset.theme'), 'replay 应提前应用主题避免闪屏');
+
     const contextKit = await httpRequest(srv.port, '/studio/context-kit.mjs');
     assert.equal(contextKit.status, 200);
     assert.ok(contextKit.body.includes("type: 'visual-context'"), 'WS 消息 type 应为 visual-context');
@@ -2499,3 +2529,53 @@ function localDateStringForTest() {
   const date = new Date();
   return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`;
 }
+
+test('v0.7 纯函数：命令模糊搜索 / tab 循环 / 进度步骤 / 笔记过滤分组', () => {
+  const commands = [
+    { id: 'start', title: '开始同传', keywords: ['start', '连接'] },
+    { id: 'notes', title: '打开笔记工作区', keywords: ['notes', '笔记'] },
+    { id: 'theme', title: '切换暗色 / 亮色主题', keywords: ['theme'] },
+    { id: 'visual', title: '生成图文笔记', keywords: ['visual', 'OCR'] },
+  ];
+  assert.equal(fuzzyMatch('打开笔记工作区', '笔记'), true);
+  assert.equal(fuzzyMatch('Gradient Descent', 'gdc'), true);
+  assert.equal(fuzzyMatch('Gradient Descent', 'xyz'), false);
+  assert.equal(fuzzyMatch('abc', ''), true);
+  assert.deepEqual(filterCommands(commands, '').map((c) => c.id), ['start', 'notes', 'theme', 'visual']);
+  assert.deepEqual(filterCommands(commands, '笔记').map((c) => c.id), ['notes', 'visual']);
+  assert.deepEqual(filterCommands(commands, 'start').map((c) => c.id), ['start']);
+  assert.deepEqual(filterCommands(commands, 'zzz'), []);
+
+  assert.equal(nextTabIndex(0, 3, 1), 1);
+  assert.equal(nextTabIndex(2, 3, 1), 0);
+  assert.equal(nextTabIndex(0, 3, -1), 2);
+  assert.equal(nextTabIndex(5, 1, 1), 0);
+
+  const steps = progressStepStates('ocr');
+  assert.deepEqual(steps.map((entry) => entry.state), ['done', 'active', 'pending', 'pending', 'pending']);
+  assert.deepEqual(progressStepStates('save').map((entry) => entry.state), ['done', 'done', 'done', 'done', 'active']);
+  assert.ok(progressStepStates(null).every((entry) => entry.state === 'pending'));
+  assert.ok(progressStepStates('unknown').every((entry) => entry.state === 'pending'));
+
+  const notes = [
+    { id: 'a', kind: 'outline', tags: ['课程总览'], tMs: 0 },
+    { id: 'b', kind: 'visual', tags: ['图文笔记', '章节'], tMs: 30000 },
+    { id: 'c', kind: 'visual', tags: ['图文笔记'], tMs: 10000 },
+    { id: 'd', kind: 'quick', tags: [], tMs: 5000 },
+    { id: 'e', kind: 'note', tags: [], tMs: 2000 },
+  ];
+  assert.equal(matchesNoteFilter(notes[0], 'overview'), true);
+  assert.equal(matchesNoteFilter(notes[1], 'chapter'), true);
+  assert.equal(matchesNoteFilter(notes[1], 'visual'), true);
+  assert.equal(matchesNoteFilter(notes[2], 'chapter'), false);
+  assert.equal(matchesNoteFilter(notes[3], 'quick'), true);
+  assert.equal(matchesNoteFilter(notes[4], 'all'), true);
+  assert.equal(matchesNoteFilter(notes[4], 'visual'), false);
+  const groups = groupNotesForDisplay(notes, 'all');
+  assert.deepEqual(groups.map((group) => group.id), ['overview', 'chapters', 'visual', 'quick', 'notes']);
+  assert.deepEqual(groups.map((group) => group.notes.map((note) => note.id)), [['a'], ['b'], ['c'], ['d'], ['e']]);
+  const chapterOnly = groupNotesForDisplay(notes, 'chapter');
+  assert.equal(chapterOnly.length, 1);
+  assert.equal(chapterOnly[0].id, 'chapters');
+  assert.equal(groupNotesForDisplay([], 'all').length, 0);
+});

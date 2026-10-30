@@ -1,0 +1,592 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <title>livedub 字幕浮层 / 快捷面板静态预览</title>
+  <style>
+    html, body { margin: 0; height: 100%; overflow: hidden; }
+    body { background: #0b1220; color: #e6edf7; font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", "Microsoft YaHei", sans-serif; }
+    .lecture { position: fixed; inset: 0; padding: 54px 70px;
+      background: radial-gradient(1200px 600px at 18% -10%, rgba(45,212,191,0.16), transparent 60%),
+        radial-gradient(900px 500px at 110% 110%, rgba(96,165,250,0.14), transparent 60%),
+        linear-gradient(160deg, #0a1520 0%, #0b1220 45%, #101a2c 100%); }
+    .brand { display: flex; align-items: center; gap: 12px; color: #8fa3bd; font-size: 14px; }
+    .brand b { color: #2dd4bf; letter-spacing: 0.4px; }
+    h1 { font-size: 44px; margin: 36px 0 8px; letter-spacing: -0.5px; }
+    .subtitle-line { color: #9fb3c8; font-size: 18px; margin-bottom: 34px; }
+    .grid { display: grid; grid-template-columns: 1.1fr 0.9fr; gap: 28px; max-width: 1100px; }
+    .slide { border-radius: 18px; padding: 26px 28px; background: rgba(255,255,255,0.045);
+      border: 1px solid rgba(255,255,255,0.12); box-shadow: 0 24px 60px rgba(0,0,0,0.35);
+      font-size: 17px; line-height: 1.8; color: #cfe0f2; }
+    .slide h2 { font-size: 20px; color: #eaf3ff; margin: 0 0 12px; }
+    .slide .formula { margin-top: 14px; padding: 12px 16px; border-radius: 12px;
+      background: rgba(45,212,191,0.1); border: 1px solid rgba(45,212,191,0.22);
+      font-family: ui-monospace, Menlo, monospace; font-size: 15px; color: #b9f3ea; }
+    .meta { color: #7f96b3; font-size: 13px; margin-top: 22px; }
+    
+    
+    .livedub-root {
+      position: fixed; inset: 0; pointer-events: none;
+      font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+      color: var(--livedub-ink);
+      --livedub-accent: #2dd4bf;
+      --livedub-accent-strong: #14b8a6;
+      --livedub-accent-soft: rgba(45, 212, 191, 0.14);
+      --livedub-ink: #f2f7f6;
+      --livedub-ink-dim: #a9bcba;
+      --livedub-ink-mute: #7f9694;
+      --livedub-glass: rgba(12, 20, 20, 0.76);
+      --livedub-glass-strong: rgba(10, 17, 17, 0.92);
+      --livedub-glass-border: rgba(255, 255, 255, 0.12);
+      --livedub-shadow: 0 10px 34px rgba(0, 0, 0, 0.42);
+      --livedub-danger: #fb7185;
+      --livedub-warn: #fbbf24;
+      --livedub-radius: 16px;
+      --livedub-radius-sm: 12px;
+      --livedub-dur: 170ms;
+    }
+    @media (prefers-color-scheme: light) {
+      .livedub-root {
+        --livedub-ink: #12201f;
+        --livedub-ink-dim: #43595a;
+        --livedub-ink-mute: #67807f;
+        --livedub-glass: rgba(250, 253, 252, 0.88);
+        --livedub-glass-strong: rgba(252, 255, 254, 0.96);
+        --livedub-glass-border: rgba(15, 40, 38, 0.12);
+        --livedub-shadow: 0 10px 30px rgba(15, 40, 38, 0.16);
+        --livedub-accent-soft: rgba(20, 184, 166, 0.12);
+      }
+    }
+    @media (prefers-reduced-motion: reduce) {
+      .livedub-root * { transition: none !important; animation: none !important; }
+    }
+    .livedub-glass {
+      background: var(--livedub-glass);
+      border: 1px solid var(--livedub-glass-border);
+      box-shadow: var(--livedub-shadow);
+      -webkit-backdrop-filter: blur(14px) saturate(1.2);
+      backdrop-filter: blur(14px) saturate(1.2);
+    }
+    @supports not ((backdrop-filter: blur(1px)) or (-webkit-backdrop-filter: blur(1px))) {
+      .livedub-glass { background: var(--livedub-glass-strong); }
+    }
+    /* ---------- 状态 pill ---------- */
+    .livedub-capsule {
+      position: fixed; top: 14px; right: 14px;
+      display: inline-flex; align-items: center; gap: 8px;
+      min-height: 32px; padding: 6px 12px; border-radius: 999px;
+      background: var(--livedub-glass);
+      border: 1px solid var(--livedub-glass-border);
+      box-shadow: var(--livedub-shadow);
+      -webkit-backdrop-filter: blur(14px); backdrop-filter: blur(14px);
+      color: var(--livedub-ink);
+      font-size: 12.5px; line-height: 1; cursor: pointer;
+      pointer-events: auto; user-select: none;
+      transition: transform var(--livedub-dur) ease, background var(--livedub-dur) ease;
+    }
+    .livedub-capsule:hover { transform: translateY(-1px); }
+    .livedub-capsule:focus-visible,
+    .livedub-panel button:focus-visible,
+    .livedub-panel input:focus-visible,
+    .livedub-panel select:focus-visible,
+    .livedub-panel [role="tab"]:focus-visible,
+    .livedub-toast button:focus-visible {
+      outline: 2px solid var(--livedub-accent);
+      outline-offset: 2px;
+    }
+    .livedub-capsule .dot {
+      width: 8px; height: 8px; border-radius: 50%;
+      background: var(--livedub-ink-mute); flex: none;
+      transition: background var(--livedub-dur) ease, box-shadow var(--livedub-dur) ease;
+    }
+    .livedub-capsule[data-tone="live"] .dot { background: var(--livedub-accent); box-shadow: 0 0 0 3px var(--livedub-accent-soft); }
+    .livedub-capsule[data-tone="busy"] .dot { background: var(--livedub-warn); animation: livedub-pulse 1.4s ease-in-out infinite; }
+    .livedub-capsule[data-tone="translate"] .dot { background: #60a5fa; }
+    .livedub-capsule[data-tone="speak"] .dot { background: var(--livedub-accent-strong); box-shadow: 0 0 0 3px var(--livedub-accent-soft); }
+    .livedub-capsule[data-tone="error"] .dot { background: var(--livedub-danger); }
+    .livedub-capsule .state { font-weight: 600; letter-spacing: 0.2px; }
+    .livedub-capsule .lat {
+      color: var(--livedub-ink-dim); font-variant-numeric: tabular-nums;
+      padding-left: 8px; border-left: 1px solid var(--livedub-glass-border);
+    }
+    .livedub-capsule .gear { color: var(--livedub-ink-dim); font-size: 12px; }
+    @keyframes livedub-pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.35; } }
+    /* ---------- 快捷面板 ---------- */
+    .livedub-panel {
+      position: fixed; top: 56px; right: 14px; width: 318px;
+      max-height: calc(100vh - 82px); overflow-y: auto; overflow-x: hidden;
+      padding: 0; border-radius: var(--livedub-radius);
+      background: var(--livedub-glass-strong);
+      border: 1px solid var(--livedub-glass-border);
+      box-shadow: var(--livedub-shadow);
+      -webkit-backdrop-filter: blur(16px); backdrop-filter: blur(16px);
+      pointer-events: auto; font-size: 12.5px; color: var(--livedub-ink);
+      scrollbar-width: thin;
+    }
+    .livedub-panel[hidden] { display: none; }
+    .livedub-panel-head {
+      position: sticky; top: 0; z-index: 2;
+      display: flex; align-items: center; gap: 8px;
+      min-height: 44px; padding: 8px 10px 8px 12px;
+      border-bottom: 1px solid var(--livedub-glass-border);
+      background: var(--livedub-glass-strong);
+      cursor: grab; user-select: none;
+    }
+    .livedub-panel-head:active { cursor: grabbing; }
+    .livedub-panel-title { font-size: 12.5px; font-weight: 700; letter-spacing: 0.3px; white-space: nowrap; }
+    .livedub-panel-title .brand { color: var(--livedub-accent-strong); }
+    .livedub-panel-head .spacer { flex: 1; }
+    .livedub-icon-btn {
+      flex: none; width: 32px; height: 32px; padding: 0;
+      display: inline-flex; align-items: center; justify-content: center;
+      background: transparent; border: 1px solid transparent; border-radius: 9px;
+      color: var(--livedub-ink-dim); font-size: 15px; line-height: 1; cursor: pointer;
+      transition: background var(--livedub-dur) ease, color var(--livedub-dur) ease;
+    }
+    .livedub-icon-btn:hover { background: var(--livedub-accent-soft); color: var(--livedub-ink); }
+    .livedub-tabs { display: flex; gap: 2px; padding: 8px 10px 0; }
+    .livedub-tabs [role="tab"] {
+      flex: 1; min-height: 32px; padding: 6px 8px;
+      background: transparent; border: none; border-bottom: 2px solid transparent;
+      border-radius: 8px 8px 0 0; color: var(--livedub-ink-mute);
+      font-size: 12.5px; font-weight: 600; font-family: inherit; cursor: pointer;
+      transition: color var(--livedub-dur) ease, border-color var(--livedub-dur) ease, background var(--livedub-dur) ease;
+    }
+    .livedub-tabs [role="tab"]:hover { color: var(--livedub-ink); background: var(--livedub-accent-soft); }
+    .livedub-tabs [role="tab"][aria-selected="true"] {
+      color: var(--livedub-ink); border-bottom-color: var(--livedub-accent);
+    }
+    .livedub-panel-body[hidden] { display: none; }
+    .livedub-tabpanel { padding: 10px 12px 6px; }
+    .livedub-tabpanel[hidden] { display: none; }
+    .livedub-group { margin: 0 0 12px; }
+    .livedub-group-title {
+      font-size: 10.5px; font-weight: 700; letter-spacing: 0.8px; text-transform: uppercase;
+      color: var(--livedub-ink-mute); margin: 2px 0 7px;
+    }
+    .livedub-row {
+      display: flex; align-items: center; gap: 8px;
+      min-height: 34px; margin: 4px 0;
+    }
+    .livedub-row .row-label { color: var(--livedub-ink-dim); flex: none; min-width: 44px; }
+    .livedub-row .val { min-width: 42px; text-align: right; color: var(--livedub-ink-dim); font-variant-numeric: tabular-nums; font-size: 11px; }
+    .livedub-row input[type="range"] { flex: 1; min-width: 0; accent-color: var(--livedub-accent-strong); height: 32px; }
+    .livedub-row select {
+      flex: 1; min-width: 0; min-height: 32px; padding: 4px 8px; border-radius: 9px;
+      background: var(--livedub-accent-soft); border: 1px solid var(--livedub-glass-border);
+      color: var(--livedub-ink); font-size: 12px; font-family: inherit;
+    }
+    .livedub-row select option { background: #0f1a19; color: #eef7f6; }
+    @media (prefers-color-scheme: light) { .livedub-row select option { background: #ffffff; color: #12201f; } }
+    /* 开关（switch） */
+    .livedub-switch { position: relative; display: inline-flex; align-items: center; gap: 8px; flex: 1; min-height: 32px; cursor: pointer; }
+    .livedub-switch input {
+      appearance: none; -webkit-appearance: none; flex: none;
+      width: 34px; height: 20px; margin: 0; border-radius: 999px;
+      background: var(--livedub-glass-border); border: 1px solid var(--livedub-glass-border);
+      cursor: pointer; transition: background var(--livedub-dur) ease;
+    }
+    .livedub-switch input::after {
+      content: ""; display: block; width: 14px; height: 14px; margin: 2px;
+      border-radius: 50%; background: var(--livedub-ink-dim);
+      transition: transform var(--livedub-dur) ease, background var(--livedub-dur) ease;
+    }
+    .livedub-switch input:checked { background: var(--livedub-accent-soft); border-color: var(--livedub-accent-strong); }
+    .livedub-switch input:checked::after { transform: translateX(14px); background: var(--livedub-accent-strong); }
+    .livedub-switch .switch-label { color: var(--livedub-ink); font-size: 12.5px; }
+    /* 分段控件 */
+    .livedub-seg {
+      display: inline-flex; gap: 2px; padding: 2px; flex: 1;
+      background: var(--livedub-accent-soft); border: 1px solid var(--livedub-glass-border);
+      border-radius: 10px;
+    }
+    .livedub-seg button {
+      flex: 1; min-height: 28px; padding: 4px 8px;
+      background: transparent; border: none; border-radius: 8px;
+      color: var(--livedub-ink-dim); font-size: 12px; font-family: inherit; cursor: pointer;
+      transition: background var(--livedub-dur) ease, color var(--livedub-dur) ease;
+    }
+    .livedub-seg button:hover { color: var(--livedub-ink); }
+    .livedub-seg button.active { background: var(--livedub-glass-strong); color: var(--livedub-ink); box-shadow: 0 1px 3px rgba(0,0,0,0.2); }
+    /* 按钮 */
+    .livedub-panel button.livedub-btn {
+      min-height: 34px; padding: 7px 10px; border-radius: 10px;
+      border: 1px solid var(--livedub-glass-border);
+      background: var(--livedub-accent-soft); color: var(--livedub-ink);
+      font-size: 12px; font-family: inherit; cursor: pointer;
+      transition: background var(--livedub-dur) ease, opacity var(--livedub-dur) ease;
+    }
+    .livedub-panel button.livedub-btn:hover:not(:disabled) { background: var(--livedub-glass); }
+    .livedub-panel button.livedub-btn:disabled { opacity: 0.45; cursor: default; }
+    .livedub-panel button.livedub-btn-primary {
+      background: linear-gradient(135deg, var(--livedub-accent-strong), var(--livedub-accent));
+      border-color: transparent; color: #062622; font-weight: 700;
+    }
+    .livedub-panel button.livedub-btn-primary:hover:not(:disabled) { filter: brightness(1.05); }
+    .livedub-panel .livedub-actions { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 8px; }
+    .livedub-panel .livedub-actions button { flex: 1; min-width: 84px; }
+    .livedub-note-btn { width: 100%; margin-top: 4px; }
+    .livedub-note-btn .spin {
+      display: inline-block; width: 11px; height: 11px; margin-right: 6px;
+      border: 2px solid currentColor; border-right-color: transparent; border-radius: 50%;
+      animation: livedub-spin 0.8s linear infinite; vertical-align: -1px;
+    }
+    @keyframes livedub-spin { to { transform: rotate(360deg); } }
+    .livedub-meta {
+      margin: 8px 0 0; padding-top: 8px;
+      border-top: 1px dashed var(--livedub-glass-border);
+      font-size: 11px; color: var(--livedub-ink-mute); line-height: 1.6; white-space: pre-line;
+    }
+    .livedub-meta[hidden] { display: none; }
+    .livedub-note-summary { font-size: 11.5px; color: var(--livedub-ink-dim); padding: 2px 0 6px; }
+    .livedub-guide {
+      margin: 8px 0 2px; padding: 10px; border-radius: var(--livedub-radius-sm);
+      background: var(--livedub-accent-soft); border: 1px solid rgba(45, 212, 191, 0.28);
+      font-size: 11.5px; line-height: 1.55; color: var(--livedub-ink);
+    }
+    .livedub-guide[hidden] { display: none; }
+    .livedub-guide .guide-title { font-weight: 700; margin-bottom: 4px; }
+    .livedub-guide .guide-body { white-space: pre-line; color: var(--livedub-ink-dim); }
+    .livedub-guide .guide-actions { display: flex; gap: 6px; margin-top: 8px; }
+    .livedub-guide .guide-actions button { flex: 1; }
+    .livedub-cmd {
+      display: flex; align-items: center; gap: 6px; margin-top: 8px;
+      padding: 6px 8px; border-radius: 9px;
+      background: var(--livedub-glass); border: 1px solid var(--livedub-glass-border);
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11.5px; color: var(--livedub-ink);
+    }
+    .livedub-cmd code { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .livedub-cmd button { min-height: 26px; padding: 3px 8px; flex: none; }
+    .livedub-panel-footer {
+      padding: 8px 12px 10px; border-top: 1px solid var(--livedub-glass-border);
+      color: var(--livedub-ink-mute); font-size: 10.5px; line-height: 1.5;
+    }
+    .livedub-panel-footer kbd {
+      font-family: inherit; padding: 1px 5px; border-radius: 5px;
+      border: 1px solid var(--livedub-glass-border); background: var(--livedub-accent-soft);
+      color: var(--livedub-ink-dim);
+    }
+    .livedub-error {
+      margin-top: 8px; padding: 8px 10px; border-radius: var(--livedub-radius-sm);
+      background: rgba(251, 113, 133, 0.14); border: 1px solid rgba(251, 113, 133, 0.36);
+      color: var(--livedub-ink); font-size: 11.5px; line-height: 1.45;
+    }
+    .livedub-error[hidden] { display: none; }
+    .livedub-error[data-kind="info"] {
+      background: var(--livedub-accent-soft); border-color: rgba(45, 212, 191, 0.32);
+    }
+    /* ---------- toast 堆叠 ---------- */
+    .livedub-toasts {
+      position: fixed; top: 56px; left: 50%; transform: translateX(-50%);
+      display: flex; flex-direction: column; gap: 8px; align-items: center;
+      pointer-events: none; max-width: min(78vw, 760px); z-index: 3;
+    }
+    .livedub-toast {
+      display: flex; align-items: center; gap: 8px;
+      min-height: 36px; padding: 7px 8px 7px 12px; border-radius: 999px;
+      background: var(--livedub-glass-strong);
+      border: 1px solid var(--livedub-glass-border);
+      box-shadow: var(--livedub-shadow);
+      -webkit-backdrop-filter: blur(14px); backdrop-filter: blur(14px);
+      color: var(--livedub-ink); font-size: 12.5px; line-height: 1.35;
+      pointer-events: auto; white-space: pre-line; text-align: center;
+      animation: livedub-toast-in var(--livedub-dur) ease both;
+    }
+    @keyframes livedub-toast-in { from { opacity: 0; transform: translateY(-6px); } to { opacity: 1; transform: translateY(0); } }
+    .livedub-toast[data-kind="warn"] { border-color: rgba(251, 191, 36, 0.42); }
+    .livedub-toast[data-kind="error"] { border-color: rgba(251, 113, 133, 0.48); }
+    .livedub-toast .toast-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--livedub-accent); flex: none; }
+    .livedub-toast[data-kind="warn"] .toast-dot { background: var(--livedub-warn); }
+    .livedub-toast[data-kind="error"] .toast-dot { background: var(--livedub-danger); }
+    .livedub-toast .toast-spin {
+      width: 12px; height: 12px; border: 2px solid currentColor; border-right-color: transparent;
+      border-radius: 50%; animation: livedub-spin 0.8s linear infinite; flex: none;
+    }
+    .livedub-toast .toast-close {
+      flex: none; width: 32px; height: 32px; margin: -4px -4px -4px 0;
+      display: inline-flex; align-items: center; justify-content: center;
+      background: transparent; border: none; border-radius: 999px;
+      color: var(--livedub-ink-mute); font-size: 15px; cursor: pointer;
+    }
+    .livedub-toast .toast-close:hover { background: var(--livedub-accent-soft); color: var(--livedub-ink); }
+    /* ---------- 字幕 ---------- */
+    .livedub-subs {
+      position: fixed; left: 50%; bottom: 8vh;
+      transform: translateX(-50%);
+      width: fit-content; max-width: min(78vw, 980px);
+      display: flex; flex-direction: column; gap: 6px;
+      pointer-events: auto; user-select: none;
+      --livedub-subs-alpha: 0.72;
+      --livedub-subs-accent: var(--livedub-accent);
+    }
+    .livedub-subs[hidden] { display: none; }
+    .livedub-subs-handle {
+      align-self: center; width: 56px; height: 18px; margin-bottom: -2px;
+      display: inline-flex; align-items: center; justify-content: center;
+      border-radius: 999px; background: var(--livedub-glass);
+      border: 1px solid var(--livedub-glass-border);
+      color: var(--livedub-ink-mute); font-size: 11px; letter-spacing: 2px;
+      cursor: grab; pointer-events: auto; opacity: 0.55;
+      transition: opacity var(--livedub-dur) ease, background var(--livedub-dur) ease;
+    }
+    .livedub-subs:hover .livedub-subs-handle { opacity: 1; }
+    .livedub-subs-handle:active { cursor: grabbing; }
+    .livedub-stack { display: flex; flex-direction: column; gap: 6px; }
+    .livedub-block {
+      position: relative; overflow: hidden;
+      padding: 11px 18px 12px; border-radius: var(--livedub-radius);
+      background: rgba(8, 15, 15, var(--livedub-subs-alpha, 0.72));
+      border: 1px solid rgba(255, 255, 255, 0.09);
+      box-shadow: 0 10px 30px rgba(0, 0, 0, 0.4);
+      -webkit-backdrop-filter: blur(10px) saturate(1.1); backdrop-filter: blur(10px) saturate(1.1);
+      text-align: center;
+      transition: border-color var(--livedub-dur) ease;
+    }
+    @supports not ((backdrop-filter: blur(1px)) or (-webkit-backdrop-filter: blur(1px))) {
+      .livedub-block { background: rgba(8, 15, 15, 0.92); }
+    }
+    .livedub-root[data-bg="light"] .livedub-block {
+      background: rgba(248, 252, 251, var(--livedub-subs-alpha, 0.9));
+      border-color: rgba(15, 40, 38, 0.1);
+      box-shadow: 0 8px 26px rgba(15, 40, 38, 0.2);
+    }
+    .livedub-root[data-bg="none"] .livedub-block {
+      background: transparent; border-color: transparent;
+      box-shadow: none; -webkit-backdrop-filter: none; backdrop-filter: none;
+      padding: 4px 8px 6px;
+    }
+    .livedub-progress {
+      height: 2px; border-radius: 999px; margin: 0 2px -2px;
+      background: rgba(255, 255, 255, 0.12); overflow: hidden;
+    }
+    .livedub-root[data-bg="light"] .livedub-progress { background: rgba(15, 40, 38, 0.12); }
+    .livedub-progress > span {
+      display: block; height: 100%; width: 0;
+      background: linear-gradient(90deg, var(--livedub-accent), var(--livedub-accent-strong));
+      border-radius: 999px;
+    }
+    .livedub-root[data-speaking="true"] .livedub-progress > span { box-shadow: 0 0 8px var(--livedub-accent); }
+    .livedub-block .time {
+      position: absolute; top: 6px; right: 10px;
+      font-size: 10px; color: var(--livedub-ink-mute); font-variant-numeric: tabular-nums;
+      opacity: 0.8;
+    }
+    .livedub-root[data-bg="light"] .livedub-block .time { color: #5d7675; }
+    .livedub-block .dst {
+      color: #ffffff; font-weight: 600;
+      font-size: 1em; line-height: 1.4;
+      text-shadow: 0 1px 3px rgba(0, 0, 0, 0.5); white-space: pre-line;
+      letter-spacing: 0.1px;
+    }
+    .livedub-block .dst.draft { opacity: 0.78; font-weight: 500; }
+    .livedub-block .src {
+      color: #a8bcba; font-size: 0.62em; line-height: 1.4;
+      margin-bottom: 4px; white-space: pre-line; font-weight: 500;
+    }
+    .livedub-block .src[hidden] { display: none; }
+    .livedub-root[data-bg="light"] .livedub-block .dst { color: #0c1a19; text-shadow: none; }
+    .livedub-root[data-bg="light"] .livedub-block .src { color: #4d6665; }
+    .livedub-root[data-bg="light"] .livedub-block .dst.draft { color: #243b3a; }
+    /* 原声 duck 指示 */
+    .livedub-duck {
+      position: fixed; right: 14px; bottom: calc(8vh + 2px);
+      display: inline-flex; align-items: center; gap: 5px;
+      min-height: 22px; padding: 2px 9px; border-radius: 999px;
+      background: var(--livedub-glass); border: 1px solid var(--livedub-glass-border);
+      color: var(--livedub-ink-dim); font-size: 10.5px;
+      pointer-events: none; opacity: 0; transform: translateY(4px);
+      transition: opacity var(--livedub-dur) ease, transform var(--livedub-dur) ease;
+    }
+    .livedub-duck[data-visible="true"] { opacity: 1; transform: translateY(0); }
+    .livedub-duck .duck-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--livedub-accent); }
+    /* 宽/紧凑两档 */
+    .livedub-root[data-density="compact"] .livedub-block { padding: 8px 14px 9px; border-radius: var(--livedub-radius-sm); }
+    .livedub-root[data-density="compact"] .livedub-block .dst { font-size: 0.92em; line-height: 1.32; }
+    .livedub-root[data-density="compact"] .livedub-block .src { font-size: 0.58em; margin-bottom: 2px; }
+    .livedub-root[data-density="compact"] .livedub-subs { max-width: min(86vw, 760px); }
+    .livedub-root[data-density="compact"] .livedub-block .time { display: none; }
+  
+    .livedub-root { position: absolute; inset: 0; }
+  </style>
+</head>
+<body>
+  <div class="lecture">
+    <div class="brand"><b>livedub</b> · 本地实时同传 · CS231n Lecture 1</div>
+    <h1>Gradient Descent</h1>
+    <div class="subtitle-line">CS231n: Deep Learning for Computer Vision · Lecture 1 · 00:02:10</div>
+    <div class="grid">
+      <div class="slide"><h2>Optimization: the core loop</h2>
+        <p>梯度下降是一种<strong>一阶迭代优化算法</strong>：沿着损失函数的负梯度方向更新参数。</p>
+        <div class="formula">θ ← θ − η · ∇<sub>θ</sub>L(θ)</div>
+        <div class="meta">η = learning rate · L = loss function · ∇ = gradient</div></div>
+      <div class="slide"><h2>Key intuition</h2>
+        <p>从任意初始化点出发，重复「计算梯度 → 沿负方向走一小步」，最终到达局部极小值。</p></div>
+    </div>
+  </div>
+  
+      <div class="livedub-root" data-part="root" data-bg="dark" data-density="wide" data-speaking="true">
+        <div class="livedub-capsule" data-part="capsule" role="button" tabindex="0"
+             aria-haspopup="dialog" aria-expanded="false" aria-label="livedub：打开快捷面板"
+             title="livedub 快捷面板（Esc 关闭）">
+          <span class="dot" aria-hidden="true"></span>
+          <span class="state" data-part="state">播放中</span>
+          <span class="lat" data-part="lat">1.2s</span>
+          <span class="gear" aria-hidden="true">⚙</span>
+        </div>
+
+        <div class="livedub-panel" data-part="panel" role="dialog" aria-modal="false"
+             aria-label="livedub 快捷面板">
+          <div class="livedub-panel-head" data-part="panel-head" title="拖动移动面板">
+            <span class="livedub-panel-title"><span class="brand">livedub</span> 快捷面板</span>
+            <span class="spacer"></span>
+            <button type="button" class="livedub-icon-btn" data-act="collapse" data-part="collapse"
+                    title="收起面板" aria-label="收起面板">▾</button>
+            <button type="button" class="livedub-icon-btn" data-act="close-panel" data-part="close"
+                    title="关闭面板（Esc）" aria-label="关闭面板">✕</button>
+          </div>
+          <div class="livedub-panel-body" data-part="panel-body">
+            <div class="livedub-tabs" role="tablist" aria-label="快捷面板分区">
+              <button type="button" role="tab" data-act="tab" data-tab="subtitles"
+                      id="livedub-tab-subtitles" aria-controls="livedub-panel-subtitles"
+                      aria-selected="false" tabindex="-1">字幕</button>
+              <button type="button" role="tab" data-act="tab" data-tab="notes"
+                      id="livedub-tab-notes" aria-controls="livedub-panel-notes"
+                      aria-selected="true" tabindex="0">笔记</button>
+              <button type="button" role="tab" data-act="tab" data-tab="settings"
+                      id="livedub-tab-settings" aria-controls="livedub-panel-settings"
+                      aria-selected="false" tabindex="-1">设置</button>
+            </div>
+
+            <div class="livedub-guide" data-part="guide" hidden role="status">
+              <div class="guide-title" data-part="guide-title"></div>
+              <div class="guide-body" data-part="guide-body"></div>
+              <div class="guide-actions">
+                <button type="button" class="livedub-btn" data-act="reconnect" aria-label="立即重连引擎">立即重连</button>
+                <button type="button" class="livedub-btn livedub-btn-primary" data-act="start" aria-label="开始同传">开始同传</button>
+              </div>
+              <div class="livedub-cmd" data-part="guide-cmd" hidden>
+                <code>npm start</code>
+                <button type="button" class="livedub-btn" data-act="copy-command"
+                        title="复制启动命令" aria-label="复制启动命令">复制</button>
+              </div>
+            </div>
+
+            <div class="livedub-tabpanel" data-panel-tab="subtitles" id="livedub-panel-subtitles"
+                 role="tabpanel" aria-labelledby="livedub-tab-subtitles" hidden>
+              <div class="livedub-group">
+                <div class="livedub-group-title">字幕样式</div>
+                <div class="livedub-row">
+                  <span class="row-label">宽度</span>
+                  <span class="livedub-seg" role="group" aria-label="字幕宽度">
+                    <button type="button" data-act="density-wide" title="宽屏字幕（默认）" aria-label="宽屏字幕">宽</button>
+                    <button type="button" data-act="density-compact" title="紧凑字幕（小窗口）" aria-label="紧凑字幕">紧凑</button>
+                  </span>
+                </div>
+                <div class="livedub-row">
+                  <span class="row-label">位置</span>
+                  <span class="livedub-seg" role="group" aria-label="字幕停靠位置">
+                    <button type="button" data-act="dock-bottom" title="字幕停靠底部" aria-label="字幕停靠底部">底部</button>
+                    <button type="button" data-act="dock-top" title="字幕停靠顶部" aria-label="字幕停靠顶部">顶部</button>
+                  </span>
+                </div>
+                <div class="livedub-row">
+                  <label for="livedub-offset">避让 <input id="livedub-offset" type="range" data-set="offsetY" min="-200" max="320" step="10" aria-label="字幕垂直避让像素" /></label>
+                  <span class="val" data-val="offsetY"></span>
+                </div>
+                <div class="livedub-row">
+                  <label for="livedub-font">字号 <input id="livedub-font" type="range" data-set="fontSize" min="14" max="32" step="1" aria-label="字幕字号" /></label>
+                  <span class="val" data-val="fontSize"></span>
+                </div>
+                <div class="livedub-row">
+                  <label class="livedub-switch"><input type="checkbox" data-set="showOriginal" role="switch" aria-label="显示原文" /><span class="switch-label">显示原文</span></label>
+                </div>
+              </div>
+              <div class="livedub-group">
+                <div class="livedub-group-title">字幕背景</div>
+                <div class="livedub-row">
+                  <label for="livedub-subsbg">背景 <select id="livedub-subsbg" data-set="subsBg" aria-label="字幕背景风格"><option value="dark">深色玻璃</option><option value="light">浅色玻璃</option><option value="none">无背景</option></select></label>
+                </div>
+                <div class="livedub-row">
+                  <label for="livedub-subsopacity">不透明度 <input id="livedub-subsopacity" type="range" data-set="subsOpacity" min="0.2" max="1" step="0.02" aria-label="字幕背景不透明度" /></label>
+                  <span class="val" data-val="subsOpacity"></span>
+                </div>
+              </div>
+            </div>
+
+            <div class="livedub-tabpanel" data-panel-tab="notes" id="livedub-panel-notes"
+                 role="tabpanel" aria-labelledby="livedub-tab-notes">
+              <div class="livedub-group">
+                <div class="livedub-group-title">快捷笔记</div>
+                <div class="livedub-note-summary" data-part="note-summary">今日 3 条 · 待同步 1</div>
+                <button type="button" class="livedub-btn livedub-btn-primary livedub-note-btn" data-act="note"
+                        data-part="note-btn" aria-label="记录当前句为笔记（Alt+Shift+N）" title="记录当前句（Alt+Shift+N）" disabled><span class="spin" aria-hidden="true"></span>识别画面文字中…</button>
+                <div class="livedub-row">
+                  <label class="livedub-switch"><input type="checkbox" data-set="noteScreenshot" role="switch" aria-label="附页面截图" /><span class="switch-label">附页面截图</span></label>
+                </div>
+                <div class="livedub-row">
+                  <label class="livedub-switch"><input type="checkbox" data-set="visionOcr" role="switch" aria-label="识别画面文字 OCR" /><span class="switch-label">识别画面文字（OCR，快）</span></label>
+                </div>
+                <div class="livedub-row">
+                  <label class="livedub-switch"><input type="checkbox" data-set="visionCaption" role="switch" aria-label="画面理解 VLM" /><span class="switch-label">画面理解（VLM，慢 20-30s）</span></label>
+                </div>
+                <div class="livedub-actions">
+                  <button type="button" class="livedub-btn" data-act="export" aria-label="导出本次字幕 SRT" title="导出本次字幕 SRT">导出 SRT</button>
+                </div>
+              </div>
+              <div class="livedub-meta" data-part="meta">引擎 whisper-local · deepseek · minimax
+音色 预设 · male-qn-qingse
+延迟 ASR 240ms · 翻译 900ms · 配音 380ms · 端到端 1.6s
+今日笔记 3 条</div>
+            </div>
+
+            <div class="livedub-tabpanel" data-panel-tab="settings" id="livedub-panel-settings"
+                 role="tabpanel" aria-labelledby="livedub-tab-settings" hidden>
+              <div class="livedub-group">
+                <div class="livedub-group-title">配音与原声</div>
+                <div class="livedub-row">
+                  <label class="livedub-switch"><input type="checkbox" data-set="dubEnabled" role="switch" aria-label="中文配音" /><span class="switch-label">中文配音</span></label>
+                </div>
+                <div class="livedub-row">
+                  <label class="livedub-switch"><input type="checkbox" data-set="captureReplay" role="switch" aria-label="原声重放" /><span class="switch-label">原声重放（关闭 = 只听配音）</span></label>
+                </div>
+                <div class="livedub-row">
+                  <label class="livedub-switch"><input type="checkbox" data-set="globalDuck" role="switch" aria-label="全局限定压音" /><span class="switch-label">全局限定压音（iframe/WebAudio）</span></label>
+                </div>
+                <div class="livedub-row">
+                  <label for="livedub-duck">压音 <input id="livedub-duck" type="range" data-set="duckRatio" min="0.02" max="0.6" step="0.01" aria-label="压音比例" /></label>
+                  <span class="val" data-val="duckRatio"></span>
+                </div>
+                <div class="livedub-row">
+                  <label for="livedub-recover">恢复延迟 <input id="livedub-recover" type="range" data-set="duckRecoverMs" min="300" max="3000" step="100" aria-label="压音恢复延迟" /></label>
+                  <span class="val" data-val="duckRecoverMs"></span>
+                </div>
+              </div>
+              <div class="livedub-group">
+                <div class="livedub-group-title">高级</div>
+                <div class="livedub-row">
+                  <label class="livedub-switch"><input type="checkbox" data-set="fullscreenWorkaround" role="switch" aria-label="video 全屏兼容" /><span class="switch-label">video 全屏兼容（包裹容器）</span></label>
+                </div>
+                <div class="livedub-actions">
+                  <button type="button" class="livedub-btn livedub-btn-primary" data-act="toggle" aria-label="开始或停止同传">开始同传</button>
+                  <button type="button" class="livedub-btn" data-act="hide" aria-label="隐藏字幕浮层">隐藏浮层</button>
+                </div>
+              </div>
+            </div>
+
+            <div class="livedub-error" data-part="error" role="alert" hidden></div>
+          </div>
+          <div class="livedub-panel-footer">
+            <kbd>Alt</kbd>+<kbd>Shift</kbd>+<kbd>N</kbd> 记笔记 · <kbd>Alt</kbd>+<kbd>Shift</kbd>+<kbd>L</kbd> 开始/停止 · <kbd>Esc</kbd> 关闭面板
+          </div>
+        </div>
+
+        <div class="livedub-toasts" data-part="toast" role="status" aria-live="polite" aria-atomic="false"><div class="livedub-toast" data-kind="ok" data-toast-id="t1"><span class="toast-dot"></span><span class="toast-text">已记笔记 @ 02:10（含画面文字）</span><button type="button" class="toast-close" data-toast-id="t1" aria-label="关闭提示">✕</button></div><div class="livedub-toast" data-kind="warn" data-toast-id="t2"><span class="toast-dot"></span><span class="toast-text">引擎未连接，已排队（2）@ 02:12</span><button type="button" class="toast-close" data-toast-id="t2" aria-label="关闭提示">✕</button></div></div>
+        <div class="livedub-duck" data-part="duck" data-visible="true" aria-hidden="true"><span class="duck-dot"></span><span data-part="duck-label">原声已压低</span></div>
+        <div class="livedub-subs" data-part="subs">
+          <div class="livedub-subs-handle" data-part="subs-handle" title="拖动字幕位置" aria-label="拖动字幕位置">⋯⋯</div>
+          <div class="livedub-progress" data-part="progress" aria-hidden="true"><span data-part="progress-fill" style="width:62%"></span></div>
+          <div class="livedub-stack livedub-sub-list" data-part="sublist"><div class="livedub-block" data-block-id="u:seg-1"><span class="time" aria-hidden="true">02:10</span><div class="src">Gradient descent is a first-order iterative optimization algorithm</div><div class="dst">梯度下降是一种一阶迭代优化算法</div></div></div>
+        </div>
+      </div>
+</body>
+</html>

@@ -14,6 +14,8 @@
 //     降级决策（含旧引擎 404 无 /api/vision/*）、health 解析（全部纯函数，不联网）
 //   - v0.6 实时画面上下文：visual-context 事件 JSON/字段、OCR 文本清洗截断、同帧去重、
 //     默认关闭/未连接/暂停不发送的决策、间隔钳制、状态文案（不联网）
+//   - v0.7 视觉重设计：设置默认/钳制、字号→宽度联动、浮层高度布局、状态 pill/菜单文案、
+//     toast 模型、VoiceOver label、亮暗/降低透明度/减少动效降级（纯函数，不建窗口）
 //  退出码：0 全部通过；1 有失败（便于 CI 与 scripts/build-macos.sh --check）。
 //
 
@@ -74,6 +76,7 @@ enum SelfTest {
         checkNotes()
         checkVision()
         checkVisualContext()
+        checkDesign()
         checkSimulationData()
 
         if failures.isEmpty {
@@ -1025,6 +1028,223 @@ enum SelfTest {
                   && VisualContextPlanner.defaultIntervalSeconds == 10
                   && VisualContextPlanner.minIntervalSeconds == 8
                   && VisualContextPlanner.maxIntervalSeconds == 15)
+    }
+
+
+    // MARK: 视觉重设计（v0.7）
+
+    private static func checkDesign() {
+        let suite = UserDefaults(suiteName: "com.livedub.macos.selftest.design") ?? .standard
+        let settings = Settings(defaults: suite)
+
+        // 设置默认值与钳制（隔离 UserDefaults，只读）
+        check("v0.7 默认字号 24pt", settings.fontSize == 24, detail: "\(settings.fontSize)")
+        check("v0.7 默认宽度自动（0）", settings.overlayWidth == 0)
+        check("v0.7 默认不透明度 0.92", abs(settings.overlayOpacity - 0.92) < 0.001)
+        check("v0.7 默认字幕双语", settings.captionMode == .bilingual)
+        check("v0.7 默认位置底部居中", settings.positionMode == .bottom)
+        check("v0.7 字号钳制 22–26",
+              OverlayDesign.clampTranslationFont(10) == 22
+                  && OverlayDesign.clampTranslationFont(30) == 26
+                  && OverlayDesign.clampTranslationFont(24) == 24
+                  && OverlayDesign.clampTranslationFont(.nan) == 24)
+        check("v0.7 不透明度钳制 0.55–1.0",
+              OverlayDesign.clampOpacity(0.2) == 0.55
+                  && OverlayDesign.clampOpacity(1.2) == 1.0
+                  && OverlayDesign.clampOpacity(.nan) == 0.92)
+        check("v0.7 宽度钳制 480–1100 / 0=自动",
+              OverlayDesign.clampOverlayWidth(0) == 0
+                  && OverlayDesign.clampOverlayWidth(400) == 480
+                  && OverlayDesign.clampOverlayWidth(2000) == 1_100)
+
+        // 字号 → 宽度联动
+        check("v0.7 自动宽度随字号 680/760/840",
+              OverlayDesign.effectiveWidth(explicitWidth: 0, fontSize: 22) == 680
+                  && OverlayDesign.effectiveWidth(explicitWidth: 0, fontSize: 24) == 760
+                  && OverlayDesign.effectiveWidth(explicitWidth: 0, fontSize: 26) == 840)
+        check("v0.7 显式宽度优先并钳制",
+              OverlayDesign.effectiveWidth(explicitWidth: 1000, fontSize: 24) == 1_000
+                  && OverlayDesign.effectiveWidth(explicitWidth: 200, fontSize: 24) == 480
+                  && OverlayDesign.effectiveWidth(explicitWidth: 2000, fontSize: 24) == 1_100)
+        check("v0.7 设计 token（圆角 20 / 命中区 ≥28 / 动效 150–200ms）",
+              OverlayDesign.cornerRadius == 20
+                  && OverlayDesign.hitTargetMin >= 28
+                  && OverlayDesign.animationFast >= 0.15
+                  && OverlayDesign.animationBase <= 0.2
+                  && OverlayDesign.translationMin == 22
+                  && OverlayDesign.translationMax == 26)
+
+        // 布局纯函数：行数 / 高度
+        check("v0.7 空文本估 1 行",
+              OverlayDesign.estimatedLines(text: "", fontSize: 24, width: 700, maxLines: 2) == 1)
+        check("v0.7 长文本按宽度折行且上限 2 行",
+              OverlayDesign.estimatedLines(
+                  text: String(repeating: "字", count: 120),
+                  fontSize: 24,
+                  width: 500,
+                  maxLines: 2
+              ) == 2)
+        let shortHeight = OverlayDesign.desiredHeight(
+            translation: "你好", source: "hello", mode: .bilingual, fontSize: 24, width: 760
+        )
+        let longHeight = OverlayDesign.desiredHeight(
+            translation: String(repeating: "今天我们来聊聊梯度下降。", count: 10),
+            source: "Today we are going to talk about gradient descent.",
+            mode: .bilingual,
+            fontSize: 24,
+            width: 760
+        )
+        check("v0.7 高度 ≥ 最小高度 92", shortHeight >= OverlayDesign.minHeight)
+        check("v0.7 长文本高度不小于短文本", longHeight >= shortHeight,
+              detail: "short=\(shortHeight) long=\(longHeight)")
+        let narrowHeight = OverlayDesign.desiredHeight(
+            translation: String(repeating: "梯度下降 ", count: 12),
+            source: "gradient descent",
+            mode: .bilingual,
+            fontSize: 26,
+            width: 480
+        )
+        let wideHeight = OverlayDesign.desiredHeight(
+            translation: String(repeating: "梯度下降 ", count: 12),
+            source: "gradient descent",
+            mode: .bilingual,
+            fontSize: 26,
+            width: 1_100
+        )
+        check("v0.7 宽度越大高度不增", wideHeight <= narrowHeight,
+              detail: "narrow=\(narrowHeight) wide=\(wideHeight)")
+        let bilingualHeight = OverlayDesign.desiredHeight(
+            translation: "译文", source: "source", mode: .bilingual, fontSize: 24, width: 760
+        )
+        let sourceOnlyHeight = OverlayDesign.desiredHeight(
+            translation: "译文", source: "source", mode: .sourceOnly, fontSize: 24, width: 760
+        )
+        check("v0.7 仅原文模式更矮", sourceOnlyHeight <= bilingualHeight,
+              detail: "bilingual=\(bilingualHeight) sourceOnly=\(sourceOnlyHeight)")
+        let bigFontHeight = OverlayDesign.desiredHeight(
+            translation: String(repeating: "字", count: 60),
+            source: "source",
+            mode: .bilingual,
+            fontSize: 26,
+            width: 500
+        )
+        let smallFontHeight = OverlayDesign.desiredHeight(
+            translation: String(repeating: "字", count: 60),
+            source: "source",
+            mode: .bilingual,
+            fontSize: 22,
+            width: 500
+        )
+        check("v0.7 字号越大高度不降", bigFontHeight >= smallFontHeight,
+              detail: "22pt=\(smallFontHeight) 26pt=\(bigFontHeight)")
+
+        // 字幕显示模式
+        check("v0.7 字幕模式组合",
+              CaptionMode.bilingual.showsTranslation && CaptionMode.bilingual.showsSource
+                  && CaptionMode.translationOnly.showsTranslation && !CaptionMode.translationOnly.showsSource
+                  && !CaptionMode.sourceOnly.showsTranslation && CaptionMode.sourceOnly.showsSource)
+        check("v0.7 字幕模式 label/兜底",
+              CaptionMode.allCases.count == 3
+                  && CaptionMode.fromRaw(nil) == .bilingual
+                  && CaptionMode.fromRaw("bad") == .bilingual
+                  && !CaptionMode.sourceOnly.label.isEmpty)
+        check("v0.7 位置模式 label/兜底",
+              OverlayPositionMode.allCases.count == 3
+                  && OverlayPositionMode.fromRaw("top") == .top
+                  && OverlayPositionMode.fromRaw(nil) == .bottom)
+
+        // 状态 pill / tone / duck 提示
+        check("v0.7 pill：未连接优先显示",
+              OverlayStatusFormatter.pillText(status: "聆听中", latencyMs: 1_834, connected: false) == "未连接")
+        check("v0.7 pill：状态 + 延迟",
+              OverlayStatusFormatter.pillText(status: "聆听中", latencyMs: 1_834, connected: true) == "聆听中 · 1.8s")
+        check("v0.7 pill：无延迟",
+              OverlayStatusFormatter.pillText(status: "已暂停", latencyMs: nil, connected: true) == "已暂停")
+        check("v0.7 tone 映射",
+              OverlayStatusFormatter.tone(status: "聆听中", isError: false) == .ok
+                  && OverlayStatusFormatter.tone(status: "翻译中", isError: false) == .busy
+                  && OverlayStatusFormatter.tone(status: "播放配音", isError: false) == .busy
+                  && OverlayStatusFormatter.tone(status: "已暂停", isError: false) == .warn
+                  && OverlayStatusFormatter.tone(status: "出错", isError: false) == .err
+                  && OverlayStatusFormatter.tone(status: "未知", isError: true) == .err
+                  && OverlayStatusFormatter.tone(status: "未开始", isError: false) == .idle)
+        check("v0.7 duck 提示",
+              OverlayStatusFormatter.duckHint(status: "播放配音", dubEnabled: true) == "原声未压低"
+                  && OverlayStatusFormatter.duckHint(status: "模拟演示 · 播放配音", dubEnabled: true) == "原声未压低"
+                  && OverlayStatusFormatter.duckHint(status: "聆听中", dubEnabled: true) == nil
+                  && OverlayStatusFormatter.duckHint(status: "播放配音", dubEnabled: false) == nil)
+
+        // toast 模型（图标 + 文案 + 语义色）
+        let successToast = OverlayToastFactory.note(.success, clock: "15:50:33")
+        check("v0.7 toast：成功",
+              successToast.text == "已记录笔记 · 15:50:33"
+                  && successToast.symbolName == "checkmark.circle.fill"
+                  && successToast.tone == .ok)
+        let queuedToast = OverlayToastFactory.note(.queued, clock: "15:50:33")
+        check("v0.7 toast：排队",
+              queuedToast.text.contains("排队") && queuedToast.tone == .warn && !queuedToast.symbolName.isEmpty)
+        let failureToast = OverlayToastFactory.note(.failure, clock: "15:50:33")
+        check("v0.7 toast：失败", failureToast.tone == .err && failureToast.symbolName.contains("exclamationmark"))
+        check("v0.7 toast：通用 isError",
+              OverlayToastFactory.generic("x", isError: true).tone == .err
+                  && OverlayToastFactory.generic("x", isError: false).symbolName.contains("info"))
+        check("v0.7 toast：画面上下文",
+              OverlayToastFactory.visualContextStarted(chars: 42, clock: "15:50:33").text.contains("42 字"))
+
+        // 菜单文案
+        check("v0.7 菜单：开始/停止/暂停/继续",
+              MenuDesign.startStopTitle(isRunning: false) == "开始同传"
+                  && MenuDesign.startStopTitle(isRunning: true) == "停止同传"
+                  && MenuDesign.pauseTitle(isPaused: false) == "暂停同传"
+                  && MenuDesign.pauseTitle(isPaused: true) == "继续同传")
+        check("v0.7 菜单：快捷键提示",
+              MenuDesign.noteTitle().contains("⌥N")
+                  && MenuDesign.settingsTitle().contains("⌘,")
+                  && MenuDesign.quitTitle().contains("⌘Q"))
+        let summary = MenuDesign.statusSummary(
+            state: "聆听中",
+            latencyMs: 1_834,
+            connectionText: "已连接",
+            ocrAvailable: true,
+            vlmAvailable: false,
+            visualContextEnabled: false
+        )
+        check("v0.7 菜单状态摘要",
+              summary.contains("已连接") && summary.contains("聆听中") && summary.contains("1.8s")
+                  && summary.contains("OCR ✓") && summary.contains("画面上下文 关"),
+              detail: summary)
+        check("v0.7 菜单：SF Symbol 全部非空",
+              [MenuDesign.brandSymbol, MenuDesign.startSymbol, MenuDesign.stopSymbol, MenuDesign.noteSymbol,
+               MenuDesign.settingsSymbol, MenuDesign.openNotesSymbol, MenuDesign.workbenchSymbol,
+               MenuDesign.quitSymbol].allSatisfy { !$0.isEmpty })
+
+        // 可访问性
+        check("v0.7 a11y：VoiceOver label 非空",
+              [OverlayA11y.overlayGroup, OverlayA11y.translationRole, OverlayA11y.sourceRole,
+               OverlayA11y.statusPillRole, OverlayA11y.brand].allSatisfy { !$0.isEmpty })
+        check("v0.7 a11y：悬停工具条 4 个按钮均有 label",
+              OverlayA11y.buttonLabels().count == 4 && OverlayA11y.buttonLabels().allSatisfy { !$0.isEmpty })
+        check("v0.7 a11y：命中区 ≥28pt", OverlayA11y.hitTargetMin >= 28)
+        check("v0.7 a11y：状态 value 含延迟",
+              OverlayA11y.statusValue(status: "聆听中", latencyMs: 1_834).contains("1.8s"))
+
+        // 亮暗 / 透明 / 动效降级
+        check("v0.7 外观解析",
+              OverlayTheme.isDark(appearanceName: "NSDarkAqua") && !OverlayTheme.isDark(appearanceName: "NSAqua"))
+        let darkBackdrop = OverlayTheme.backdropRGBA(isDark: true, reduceTransparency: false, opacity: 0.92)
+        let lightBackdrop = OverlayTheme.backdropRGBA(isDark: false, reduceTransparency: false, opacity: 0.92)
+        let solidBackdrop = OverlayTheme.backdropRGBA(isDark: true, reduceTransparency: true, opacity: 0.92)
+        check("v0.7 亮暗背景不同", darkBackdrop != lightBackdrop)
+        check("v0.7 降低透明度 -> 纯色", solidBackdrop.a == 1.0)
+        check("v0.7 正常材质 tint 半透明", darkBackdrop.a > 0.1 && darkBackdrop.a < 0.9)
+        check("v0.7 accent / 语义色亮暗不同",
+              OverlayTheme.accentRGBA(isDark: true) != OverlayTheme.accentRGBA(isDark: false)
+                  && OverlayTheme.toneRGBA(.ok, isDark: true) != OverlayTheme.toneRGBA(.err, isDark: true))
+        check("v0.7 reduceMotion 关闭动效",
+              OverlayTheme.animationDuration(0.18, reduceMotion: true) == 0
+                  && OverlayTheme.animationDuration(0.18, reduceMotion: false) == 0.18
+                  && OverlayTheme.accentBreathingAlpha(reduceMotion: true) == nil
+                  && !OverlayTheme.shouldAnimate(reduceMotion: true))
     }
 
     // MARK: - 断言帮手

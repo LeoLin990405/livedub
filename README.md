@@ -13,6 +13,9 @@
 > 面向**教学视频**（公开课/网课/技术讲座）优化：术语表约束、子句级低延迟配音、原声自动压音。
 >
 
+**v0.7（2026-10-30）**：**界面设计优化**——统一三端设计语言（jade/ink、短动效、可访问性），
+工作台布局重构（视频/字幕舞台 + 可折叠 dock + 命令面板 ⌘K）、笔记工作区升级、扩展浮层/面板/popup、
+macOS 悬浮窗重设计 + 设置窗口。设计规范见 [docs/DESIGN.md](docs/DESIGN.md)。
 **v0.6（2026-10-30）**：**按章节自动生成图文笔记**（字幕停顿+画面切换分章 + 课程总览）、
 **画面 OCR 作为翻译上下文**（术语/公式更一致）、**Obsidian 目录自动同步**（Markdown+截图+索引，保存后自动导出）。
 **v0.5（2026-10-30）**：**视频画面理解 → 图文笔记**——按画面变化抽关键帧，本地 macOS Vision OCR 提取幻灯片/代码文字，
@@ -60,21 +63,42 @@ YouTube / B站 / 网课页面       本地引擎 (127.0.0.1)               输�
 
 ## 看一眼（真实产物）
 
-| 本地工作台（真实链路回放，HUD 为实测延迟） | 成片：中文配音 + 烧录双语字幕 |
+| 工作台 v0.7（暗色，真实回放 + 实测 HUD） | 成片：中文配音 + 烧录双语字幕 |
 |---|---|
-| ![studio](docs/assets/studio-real-session.png) | ![dubbed](docs/assets/demo-bilingual-subtitled.png) |
+| ![studio](docs/assets/ui-dark-home.png) | ![dubbed](docs/assets/demo-bilingual-subtitled.png) |
 
-| 本地/云端 ASR 切换 + 隐私提示 | macOS 桌面悬浮窗（任意应用之上） |
+| Workbench v0.7（light） | 笔记工作区（过滤/分组/双栏） |
 |---|---|
-| ![asr](docs/assets/studio-asr-cloud.png) | ![macos](docs/assets/macos-app-overlay.png) |
+| ![light](docs/assets/ui-light-home.png) | ![notes](docs/assets/ui-notes-workspace.png) |
 
-| 亮色主题 | 仅字幕模式 |
+| 命令面板 ⌘K | 窄屏（390×844，单列） |
 |---|---|
-| ![light](docs/assets/studio-light.png) | ![subs-only](docs/assets/studio-subs-only.png) |
+| ![command](docs/assets/ui-command-palette.png) | ![narrow](docs/assets/ui-narrow.png) |
 
 - 完整演示视频：`demo/dubbed.mp4`（原声自动压低 + 中文 AI 配音 + 双语字幕）
 - 原始英文视频：`demo/original.mp4`；双语字幕：`demo/bilingual.srt`；回放事件流：`demo/session.jsonl`
 - 更多截图与产物说明：[demo/README.md](demo/README.md)
+
+## 界面设计（v0.7）
+
+三端（工作台 / Chrome 扩展 / macOS 悬浮窗）统一设计语言：**沉浸看课 + 学术工具**。
+jade/ink 色板、低饱和、短动效（120–240ms，尊重 `prefers-reduced-motion`）、
+`:focus-visible` 焦点环、aria/tooltip/键盘可达。完整规范：[docs/DESIGN.md](docs/DESIGN.md)。
+
+| Chrome 浮层 + 快捷面板 | Chrome popup |
+|---|---|
+| ![extension](docs/assets/ui-extension-overlay.png) | ![popup](docs/assets/ui-extension-popup.png) |
+
+| macOS 悬浮窗（材质 + 状态 pill + 双语） | macOS 设置窗口（即时生效） |
+|---|---|
+| ![macos-overlay](docs/assets/ui-macos-overlay.png) | ![macos-settings](docs/assets/ui-macos-settings.png) |
+
+| 图文/章节生成分步进度 | Replay 页（统一 token） |
+|---|---|
+| ![progress](docs/assets/ui-progress.png) | ![replay](docs/assets/ui-replay.png) |
+
+工作台交互速览：`⌘K`（命令面板）、`?`（快捷键帮助）、`N`（新建笔记）、
+Tab rail 切换「字幕 / 笔记 / 设置」，窄屏自动变底部 sheet；笔记图片可点开 lightbox。
 
 ## 快速开始
 
@@ -235,7 +259,7 @@ livedub/
 ├── scripts/                doctor / batch / make-demo / 图层渲染
 ├── tests/                  node:test（含 mock 端到端）
 ├── config/                 livedub.config.json + fast/cloud 档位覆盖
-└── docs/                   CONTRACTS / ARCHITECTURE / PROVIDERS / NOTES / ROADMAP / MEASUREMENTS
+└── docs/                   CONTRACTS / ARCHITECTURE / PROVIDERS / NOTES / DESIGN / ROADMAP / MEASUREMENTS
 ```
 
 ## 设计要点（为什么能做到「像原声」）

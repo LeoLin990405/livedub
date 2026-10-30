@@ -3,6 +3,26 @@
 All notable changes to livedub are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/), versioning: [SemVer](https://semver.org/).
 
+## [0.7.0] - 2026-10-30
+
+前端设计优化：统一三端设计语言，工作台布局重构与命令面板，笔记工作区、扩展浮层/面板/popup、macOS 悬浮窗与设置面板。
+
+### Added
+
+- 设计规范 [docs/DESIGN.md](docs/DESIGN.md)（tokens / 组件 / 三端布局 / 可访问性清单）。
+- 工作台：设计系统 tokens、顶部状态栏 + 视频/字幕舞台 + 可折叠 dock（字幕/笔记/设置）、底部控制条、
+  笔记 list+editor 工作区（过滤/搜索/章节分组/保存态/图片 lightbox）、命令面板 ⌘K（16 条命令）、
+  快捷键帮助 `?`、toast 堆叠、章节生成 5 步进度、≤1100px 底部 sheet / ≤720px 单列、replay 页统一；39 单测。
+- Chrome 扩展：字幕浮层重设计（accent 进度线/状态 pill/玻璃质感/悬停控制条/宽窄两档）、面板分段
+  （字幕/笔记/设置，aria tablist + 方向键）、笔记按钮进度态、popup 重设计、亮暗自适应与 reduced-motion；
+  新增离线 UI 预览页（extension/preview）；100 单测。
+- macOS：浮层材质（NSVisualEffectView）/22–26pt 字号层级/状态 pill/悬停工具条、独立设置窗口
+  （字幕/浮层/音频/笔记视觉/引擎，即时生效）、菜单栏分区重设计、toast 重设计；self-test 273 项。
+
+### Changed
+
+- 版本 0.7.0；三端共用 jade/ink 色板、字体栈、圆角/阴影/动效 tokens；可访问性（焦点环/aria/命中区/reduced-motion）。
+
 ## [0.6.0] - 2026-10-30
 
 章节化图文笔记、画面 OCR 辅助翻译、Obsidian 自动同步。

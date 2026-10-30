@@ -37,6 +37,9 @@ const SWIFT_FILES = [
   'Vision.swift',
   // v0.6 实时画面上下文推送
   'VisualContext.swift',
+  // v0.7 视觉重设计 + 设置窗口
+  'OverlayDesign.swift',
+  'SettingsWindow.swift',
 ];
 
 test('macos: 构建脚本存在，bash -n 语法检查通过', () => {
@@ -214,6 +217,66 @@ test('macos: visual-context 常量与 engine/protocol.mjs 对齐', () => {
   assert.match(visual, /"visual-context"/);
 });
 
+test('macos: v0.7 视觉重设计 + 设置窗口 + 菜单 / 可访问性', () => {
+  const design = readSource('OverlayDesign.swift');
+  assert.match(design, /cornerRadius: CGFloat = 20/);
+  assert.match(design, /translationMin: Double = 22/);
+  assert.match(design, /translationMax: Double = 26/);
+  assert.match(design, /hitTargetMin: CGFloat = 28/);
+  assert.match(design, /animationFast: TimeInterval = 0\.16/);
+  assert.match(design, /animationBase: TimeInterval = 0\.18/);
+  assert.match(design, /accentHexDark|5eead4/);
+  assert.match(design, /CaptionMode/);
+  assert.match(design, /OverlayPositionMode/);
+  assert.match(design, /OverlayStatusFormatter/);
+  assert.match(design, /OverlayToastFactory/);
+  assert.match(design, /MenuDesign/);
+  assert.match(design, /OverlayA11y/);
+  assert.match(design, /reduceTransparency|reduceMotion/);
+
+  const overlay = readSource('OverlayWindow.swift');
+  assert.match(overlay, /NSVisualEffectView/, '浮层应使用材质模糊（可降级纯色）');
+  assert.match(overlay, /OverlayIconButton/);
+  assert.match(overlay, /accessibilityDisplayShouldReduceMotion/);
+  assert.match(overlay, /PassthroughView/, '整层拖动需要非交互文本层');
+  assert.match(overlay, /performDrag/);
+  assert.match(overlay, /statusPill|StatusPillView/);
+  assert.match(overlay, /accentLine|AccentLineView/);
+  assert.match(overlay, /showToast/);
+
+  const settingsWindow = readSource('SettingsWindow.swift');
+  assert.match(settingsWindow, /class SettingsWindow: NSWindow/);
+  assert.match(settingsWindow, /cancelOperation/, 'Esc 关闭设置窗口');
+  assert.match(settingsWindow, /fontSlider/);
+  assert.match(settingsWindow, /captionPopup/);
+  assert.match(settingsWindow, /opacitySlider/);
+  assert.match(settingsWindow, /positionPopup/);
+  assert.match(settingsWindow, /visualContextCheckbox/);
+  assert.match(settingsWindow, /恢复默认/);
+
+  const settings = readSource('Settings.swift');
+  assert.match(settings, /captionMode/);
+  assert.match(settings, /overlayWidth/);
+  assert.match(settings, /overlayOpacity/);
+  assert.match(settings, /positionMode/);
+  assert.match(settings, /resetPresentationDefaults/);
+  assert.match(settings, /clampTranslationFont/, '字号应钳制到 22–26');
+
+  const main = readSource('main.swift');
+  assert.match(main, /--show-settings/);
+  assert.match(main, /--demo-toast/);
+  assert.match(main, /openSettingsWindow/);
+  assert.match(main, /settingsDidChange/);
+  assert.match(main, /togglePauseResume/);
+  assert.match(main, /MenuDesign\.statusSummary/);
+  assert.match(main, /systemSymbolName: MenuDesign/);
+
+  const selfTest = readSource('SelfTest.swift');
+  for (const must of ['checkDesign()', 'v0.7 默认字号', 'v0.7 自动宽度随字号', 'v0.7 toast：成功', 'v0.7 a11y', 'v0.7 reduceMotion']) {
+    assert.ok(selfTest.includes(must), `SelfTest.swift 缺少 v0.7 检查：${must}`);
+  }
+});
+
 test('macos: v0.6 实时画面上下文推送（visual-context / 默认关 / 决策 / 状态）', () => {
   const visual = readSource('VisualContext.swift');
   assert.match(visual, /visual-context/, '缺少 v0.6 WS 事件类型');
@@ -283,13 +346,13 @@ test('macos: v0.5 画面文字（OCR）/ 画面理解（VLM）（Vision + NotesC
   const settings = readSource('Settings.swift');
   assert.match(settings, /notesOCR/);
   assert.match(settings, /notesVision/);
-  const main = readSource('main.swift');
-  assert.match(main, /识别画面文字（OCR/);
-  assert.match(main, /画面理解（VLM/);
-  assert.match(main, /visionStatusMenuItem|视觉：/);
-  assert.match(main, /refreshVisionHealth/);
-  assert.match(main, /--notes-vision/);
-  assert.match(main, /画面理解中/);
+  const mainAndUI = readSource('main.swift') + readSource('SettingsWindow.swift') + readSource('OverlayDesign.swift');
+  assert.match(mainAndUI, /识别画面文字（OCR/);
+  assert.match(mainAndUI, /画面理解（VLM/);
+  assert.match(mainAndUI, /视觉：/);
+  assert.match(mainAndUI, /refreshVisionHealth/);
+  assert.match(mainAndUI, /--notes-vision/);
+  assert.match(mainAndUI, /画面理解中/);
   const selfTest = readSource('SelfTest.swift');
   for (const must of ['checkVision()', 'VisionText', 'VisionPlanner', 'VisionHealthParser', 'vision/ocr 请求体', '（OCR）']) {
     assert.ok(selfTest.includes(must), `SelfTest.swift 缺少 v0.5 检查：${must}`);
@@ -334,7 +397,7 @@ test('macos: v0.4 ⌥N 快捷笔记（NotesClient / 全局热键 / 截图 / 离�
   // 浮层 toast + 菜单/设置接入
   const overlay = readSource('OverlayWindow.swift');
   assert.match(overlay, /showToast/);
-  assert.match(overlay, /已记录/);
+  assert.match(readSource('OverlayDesign.swift'), /已记录笔记/, 'toast 文案应在 OverlayDesign（v0.7 设计层）');
   const main = readSource('main.swift');
   assert.match(main, /GlobalHotKey\.shared/);
   assert.match(main, /takeNote/);
@@ -427,6 +490,13 @@ test('macos: apps/macos/README.md 覆盖构建/权限/运行/已知限制/手动
     '默认关闭',
     '每 10s',
     'CPU',
+    // v0.7 视觉重设计
+    '视觉重设计',
+    '设置',
+    'NSVisualEffectView',
+    'reduceMotion',
+    '可访问性',
+    '菜单栏',
   ]) {
     assert.ok(readme.includes(must), `README 缺少关键说明：${must}`);
   }
@@ -450,7 +520,7 @@ test(
     });
     const match = output.match(/self-test: (\d+) checks passed/);
     assert.ok(match, '构建输出缺少 self-test 统计');
-    assert.ok(Number(match[1]) >= 200, `self-test 项数应 >= 200（v0.6 含画面上下文检查），实际 ${match[1]}`);
+    assert.ok(Number(match[1]) >= 250, `self-test 项数应 >= 250（v0.7 含视觉设计检查），实际 ${match[1]}`);
     assert.ok(existsSync(path.join(APP_DIR, 'build', 'livedub.app', 'Contents', 'MacOS', 'livedub')));
   },
 );
