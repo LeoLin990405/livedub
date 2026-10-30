@@ -34,6 +34,8 @@ if (argv.includes('--help') || argv.includes('-h') || argv.length === 0) {
   --source <cli>        来源标记（默认 cli）
   --engine <url>        引擎地址（默认 $LIVEDUB_ENGINE_URL 或 http://127.0.0.1:8787）
   --screenshot <png>    附带截图（>4MB 或非 PNG 会被拒绝；失败自动降级纯文字）
+  --no-ocr              不识别截图中的画面文字
+  --vision              额外做画面理解（VLM，慢 ~20-30s；默认关闭）
   --no-offline          引擎不可用时不要写本地降级文件（只报错）
   --print               仅打印将写入的 Markdown，不落盘/不发请求
   -h, --help
@@ -124,29 +126,31 @@ function videoId({ url, title }) {
 
 const video = { id: videoId({ url, title }), title, ...(url ? { url } : {}) };
 
+let bodyText = text;
+
 function buildMarkdown() {
   const lines = [];
   const link = url ? `[${title}](${url})` : title;
   lines.push(`### ${timeLabel} · ${link}`);
   lines.push('');
-  lines.push(text);
+  lines.push(bodyText);
   if (tags.length) lines.push('', tags.map((t) => `#${t.replace(/\s+/g, '-')}`).join(' '));
   return lines.join('\n');
 }
 
-const markdown = buildMarkdown();
+let markdown = buildMarkdown();
 
 if (has('--print')) {
   console.log(markdown);
   process.exit(0);
 }
 
-async function postJson(pathname, body, { raw = false } = {}) {
+async function postJson(pathname, body, { raw = false, timeoutMs = 10000 } = {}) {
   const res = await fetch(`${engineUrl}${pathname}`, {
     method: 'POST',
     headers: raw ? { 'content-type': raw } : { 'content-type': 'application/json' },
     body: raw ? body : JSON.stringify(body),
-    signal: AbortSignal.timeout(10000),
+    signal: AbortSignal.timeout(timeoutMs),
   });
   const data = await res.json().catch(() => ({}));
   if (!res.ok || data.ok === false) {
@@ -186,16 +190,38 @@ async function main() {
   try {
     if (arg('--screenshot')) {
       screenshotUrl = await uploadScreenshot(arg('--screenshot'));
+      let ocrText = '';
+      let caption = '';
+      if (screenshotUrl && !has('--no-ocr')) {
+        try {
+          const ocrRes = await postJson('/api/vision/ocr', { imageUrl: screenshotUrl }, { timeoutMs: 15000 });
+          ocrText = String(ocrRes.text ?? '').trim();
+        } catch (err) {
+          console.error(`! 画面文字识别失败（已跳过）：${err.message}`);
+        }
+      }
+      if (screenshotUrl && has('--vision')) {
+        try {
+          const an = await postJson('/api/vision/analyze?mode=both', { imageUrl: screenshotUrl }, { timeoutMs: 120000 });
+          ocrText = ocrText || String(an.ocr?.text ?? '').trim();
+          caption = String(an.caption?.text ?? '').trim();
+        } catch (err) {
+          console.error(`! 画面理解失败（已跳过）：${err.message}`);
+        }
+      }
+      if (ocrText) bodyText += `\n\n**画面文字**（OCR）：\n\n\`\`\`\n${ocrText.replace(/\`\`\`/g, "'''")}\n\`\`\``;
+      if (caption) bodyText += `\n\n**画面理解**：\n\n${caption}`;
+      markdown = buildMarkdown();
       const note = await postJson('/api/notes', {
         video,
         tMs,
-        body: text,
+        body: bodyText,
         tags,
         kind: 'quick',
         source,
         ...(screenshotUrl ? { imageUrl: screenshotUrl } : {}),
       });
-      result = { path: '(engine)', markdown, note: note.note, screenshotUrl };
+      result = { path: '(engine)', markdown, note: note.note, screenshotUrl, ocrText, caption };
     } else {
       result = await postJson('/api/notes/quick', { video, tMs, text, source, ...(tags.length ? { tags } : {}) });
     }

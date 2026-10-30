@@ -5,6 +5,9 @@
 
 - **v0.4 新能力**：全局快捷键 **⌥N**「边看边实现」——把当前双语字幕 + 时间戳 +（可选）屏幕截图
   一键记进本地引擎的学习笔记（`POST /api/notes/quick`），失败自动离线排队、引擎恢复后补发。
+- **v0.5 新能力**：⌥N 笔记加入**画面文字（OCR）**——截图上传后调用引擎 `/api/vision/ocr`，
+  把幻灯片/代码/字幕里的文字写进笔记；可选 **画面理解（VLM，默认关，慢约 20–30s）**。
+  视觉不可用（旧引擎 / 未安装 vision 模块）时静默降级，笔记照常保存。
 - 和 Chrome 扩展（只抓网页标签页）、本地工作台（只处理本地文件）互补，三端共用同一套线协议：
   [`docs/CONTRACTS.md`](../../docs/CONTRACTS.md) §3 / [`engine/protocol.mjs`](../../engine/protocol.mjs)。
 - 原生 Swift，零第三方依赖：只用系统框架 `ScreenCaptureKit` / `AVFoundation` / `AppKit` / `Foundation`。
@@ -25,6 +28,7 @@ apps/macos/
 │   ├── Protocol.swift             # 线协议 Swift 镜像（帧编解码、hello、事件解析、字幕折行、重采样）
 │   ├── NotesClient.swift          # Notes API 客户端 + 离线队列（≤50 条）+ 笔记文本/视频标题纯函数
 │   ├── Screenshot.swift           # SCScreenshotManager 截图（PNG ≤4MB）+ 截图降级决策
+│   ├── Vision.swift               # v0.5 视觉纯逻辑：OCR/analyze 请求、文本清洗/代码块转义、降级决策、health 解析
 │   ├── HotKey.swift               # Carbon RegisterEventHotKey 全局 ⌥N（无第三方依赖）
 │   └── SelfTest.swift             # --self-test headless 自检 + --simulate 演示语料
 ├── Info.plist                     # LSUIElement=true（菜单栏 App）、NSScreenCaptureUsageDescription 等
@@ -66,7 +70,7 @@ bash scripts/build-macos.sh --clean
 - 脚本只显式链接系统框架：`AppKit` / `AVFoundation` / `CoreMedia` / `CoreGraphics` / `ScreenCaptureKit`。
 - 构建末尾会做 **ad-hoc 签名**（`codesign --force --sign -`），便于 `open` 正常启动；App 未公证。
 - 本机实测（Swift 5.10 / macOS 14.8.9，Apple Silicon）：增量编译约 **6–15s**（clean 全量约 36s）、
-  可执行文件 **653 KB**、bundle **668 KB**（v0.4 增加笔记模块）。
+  可执行文件 **788 KB**、bundle **800 KB**（v0.5 增加视觉/OCR 模块）。
 
 ## 运行
 
@@ -94,7 +98,8 @@ BIN=apps/macos/build/livedub.app/Contents/MacOS/livedub
 "$BIN" --self-test                 # headless 自检，退出码 0/1（不建窗口、不请求权限）
 "$BIN" --simulate --duration 10    # 无权限/无引擎演示 UI（自动退出便于冒烟）
 "$BIN" --autostart --duration 15   # 自动开始同传，15s 后自动退出
-"$BIN" --autostart --note-once --duration 10   # 自动开始 + 2.5s 后记一条测试笔记（截图/队列全链路）
+"$BIN" --autostart --note-once --duration 10   # 自动开始 + 2.5s 后记一条测试笔记（截图/OCR/队列全链路）
+"$BIN" --autostart --note-once --notes-vision --duration 20   # 冒烟 VLM（慢）路径
 "$BIN" --engine-url ws://127.0.0.1:8787/ws --autostart
 "$BIN" --help
 ```
@@ -103,7 +108,8 @@ BIN=apps/macos/build/livedub.app/Contents/MacOS/livedub
 |---|---|
 | `--simulate` | 不抓音频、不连引擎，循环演示中英字幕/状态/延迟（无权限环境验证 UI） |
 | `--autostart` | 启动后自动点一次「开始同传」（适合登录项 / 自动化冒烟） |
-| `--note-once` | 启动 2.5s 后自动记一条测试笔记；未显式给 `--duration` 时记录完自动退出（冒烟用） |
+| `--note-once` | 启动 2.5s 后自动记一条测试笔记（截图/OCR/VLM 全链路）；未显式给 `--duration` 时记录完自动退出（冒烟用） |
+| `--notes-vision` | 调试用：本次运行开启「画面理解（VLM，慢）」开关（不写用户设置） |
 | `--duration <秒>` | N 秒后自动退出（调试用） |
 | `--engine-url <url>` | 覆盖引擎地址并持久化 |
 | `--self-test` | headless 自检：协议字节布局 / hello / 事件解析 / 字幕排版 / 重采样 / 分帧 |
@@ -125,6 +131,9 @@ BIN=apps/macos/build/livedub.app/Contents/MacOS/livedub
 | 增大 / 减小字幕字号 | 即时生效并持久化 |
 | **记笔记时附截图** | 开关（默认开）：按 ⌥N 时用 SCScreenshotManager 截当前屏幕作为笔记附件 |
 | **暂停时仍可笔记** | 开关（默认开）：同传暂停（引擎 status=paused）时仍允许 ⌥N 记录当前字幕 |
+| **识别画面文字（OCR，快）** | v0.5 开关（默认开）：截图上传后调用 `/api/vision/ocr`，把文字写进笔记 |
+| **画面理解（VLM，慢，约 20–30s）** | v0.5 开关（默认关）：调用 `/api/vision/analyze?mode=both` 生成画面描述；失败降级为仅 OCR |
+| **视觉：…** | 视觉能力状态（只读）：OCR/VLM 是否可用（来自 `/api/vision/health`） |
 | 笔记队列：… | 离线待同步条数（引擎重连后自动补发） |
 | 设置引擎地址… | 修改 WS 地址，保存后自动重连 |
 | 打开屏幕录制权限设置… | 直达 系统设置 → 隐私与安全性 → 屏幕录制 |
@@ -206,9 +215,15 @@ macOS 用**「屏幕录制」权限**管控系统音频捕获——系统弹窗�
                                    │
              ┌─────────────────────┴──────────────────────┐
              ▼                                            ▼
-  POST /api/notes/quick 成功                    引擎未启动 / 请求失败
-  toast「已记录笔记 · HH:MM:SS」                 UserDefaults 离线队列（≤50 条）
-                                                  引擎重连 / 每 60s 自动补发
+  截图 PNG → POST /api/notes/assets               引擎未启动 / 请求失败
+             │                                     UserDefaults 离线队列（≤50 条）
+             ▼                                      引擎重连 / 每 60s 自动补发
+  v0.5：POST /api/vision/ocr（8s 超时，默认开）
+        POST /api/vision/analyze?mode=both（VLM，默认关，慢 20–30s）
+             │  失败静默降级（不影响笔记保存）
+             ▼
+  POST /api/notes/quick 成功
+  toast「已记录笔记 · HH:MM:SS」
 ```
 
 - 全局热键：**Carbon `RegisterEventHotKey`**（系统自带，不需要「辅助功能 / 输入监控」授权，
@@ -230,8 +245,38 @@ macOS 用**「屏幕录制」权限**管控系统音频捕获——系统弹窗�
   PNG > 4MB 时自动降采样（1.0 → 0.75 → 0.55 → 0.4），仍超限或截图失败 → **降级为纯文字笔记**（日志说明原因）。
 - 离线队列：引擎没启动 / Notes API 404 / 网络失败 → 笔记进 `UserDefaults` 队列（最多 50 条，丢最旧）；
   WS 重连成功或每 60s 自动 flush，逐条补发；菜单「笔记队列：N 条待同步」可见。
-- 浮层 toast：成功「已记录笔记 · 14:20:33」；离线「引擎未连接，笔记已排队 · 14:20:33」。
-- 权限：无需新增权限——截图复用「屏幕录制」；不开启附截图时，笔记只含文本。
+- 浮层 toast：成功「已记录笔记 · 14:20:33」；离线「引擎未连接，笔记已排队 · 14:20:33」；
+  VLM 开启时先提示「画面理解中…（VLM 约 20–30s）」。
+- 权限：无需新增权限——截图复用「屏幕录制」；OCR 用引擎侧本地 macOS Vision；不开启附截图时，笔记只含文本（没有画面可识别）。
+
+### 画面文字（OCR）/ 画面理解（VLM）（v0.5）
+
+`⌥N` -> 截图上传 assets 成功后，按设置调用引擎视觉端点，把结果写进 quick note 的 `text`：
+
+- **画面文字（OCR，默认开）**：`POST /api/vision/ocr`，body `{"imageUrl":"/api/notes/assets/<file>.png"}`，
+  **8s 超时**；返回 `{ok,text,lines,provider,ms}`。清洗规则：按行 trim/去空行、相邻重复行去重、
+  去控制字符、最多 80 行 / 2000 字（超出加 `…`）；用 Markdown 代码块写入（内容含反引号时自动用更长 fence）：
+
+  ````markdown
+  **画面文字**（OCR）：
+
+  ```
+  Gradient descent
+  Follow the slope downhill
+  ```
+  ````
+
+  没有可读文字时**不加**该段；OCR 失败只写日志、笔记照常保存。
+- **画面理解（VLM，默认关）**：`POST /api/vision/analyze?mode=both`（**45s 客户端超时**；服务端慢操作
+  默认 90s 上限），返回 `{ok,ocr?,caption?}`；caption 写入 `**画面理解**：` 段落，OCR 若还没拿到会用
+  analyze 的 `ocr` 兜底。开启时浮层先提示等待；超时/未配置/失败 -> **降级为仅 OCR**（不丢笔记）。
+- **视觉能力状态**：启动、引擎连上、每 5 分钟、切换开关时 `GET /api/vision/health`，菜单「视觉：…」显示
+  `OCR 可用/不可用 · VLM 已配置/未配置`。旧引擎（v0.4 无 `/api/vision/*`）返回 404 -> 菜单显示
+  「不可用（引擎 < v0.5）」，整个运行期跳过视觉调用，**笔记照常保存（字幕+截图）**。
+- **延迟/费用**：OCR 本地 macOS Vision，通常 <1s、无云端费用；VLM 取决于引擎配置（可能调用云端 ark-plan），
+  单次约 20–30s，**可能产生费用**，所以默认关。笔记保存只等 OCR（快）；开 VLM 时才会等慢路径。
+- **隐私**：截图只作为本地笔记附件存 `data/notes/assets/`；开启 VLM 时截图会按引擎配置发给 VLM provider
+  （可能是云端）。介意隐私请保持 VLM 关闭（OCR 仍是本地的）。
 
 ### 手动验证 ⌥N（不依赖真实引擎）
 
@@ -255,7 +300,7 @@ sleep 6 && node /tmp/mock-notes-engine.mjs
 ## 自检 / 测试
 
 ```bash
-# 1) 编译 + 自检（139 项，退出码 0/1）
+# 1) 编译 + 自检（194 项，退出码 0/1）
 bash scripts/build-macos.sh --check
 
 # 2) 静态契约测试（默认跨平台、离线、不跑 swiftc —— CI 在 ubuntu 也能跑）
@@ -279,7 +324,11 @@ LIVEDUB_MACOS_BUILD=1 node --test tests/macos.test.mjs
   会话时间格式（`01:23.4` / `1:02:03.4`）、墙钟 `HH:MM:SS`、日期；视频标题/ID 推导（媒体 App / 会话 / 兜底 /
   清洗 / slug）；quick note 文本（原文/译文/时间/来源/截图 markdown/无字幕）与 JSON 字段编解码往返；
   离线队列（≤50 丢最旧、FIFO、enqueueFront、clear、损坏数据安全丢弃、注入内存存储不写用户偏好）；
-  截图降级决策（关闭/无权限/失败/超 4MB/正常）与降采样序列；⌥N 热键常量（`kVK_ANSI_N=45`、Carbon optionKey）。
+  截图降级决策（关闭/无权限/失败/超 4MB/正常）与降采样序列；⌥N 热键常量（`kVK_ANSI_N=45`、Carbon optionKey）；
+- **v0.5 画面文字/画面理解**：OCR/analyze 请求体 JSON、`/api/vision/*` URL 与 `mode` 归一化、imageUrl 相对路径校验；
+  OCR 文本清洗（trim/去空行/去重/去控制字符/80 行/2000 字截断）、代码块反引号转义、`**画面文字**（OCR）`/
+  `**画面理解**` 段落格式；降级决策（关闭/无截图/旧引擎 404/服务未就绪 503/health 未配置）、健康 JSON 解析
+  （bool 与对象两种能力形态）、analyze 响应 string/object 兼容、图文笔记正文顺序与 4000 字上限。
 
 ## 手动测试清单
 
@@ -306,6 +355,13 @@ LIVEDUB_MACOS_BUILD=1 node --test tests/macos.test.mjs
 - [ ] **离线队列**：先停掉引擎 → 按 ⌥N → toast「引擎未连接，笔记已排队」、菜单「笔记队列：1 条待同步」；
       启动引擎后 60s 内（或重连后立即）自动补发，队列清零
 - [ ] **暂停时仍可笔记**：暂停同传（或关闭该开关）验证：开=可记录最后一句；关=toast 提示被禁用
+- [ ] **画面文字 OCR**：播放带幻灯片的英文课/代码画面 → ⌥N → 笔记正文出现
+      `**画面文字**（OCR）` 代码块（引擎 v0.5 + vision 模块就绪时）；无文字画面则不出现该段
+- [ ] **OCR 关闭开关**：菜单关闭「识别画面文字（OCR）」→ 再按 ⌥N，笔记只有字幕+截图；重新打开恢复
+- [ ] **画面理解 VLM（可选）**：菜单开「画面理解（VLM）」→ ⌥N → 浮层提示「画面理解中…」→ 笔记出现
+      `**画面理解**：` 段（未配置 VLM/超时则自动降级为仅 OCR）；之后关掉开关避免每次都慢 20–30s
+- [ ] **旧引擎降级**：引擎不升级（无 `/api/vision/*`）→ 菜单「视觉：不可用（引擎 < v0.5）」，
+      ⌥N 笔记仍正常保存（字幕+截图，无 OCR 段），日志提示跳过
 - [ ] **退出**：菜单退出后 `pgrep -fl livedub` 无残留；无 Dock 图标（菜单栏 App 正常形态）
 
 ### 验收记录（本机实测，2026-10-29，Swift 5.10 / macOS 14.8.9 / Apple Silicon）
@@ -338,6 +394,21 @@ LIVEDUB_MACOS_BUILD=1 node --test tests/macos.test.mjs
   假引擎收到 text 含 `（无字幕）`（离线时无引擎事件，符合预期）、无 imageUrl。
 - 自动化：`node --test tests/macos.test.mjs` 全绿（含 v0.4 静态契约断言）。
 
+### v0.5 验收记录（2026-10-30，Swift 5.10 / macOS 14.8.9 / Apple Silicon）
+
+- `bash scripts/build-macos.sh --check`：**self-test 194/194 通过**，退出码 0，0 warning；
+  可执行文件 788 KB，bundle 800 KB。
+- **OCR 端到端**（严格契约假引擎 18788：Notes + Vision API，全部本机）：
+  `--autostart --note-once`（OCR 默认开、VLM 默认关）→ 日志 `视觉：OCR mock-ocr · VLM mock-vlm` →
+  截图 725KB 上传 → `POST /api/vision/ocr` body `{"imageUrl":"/api/notes/assets/img_xxx.png"}` →
+  quick note text 含 `**画面文字**（OCR）` 代码块（`Gradient descent / Follow the slope downhill …`），
+  无 `**画面理解**` 段；exit 0。
+- **VLM 端到端**：`--notes-vision` → `POST /api/vision/analyze?mode=both` →
+  笔记 text 同时含 OCR 代码块 + `**画面理解**：幻灯片在讲解梯度下降的几何直觉…`；日志 `VLM 已生成（31 字）`。
+- **旧引擎 404 降级**：假引擎关闭 Vision（/api/vision/* 返回 404）→ 菜单/日志「视觉：不可用（引擎 < v0.5）」→
+  ⌥N 笔记照常保存（字幕+截图，无 OCR），`画面 OCR 跳过：引擎无视觉端点（需 v0.5）`，exit 0。
+- 自动化：`node --test tests/macos.test.mjs` 全绿（含 v0.5 静态契约断言）。
+
 ## 已知限制
 
 1. **系统音频不会自动静音 → 原声与中文配音同时存在。**
@@ -368,6 +439,11 @@ LIVEDUB_MACOS_BUILD=1 node --test tests/macos.test.mjs
 14. 笔记里的 `tMs` 是**会话音频时间轴**（不是视频平台的播放时间），暂停时是最后一次音频位置；
     直播/会议场景没有可回跳的 URL，`video.url` 为空，标题靠推导。
 15. 截图功能需要 macOS 14+（`SCScreenshotManager`）；音频捕获与笔记文本在 macOS 14+ 全部可用。
+16. **画面文字（OCR）需要引擎 v0.5 + vision 模块就绪**：未就绪时静默降级（笔记只有字幕+截图），
+    菜单会显示视觉不可用；OCR 只处理截图里的文字（手写体/艺术字/极小字号识别率有限）。
+17. **画面理解（VLM）默认关闭**：单次约 20–30s，且可能调用云端 provider（截图会上传、可能产生费用）。
+    开启后每次 ⌥N 都会等待 VLM；失败/超时会自动降级为仅 OCR，笔记不会丢。
+18. 视觉调用失败只写日志、不弹错误框（避免打扰同传）；需要排障时看菜单「视觉：…」与诊断信息。
 
 ## 故障排查
 
@@ -383,6 +459,9 @@ LIVEDUB_MACOS_BUILD=1 node --test tests/macos.test.mjs
 | 按 ⌥N 没反应 | 看日志「全局快捷键 ⌥N 已就绪 / 注册失败」；被占用时用菜单「记笔记」；确认 App 在运行（非退出） |
 | 笔记一直「待同步」 | 引擎是否运行 / 是否 v0.4（Notes API 404 会排队）；菜单「打开笔记」确认工作台可用；看引擎日志 |
 | 笔记没有截图 | 菜单「记笔记时附截图」是否开；屏幕录制权限；截图/上传失败会降级纯文字（日志有原因） |
+| 笔记没有画面文字（OCR） | 菜单「视觉：…」是否显示 OCR 可用；引擎是否 v0.5 + vision 模块；OCR 开关是否开；看日志 `[vision]` |
+| VLM 一直没结果 | 默认关；开启后每条约 20–30s，超时（45s）会自动降级仅 OCR；未配置 VLM 时菜单显示未配置 |
+| 菜单「视觉：不可用（引擎 < v0.5）」 | 引擎是 v0.4 或未安装 vision 模块：升级引擎/安装依赖；不影响笔记（截图+字幕照常） |
 | 笔记时间/标题怪 | `tMs` 是会话音频轴；标题由前台媒体 App/会话推导，可在工作台里改名/编辑 |
 | 编译报 SDK/availability 错 | 需要 macOS 14+ SDK；`swiftc --version` 应为 5.10+，`MACOS_TARGET` 默认 `<arch>-apple-macos14.0` |
 
@@ -391,6 +470,8 @@ LIVEDUB_MACOS_BUILD=1 node --test tests/macos.test.mjs
 - 音频只在内存中：系统采集 → `ws://127.0.0.1` 本地引擎，**不落盘、不上传**；
 - 快捷笔记：文本/截图只发给**本机引擎**（`127.0.0.1`），落在本地 `data/notes/`；默认不截屏，
   只有开启「记笔记时附截图」并按 ⌥N 时才截当前屏幕作为该条笔记附件（不含 livedub 浮层）。
+- 画面文字（OCR）：默认由引擎侧**本地 macOS Vision** 识别，图片不出本机；
+- 画面理解（VLM，默认关）：按引擎配置调用 provider，**截图可能上传云端**并产生费用——介意隐私请保持关闭。
 - 引擎会把**文本**发给配置的云翻译 / TTS provider（与其他端一致，取决于用户配置）。
 - 日志只打印状态与计数，不打印 API Key；`--simulate` / `--self-test` 完全离线。
 
@@ -399,5 +480,7 @@ LIVEDUB_MACOS_BUILD=1 node --test tests/macos.test.mjs
 - 线协议与事件字段：[`docs/CONTRACTS.md`](../../docs/CONTRACTS.md) §3；权威实现 [`engine/protocol.mjs`](../../engine/protocol.mjs)
 - 浏览器端：[`extension/README.md`](../../extension/README.md)；本地工作台：根目录 README
 - Notes API 契约与工作台笔记面板（T4）：`engine/server.mjs` 的 `/api/notes/*`、`studio/`（v0.4）
+- 视觉端点（T4 契约）：`POST /api/vision/ocr`、`POST /api/vision/analyze?mode=ocr|vision|both`、
+  `GET /api/vision/health`（v0.5，见 `engine/server.mjs` 与 `engine/vision/`）
 - 路线图：[`docs/ROADMAP.md`](../../docs/ROADMAP.md)（v0.3 桌面悬浮窗 / v0.4 边看边写笔记）
 - 构建脚本：[`scripts/build-macos.sh`](../../scripts/build-macos.sh)；静态测试：[`tests/macos.test.mjs`](../../tests/macos.test.mjs)

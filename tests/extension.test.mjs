@@ -100,6 +100,11 @@ import {
 } from '../extension/lib/srt.js';
 import {
   NOTE_QUEUE_LIMIT,
+  VISION_ANALYZE_TIMEOUT_MS,
+  VISION_OCR_TIMEOUT_MS,
+  VISION_TEXT_LIMIT,
+  appendVisionToText,
+  buildEnrichedNoteBody,
   buildNoteToastText,
   buildQuickNoteMarkdown,
   buildQuickNoteRequest,
@@ -111,10 +116,16 @@ import {
   normalizeVideoUrl,
   notesEndpoint,
   parseNotesListResponse,
+  pickVisionAnalysis,
+  pickVisionOcrText,
   readDailyCount,
   resolveAssetUrl,
+  sanitizeVisionText,
   toDateKey,
+  visionEndpoint,
+  visionHealthSummary,
 } from '../extension/lib/notes.js';
+import { buildFencedCode, buildVisionCaptionSection, buildVisionOcrSection } from '../extension/lib/notes.js';
 import {
   PROTOCOL_VERSION as ENGINE_PROTOCOL_VERSION,
   decodeAudioFrame as engineDecodeAudioFrame,
@@ -173,7 +184,7 @@ test('manifest：合法的 MV3 清单，background 为 module service worker + a
   assert.equal(typeof manifest.name, 'string');
   assert.ok(manifest.name.length > 0);
   assert.match(manifest.version, /^\d+\.\d+\.\d+$/);
-  assert.match(manifest.version, /^0\.4\./, 'v0.4 迭代应把扩展版本提升到 0.4.x');
+  assert.match(manifest.version, /^0\.5\./, 'v0.5 迭代应把扩展版本提升到 0.5.x');
   assert.equal(manifest.background.service_worker, 'background.js');
   assert.equal(manifest.background.type, 'module', 'service worker 必须是 type: module，background.js 里用了 ESM import');
   assert.equal(manifest.action.default_popup, 'popup.html');
@@ -554,6 +565,11 @@ test('README 覆盖安装/权限/排障/手动测试清单', () => {
     'Obsidian',
     '离线队列',
     '截图',
+    'OCR',
+    'VLM',
+    '画面文字',
+    '画面理解',
+    '20-30s',
   ]) {
     assert.ok(source.readme.includes(keyword), `README 缺少内容: ${keyword}`);
   }
@@ -933,6 +949,9 @@ test('constants：默认设置符合契约（16k 引擎 / 配音开 / 压音 0.1
   assert.equal(DEFAULT_SETTINGS.fullscreenWorkaround, true);
   // v0.4：记笔记默认附页面截图
   assert.equal(DEFAULT_SETTINGS.noteScreenshot, true);
+  // v0.5：画面文字 OCR 默认开；画面理解 VLM 默认关（慢）
+  assert.equal(DEFAULT_SETTINGS.visionOcr, true);
+  assert.equal(DEFAULT_SETTINGS.visionCaption, false);
   assert.equal(STORAGE_KEYS.settings, 'livedub:settings');
   assert.equal(STORAGE_KEYS.bgState, 'livedub:bg-state');
   assert.equal(STORAGE_KEYS.captions, 'livedub:captions');
@@ -1568,6 +1587,168 @@ test('popup v0.4：今日笔记/打开笔记本/导出 Markdown', () => {
   assert.match(source.popupHtml, /Alt\+Shift\+N/);
   assert.match(source.popup, /notes=1/);
   assert.match(source.popup, /今日 \$\{todayCount\} 条/);
+});
+
+
+// ===========================================================================
+// 8d. v0.5：画面文字（OCR）/ 画面理解（VLM）
+// ===========================================================================
+
+test('notes v0.5：sanitizeVisionText 清洗/多行/截断 2000', () => {
+  assert.equal(sanitizeVisionText(''), '');
+  assert.equal(sanitizeVisionText(null), '');
+  assert.equal(VISION_TEXT_LIMIT, 2000);
+  assert.equal(sanitizeVisionText('  第一行\n第二行  '), '第一行\n第二行');
+  assert.equal(sanitizeVisionText('a\u0000b\u0007c'), 'abc');
+  assert.equal(sanitizeVisionText('a\n\n\n\nb'), 'a\n\nb', '连续 3+ 空行折叠为 2');
+  assert.equal(sanitizeVisionText('x'.repeat(2500)).length, VISION_TEXT_LIMIT);
+  assert.ok(sanitizeVisionText('x'.repeat(2500)).endsWith('…'));
+  assert.equal(sanitizeVisionText('abcdef', { maxLen: 5 }), 'abcd…');
+});
+
+test('notes v0.5：buildFencedCode 反引号转义（围栏自适应）', () => {
+  assert.equal(buildFencedCode(''), '');
+  assert.equal(buildFencedCode('hello'), '```\nhello\n```');
+  const withTicks = buildFencedCode('a ``` b');
+  assert.ok(withTicks.startsWith('````'), '内容含 ``` 时应用 4+ 反引号围栏');
+  assert.ok(withTicks.endsWith('````'));
+  assert.ok(withTicks.includes('a ``` b'));
+  assert.equal(buildFencedCode('code', { lang: 'text' }), '```text\ncode\n```');
+  // 危险字符不进入语言标识
+  assert.match(buildFencedCode('x', { lang: 'js`\n' }), /^```js\n/);
+});
+
+test('notes v0.5：buildVisionOcrSection / buildVisionCaptionSection', () => {
+  const ocr = buildVisionOcrSection('幻灯片标题\n梯度下降法');
+  assert.match(ocr, /^\*\*画面文字\*\*（OCR）：\n\n```\n/);
+  assert.ok(ocr.includes('幻灯片标题\n梯度下降法'));
+  assert.ok(ocr.endsWith('```'));
+  assert.equal(buildVisionOcrSection(''), '');
+  assert.equal(buildVisionOcrSection('   '), '');
+
+  const caption = buildVisionCaptionSection('讲师正在讲解梯度下降的几何直观。');
+  assert.equal(caption, '**画面理解**：\n\n讲师正在讲解梯度下降的几何直观。');
+  assert.equal(buildVisionCaptionSection(''), '');
+});
+
+test('notes v0.5：buildEnrichedNoteBody 保留原结构并追加视觉段', () => {
+  const base = '- [ ] **01:05** 梯度下降\n  - 视频：Lesson 1';
+  // 无视觉：原样返回（去掉尾部空白）
+  assert.equal(buildEnrichedNoteBody({ baseBody: `${base}\n` }), base);
+  // 仅 OCR
+  const onlyOcr = buildEnrichedNoteBody({ baseBody: base, ocr: '梯度下降', caption: '' });
+  assert.ok(onlyOcr.startsWith(base));
+  assert.match(onlyOcr, /\*\*画面文字\*\*（OCR）：/);
+  assert.ok(!onlyOcr.includes('**画面理解**'));
+  // OCR + caption，顺序固定
+  const both = buildEnrichedNoteBody({ baseBody: base, ocr: 'OCR 文本', caption: '画面描述' });
+  const ocrIndex = both.indexOf('**画面文字**');
+  const captionIndex = both.indexOf('**画面理解**');
+  assert.ok(ocrIndex > 0 && captionIndex > ocrIndex);
+  // 空 base：只输出视觉段
+  const noBase = buildEnrichedNoteBody({ baseBody: '', ocr: 'x' });
+  assert.ok(noBase.startsWith('**画面文字**'));
+  // 无文字不加空块
+  assert.equal(buildEnrichedNoteBody({ baseBody: base, ocr: '', caption: '' }), base);
+});
+
+test('notes v0.5：appendVisionToText（quick 兜底）', () => {
+  assert.equal(appendVisionToText('梯度下降'), '梯度下降');
+  const enriched = appendVisionToText('梯度下降', { ocr: '幻灯片：learning rate', caption: '讲师在写公式' });
+  assert.ok(enriched.startsWith('梯度下降\n\n'));
+  assert.match(enriched, /\*\*画面文字\*\*（OCR）：/);
+  assert.match(enriched, /\*\*画面理解\*\*：/);
+  assert.equal(appendVisionToText('', { ocr: 'x' }).startsWith('（无字幕）'), true);
+});
+
+test('notes v0.5：pickVisionOcrText / pickVisionAnalysis 兼容契约响应', () => {
+  assert.equal(pickVisionOcrText({ ok: true, text: ' hello\nworld ', lines: ['a'] }), 'hello\nworld');
+  assert.equal(pickVisionOcrText({ ok: true, lines: ['第一行', '第二行'] }), '第一行\n第二行');
+  assert.equal(pickVisionOcrText({ ok: true, lines: [{ text: 'L1' }, { value: 'L2' }] }), 'L1\nL2');
+  assert.equal(pickVisionOcrText({ ok: true, ocr: { text: 'nested' } }), 'nested');
+  assert.equal(pickVisionOcrText(null), '');
+  assert.equal(pickVisionOcrText({ ok: true }), '');
+
+  const both = pickVisionAnalysis({
+    ok: true,
+    mode: 'both',
+    ocr: 'OCR 文本',
+    caption: { text: '画面描述', provider: 'ark', model: 'x', ms: 1200 },
+  });
+  assert.deepEqual(both, { ocr: 'OCR 文本', caption: '画面描述' });
+  assert.deepEqual(pickVisionAnalysis({ ok: true, caption: '纯字符串描述' }), { ocr: '', caption: '纯字符串描述' });
+  assert.deepEqual(pickVisionAnalysis({ ok: true, vision: { text: 'v' } }), { ocr: '', caption: 'v' });
+  assert.deepEqual(pickVisionAnalysis({ ok: true, text: 'fallback' }), { ocr: 'fallback', caption: '' });
+  assert.deepEqual(pickVisionAnalysis(null), { ocr: '', caption: '' });
+});
+
+test('notes v0.5：visionHealthSummary 解析 health（含旧引擎 503/404 降级）', () => {
+  assert.equal(visionEndpoint('http://h:1', 'ocr'), 'http://h:1/api/vision/ocr');
+  assert.equal(visionEndpoint('http://h:1/', 'analyze'), 'http://h:1/api/vision/analyze');
+  assert.equal(visionEndpoint('http://h:1', 'health'), 'http://h:1/api/vision/health');
+  assert.throws(() => visionEndpoint('http://h:1', 'nope'), /unknown vision endpoint/);
+  assert.ok(VISION_OCR_TIMEOUT_MS >= 5000 && VISION_OCR_TIMEOUT_MS <= 15000);
+  assert.ok(VISION_ANALYZE_TIMEOUT_MS >= 30000, 'VLM 慢，超时应 >= 30s');
+
+  const ready = visionHealthSummary({
+    ok: true,
+    ready: true,
+    ocr: { ok: true, provider: 'macos-vision', bin: 'data/bin/ocr-macos' },
+    vision: { configured: true, provider: 'ark-plan', model: 'doubao' },
+  });
+  assert.equal(ready.available, true);
+  assert.equal(ready.ready, true);
+  assert.equal(ready.ocr, true);
+  assert.equal(ready.vision, true);
+  assert.match(ready.ocrLabel, /OCR macos-vision/);
+  assert.match(ready.visionLabel, /VLM ark-plan/);
+
+  const degraded = visionHealthSummary({ ok: false, error: 'vision module not available' });
+  assert.equal(degraded.available, false);
+  assert.equal(degraded.ocr, false);
+  assert.equal(degraded.error, 'vision module not available');
+
+  const simple = visionHealthSummary({ ok: true, ready: true, ocr: true, vision: false });
+  assert.equal(simple.available, true);
+  assert.equal(simple.ocr, true);
+  assert.equal(simple.vision, false);
+
+  assert.equal(visionHealthSummary(null).available, false);
+});
+
+test('background.js v0.5：视觉增强链路（OCR 8s / VLM 45s / 静默降级）', () => {
+  assert.ok(source.background.includes("from './lib/notes.js'"));
+  assert.match(source.background, /VISION_OCR_TIMEOUT_MS/);
+  assert.match(source.background, /VISION_ANALYZE_TIMEOUT_MS/);
+  assert.match(source.background, /async function enrichNoteWithVision\(/);
+  assert.match(source.background, /async function requestVisionOcr\(/);
+  assert.match(source.background, /async function requestVisionAnalyze\(/);
+  assert.match(source.background, /visionEndpoint\(engineHttpBase\(\), 'ocr'\)/);
+  assert.match(source.background, /visionEndpoint\(engineHttpBase\(\), 'analyze'\)/);
+  assert.match(source.background, /visionEndpoint\(engineHttpBase\(\), 'health'\)/);
+  assert.match(source.background, /mode=\$\{encodeURIComponent\(mode\)\}/);
+  assert.match(source.background, /buildEnrichedNoteBody\(/);
+  assert.match(source.background, /appendVisionToText\(/);
+  assert.match(source.background, /payload\.vision/);
+  assert.match(source.background, /pending: true/);
+  assert.match(source.background, /visionHealth/);
+  assert.match(source.background, /503|\b501\b/, '旧引擎无视觉端点应静默降级');
+});
+
+test('content/popup v0.5：视觉设置与健康状态展示', () => {
+  assert.match(source.content, /data-set="visionOcr"/);
+  assert.match(source.content, /data-set="visionCaption"/);
+  assert.match(source.content, /visionOcr: true/);
+  assert.match(source.content, /visionCaption: false/);
+  assert.match(source.content, /result\.pending/);
+  for (const id of ['vision-health', 'vision-ocr', 'vision-caption']) {
+    assert.match(source.popupHtml, new RegExp(`id="${id}"`), `popup.html 缺少 #${id}`);
+  }
+  assert.ok(source.popup.includes("from './lib/notes.js'"));
+  assert.match(source.popup, /visionHealthSummary\(/);
+  assert.match(source.popup, /async function probeVisionHealth\(/);
+  assert.match(source.popup, /visionEndpoint\(base, 'health'\)/);
+  assert.match(source.popup, /20-30s/);
 });
 
 

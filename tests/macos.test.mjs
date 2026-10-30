@@ -33,6 +33,8 @@ const SWIFT_FILES = [
   'NotesClient.swift',
   'HotKey.swift',
   'Screenshot.swift',
+  // v0.5 画面文字 / 画面理解
+  'Vision.swift',
 ];
 
 test('macos: 构建脚本存在，bash -n 语法检查通过', () => {
@@ -199,6 +201,50 @@ test('macos: 引擎地址 / 事件名与 docs+protocol.mjs 对齐', () => {
   assert.match(main, /sendAudioFrame/);
 });
 
+test('macos: v0.5 画面文字（OCR）/ 画面理解（VLM）（Vision + NotesClient + 菜单）', () => {
+  // 纯逻辑层：请求模型 / 清洗 / 代码块转义 / 降级决策 / health 解析
+  const vision = readSource('Vision.swift');
+  assert.match(vision, /\/api\/vision|VisionOCRRequest|imageUrl/, '缺少视觉 API 模型');
+  assert.match(vision, /VisionAnalyzeResponse/);
+  assert.match(vision, /VisionPlanner/);
+  assert.match(vision, /ocrTimeout: TimeInterval = 25/);
+  assert.match(vision, /analyzeTimeout: TimeInterval = 45/);
+  assert.match(vision, /ocrMaxChars = 2_000/);
+  assert.match(vision, /captionMaxChars = 1_000/);
+  assert.match(vision, /maxImageBytes = 4 \* 1024 \* 1024/);
+  assert.match(vision, /VisionHealthParser/, '缺少 /api/vision/health 解析');
+  assert.match(vision, /endpointMissing/, '缺少旧引擎 404 降级决策');
+  assert.match(vision, /codeBlock/, '缺少 OCR 代码块转义');
+  assert.match(vision, /\*\*画面文字\*\*（OCR）/, '缺少画面文字段落标记');
+  assert.match(vision, /\*\*画面理解\*\*/, '缺少画面理解段落标记');
+
+  // 网络层：NotesClient 扩展
+  const notes = readSource('NotesClient.swift');
+  assert.match(notes, /fetchVisionHealth/);
+  assert.match(notes, /recognizeImage/);
+  assert.match(notes, /analyzeImage/);
+  assert.match(notes, /visionOCRURL|visionHealthURL|visionAnalyzeURL/);
+  assert.match(notes, /appendingPathComponent\("vision"\)/);
+  assert.match(notes, /ocrText/, 'quick note 缺少 OCR 参数');
+  assert.match(notes, /visionCaption/, 'quick note 缺少画面理解参数');
+
+  // 设置 / 菜单 / 主流程
+  const settings = readSource('Settings.swift');
+  assert.match(settings, /notesOCR/);
+  assert.match(settings, /notesVision/);
+  const main = readSource('main.swift');
+  assert.match(main, /识别画面文字（OCR/);
+  assert.match(main, /画面理解（VLM/);
+  assert.match(main, /visionStatusMenuItem|视觉：/);
+  assert.match(main, /refreshVisionHealth/);
+  assert.match(main, /--notes-vision/);
+  assert.match(main, /画面理解中/);
+  const selfTest = readSource('SelfTest.swift');
+  for (const must of ['checkVision()', 'VisionText', 'VisionPlanner', 'VisionHealthParser', 'vision/ocr 请求体', '（OCR）']) {
+    assert.ok(selfTest.includes(must), `SelfTest.swift 缺少 v0.5 检查：${must}`);
+  }
+});
+
 test('macos: v0.4 ⌥N 快捷笔记（NotesClient / 全局热键 / 截图 / 离线队列 / 菜单）', () => {
   // Notes API 客户端：quick + assets + 离线队列 + macos source
   const notes = readSource('NotesClient.swift');
@@ -318,6 +364,12 @@ test('macos: apps/macos/README.md 覆盖构建/权限/运行/已知限制/手动
     'data/notes',
     '离线',
     '按 ⌥N',
+    // v0.5 画面文字/画面理解
+    '画面文字',
+    'OCR',
+    '画面理解',
+    'VLM',
+    'api/vision',
   ]) {
     assert.ok(readme.includes(must), `README 缺少关键说明：${must}`);
   }
@@ -341,7 +393,7 @@ test(
     });
     const match = output.match(/self-test: (\d+) checks passed/);
     assert.ok(match, '构建输出缺少 self-test 统计');
-    assert.ok(Number(match[1]) >= 100, `self-test 项数应 >= 100（v0.4 含笔记检查），实际 ${match[1]}`);
+    assert.ok(Number(match[1]) >= 150, `self-test 项数应 >= 150（v0.5 含视觉检查），实际 ${match[1]}`);
     assert.ok(existsSync(path.join(APP_DIR, 'build', 'livedub.app', 'Contents', 'MacOS', 'livedub')));
   },
 );

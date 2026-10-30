@@ -4055,3 +4055,222 @@ html[data-theme="light"] .icon-btn[aria-pressed="true"] {
     flex-basis: 58%;
   }
 }
+
+/* ================================================================
+   v0.5：图文笔记（关键帧 + OCR/VLM）弹窗 / 多图缩略图 / 图文徽标
+   ================================================================ */
+
+.notes-kind.visual {
+  color: #f0abfc;
+  border-color: rgba(232, 121, 249, 0.32);
+  background: rgba(232, 121, 249, 0.08);
+}
+
+.notes-thumbs {
+  display: flex;
+  align-items: center;
+  gap: 3px;
+}
+
+.notes-thumbs img {
+  width: 34px;
+  height: 24px;
+  object-fit: cover;
+  border-radius: 5px;
+  border: 1px solid var(--border-strong);
+  background: rgba(0, 0, 0, 0.4);
+}
+
+.notes-thumbs img:first-child {
+  width: 46px;
+  height: 28px;
+}
+
+/* 生成图文笔记弹窗 */
+.visual-modal {
+  position: fixed;
+  inset: 0;
+  z-index: 90;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+  background: rgba(4, 6, 10, 0.66);
+  backdrop-filter: blur(6px);
+}
+
+.visual-modal[hidden] {
+  display: none;
+}
+
+.visual-panel {
+  width: min(560px, 94vw);
+  max-height: 88vh;
+  display: flex;
+  flex-direction: column;
+  border-radius: 16px;
+  border: 1px solid var(--border-strong);
+  background: linear-gradient(180deg, rgba(21, 24, 36, 0.99), rgba(12, 14, 22, 0.99));
+  box-shadow: 0 40px 100px -34px rgba(0, 0, 0, 0.95);
+  overflow: hidden;
+}
+
+.visual-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 12px 14px;
+  border-bottom: 1px solid var(--border);
+}
+
+.visual-title {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  min-width: 0;
+}
+
+.visual-title strong {
+  font-size: 13.5px;
+  color: var(--text-strong);
+}
+
+.visual-title span {
+  font-size: 10.5px;
+  color: var(--muted);
+  max-width: 240px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.visual-body {
+  flex: 1;
+  overflow-y: auto;
+  padding: 12px 14px;
+}
+
+.visual-hint {
+  margin: 0 0 12px;
+}
+
+.visual-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 6px 0;
+}
+
+.visual-row > span {
+  flex: 0 0 62px;
+  font-size: 11px;
+  color: var(--muted-2);
+}
+
+.visual-row .segmented {
+  flex: 1;
+}
+
+.visual-plan {
+  margin: 10px 0 4px;
+  padding: 9px 11px;
+  border-radius: 9px;
+  border: 1px solid var(--border);
+  background: rgba(255, 255, 255, 0.025);
+  font-size: 11px;
+  line-height: 1.65;
+  color: var(--muted);
+}
+
+.visual-progress {
+  margin: 10px 0 2px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.visual-progress[hidden] {
+  display: none;
+}
+
+.visual-progress-track {
+  height: 6px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.09);
+  overflow: hidden;
+}
+
+.visual-progress-track i {
+  display: block;
+  width: 0%;
+  height: 100%;
+  border-radius: inherit;
+  background: linear-gradient(90deg, #5eead4, #818cf8, #c084fc);
+  transition: width 0.25s ease;
+}
+
+.visual-progress span {
+  font-size: 10.5px;
+  color: var(--muted);
+}
+
+.visual-error {
+  margin: 10px 0 2px;
+  padding: 8px 10px;
+  border-radius: 8px;
+  border: 1px solid rgba(251, 113, 133, 0.3);
+  background: rgba(251, 113, 133, 0.08);
+  color: #fecdd3;
+  font-size: 11px;
+  line-height: 1.55;
+}
+
+.visual-error[hidden] {
+  display: none;
+}
+
+.visual-foot {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 14px;
+  border-top: 1px solid var(--border);
+}
+
+html[data-theme="light"] .visual-modal {
+  background: rgba(15, 23, 42, 0.4);
+}
+
+html[data-theme="light"] .visual-panel {
+  background: linear-gradient(180deg, #ffffff, #f7f9fd);
+}
+
+html[data-theme="light"] .visual-plan {
+  background: rgba(15, 23, 42, 0.025);
+}
+
+html[data-theme="light"] .visual-progress-track {
+  background: rgba(15, 23, 42, 0.12);
+}
+
+html[data-theme="light"] .visual-error {
+  color: #b91c1c;
+  border-color: rgba(220, 38, 38, 0.28);
+  background: rgba(220, 38, 38, 0.06);
+}
+
+html[data-theme="light"] .notes-kind.visual {
+  color: #86198f;
+  border-color: rgba(168, 85, 247, 0.3);
+  background: rgba(168, 85, 247, 0.07);
+}
+
+@media (max-width: 600px) {
+  .visual-row {
+    align-items: flex-start;
+    flex-direction: column;
+    gap: 5px;
+  }
+  .visual-row > span {
+    flex-basis: auto;
+  }
+}

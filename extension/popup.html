@@ -191,6 +191,7 @@
 
     <section class="card" id="notes-card">
       <div class="kv"><span>笔记</span><b id="note-stats">今日 0 条 · 待同步 0</b></div>
+      <div class="kv"><span>画面</span><b id="vision-health">—</b></div>
       <div class="actions">
         <button id="capture-note" class="ghost" type="button">记当前句</button>
         <button id="open-notebook" class="ghost" type="button">打开笔记本</button>
@@ -198,6 +199,10 @@
       <div class="actions">
         <button id="export-notes" class="ghost" type="button">导出 Markdown</button>
         <label class="inline"><input type="checkbox" id="note-screenshot" /> 附页面截图</label>
+      </div>
+      <div class="actions">
+        <label class="inline"><input type="checkbox" id="vision-ocr" /> 识别画面文字（OCR，快）</label>
+        <label class="inline"><input type="checkbox" id="vision-caption" /> 画面理解（VLM，慢）</label>
       </div>
       <p class="hint" id="note-hint">快捷键 Alt+Shift+N 记笔记 · Alt+Shift+L 开始/停止。截图与笔记只存本机 data/notes/。</p>
     </section>

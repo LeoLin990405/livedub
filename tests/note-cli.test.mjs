@@ -59,3 +59,9 @@ test('note CLI: --help 退出码 0 且包含用法', () => {
   assert.match(res.stdout, /--video/);
   assert.match(res.stdout, /--screenshot/);
 });
+
+test('note CLI: --print 与 --vision/--no-ocr 组合不联网、退出码 0', () => {
+  const res = run(['图文笔记 CLI 参数', '--video', 'X', '--time', '2:00', '--print', '--vision', '--no-ocr']);
+  assert.equal(res.status, 0, res.stderr);
+  assert.match(res.stdout, /### 02:00 · X/);
+});

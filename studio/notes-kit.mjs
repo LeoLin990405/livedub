@@ -380,7 +380,7 @@ export function assetFileName(imageUrl) {
 /** 生成单条笔记的 Markdown 片段（导出/插入正文用） */
 export function buildNoteMarkdown(note) {
   const lines = [];
-  const kindLabels = { note: '笔记', outline: '课程大纲', quick: '快速摘录', marker: '标记' };
+  const kindLabels = { note: '笔记', outline: '课程大纲', quick: '快速摘录', marker: '标记', visual: '图文笔记' };
   lines.push(`## ${timestampAnchor(note?.tMs ?? 0)} · ${kindLabels[note?.kind] ?? '笔记'}`);
   lines.push('');
   const body = String(note?.body ?? '').trim();

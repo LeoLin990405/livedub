@@ -214,6 +214,7 @@ macOS 桌面 App（`apps/macos/`）是线协议 §3 的另一个客户端，行�
 ```
 VideoRef = { id, title, url?, durationMs? }         // id 由客户端生成且稳定
 Note    = { id, video, tMs, body(Markdown<=200KB), quotes?, tags?, imageUrl?, kind?, source, createdAt, updatedAt }
+          kind ∈ note | outline | quick | marker | visual（v0.5 图文笔记）
 
 GET    /api/notes?videoId=&q=&limit=200             -> {ok,videos[],notes[]}
 POST   /api/notes                                    -> {ok,note}
@@ -229,6 +230,25 @@ POST   /api/notes/export    {videoId}                -> {ok,path}  // data/expor
 
 约束：笔记只落本机 `data/notes/`（gitignore）、不上传；字段白名单/大小限制；文件名仅 `[A-Za-z0-9._-]`；不写密钥；`imageUrl` 只接受 `POST /api/notes/assets` 返回的相对路径（绝对 URL 400）。
 客户端：工作台（Markdown 编辑/截图/大纲/导出/画中画）、Chrome 扩展（`Alt+Shift+N`）、macOS App（`⌥N`）、`scripts/note.mjs` CLI。
+
+## 7.7 视觉理解 API（v0.5，HTTP）
+
+供工作台/扩展/macOS/CLI 做「画面理解」；底层 `engine/vision/index.mjs`（macOS Vision OCR + OpenAI 兼容 VLM + 文本总结）。
+
+```
+POST /api/vision/ocr        body: raw image/png 或 JSON {imageUrl:"/api/notes/assets/<file>"}
+                            -> {ok,text,lines,provider:"macos-vision"|"tesseract",ms}   // 本地、快(~1s/帧)
+POST /api/vision/analyze    ?mode=ocr|vision|both （默认 ocr；vision 慢 20-30s/次）
+                            同上输入 -> {ok,mode,ocr?,caption?:{text,provider,model,ms},ms}
+POST /api/vision/summarize  JSON {title, transcript:[{t0Ms,t1Ms,src,dst}], visuals:[{tMs,ocrText,caption?}], lang?}
+                            -> {ok,summary,keyPoints:string[],provider,model,ms}       // 文本 LLM，音频+画面综合总结
+GET  /api/vision/health     -> {ok,ocr:{ok,provider,bin},vision:{configured,provider,model},ready}
+```
+约束：`imageUrl` 只接受本机 notes assets 相对路径（防穿越/绝对 URL 拒绝）；PNG ≤4MB；不打印密钥/图片内容。
+不可用（模块/OCR/VLM 未配置）时返回 `503/502/504` + `{ok:false,error,message}`，客户端应静默降级。
+配置：`config.vision.{provider,model,maxTokens,timeoutMs,prompt,ocr:{...},summary:{provider,model},keyframe:{intervalMs,minChange,maxFrames}}`。
+工作台默认关键帧 `intervalMs=6000`、`minChange=0.035`（另加结构性差异兜底）、`maxFrames=12`（v0.5 默认；VLM 默认关闭）。
+错误码：503 `vision_unavailable`、504 `vision_timeout`、502 `vision_not_configured`/`vision_failed`、400 输入非法；客户端应静默降级为纯文本笔记。
 
 ## 8. 已知坑（别重复踩）
 

@@ -9,6 +9,9 @@
 //   - hello JSON 字段 / 事件解析（ready/status/partial/segment/translation/dub/metrics/voice/error/pong/bye）
 //   - 字幕折行（ASCII / CJK 宽字符 / 超长 token / 最多两行）、延迟时间格式、状态文案
 //   - 16k 100ms 分帧、48k/44.1k -> 16k 重采样、引擎地址清洗
+//   - v0.4 快捷笔记：quick note JSON/时间格式/离线队列/标题推导/截图降级
+//   - v0.5 画面文字（OCR）/画面理解：请求体、imageUrl 校验、文本清洗/代码块转义、
+//     降级决策（含旧引擎 404 无 /api/vision/*）、health 解析（全部纯函数，不联网）
 //  退出码：0 全部通过；1 有失败（便于 CI 与 scripts/build-macos.sh --check）。
 //
 
@@ -67,6 +70,7 @@ enum SelfTest {
         checkChunker()
         checkSettings()
         checkNotes()
+        checkVision()
         checkSimulationData()
 
         if failures.isEmpty {
@@ -625,6 +629,252 @@ enum SelfTest {
         check("热键 keyCode = kVK_ANSI_N(45)", GlobalHotKey.keyCode == 45)
         check("热键修饰键 = Carbon optionKey(2048)", GlobalHotKey.modifiers == 2_048)
         check("Notes 请求超时 8s", NotesClient.requestTimeout == 8)
+    }
+
+
+    // MARK: 画面文字（OCR）/ 画面理解（VLM）—— v0.5
+
+    private static func checkVision() {
+        // ---- 请求体构造 / URL ----
+        let assetPath = "/api/notes/assets/a.png"
+        let base = URL(string: "http://127.0.0.1:8787")!
+        do {
+            let ocrData = try JSONEncoder().encode(VisionOCRRequest(imageUrl: assetPath))
+            let ocrDecoded = try JSONDecoder().decode(VisionOCRRequest.self, from: ocrData)
+            check("vision/ocr 请求体：JSON {imageUrl}",
+                  ocrDecoded.imageUrl == assetPath,
+                  detail: String(data: ocrData, encoding: .utf8) ?? "")
+            let analyzeData = try JSONEncoder().encode(VisionAnalyzeRequest(imageUrl: assetPath))
+            let analyzeDecoded = try JSONDecoder().decode(VisionAnalyzeRequest.self, from: analyzeData)
+            check("vision/analyze 请求体：JSON {imageUrl}", analyzeDecoded.imageUrl == assetPath)
+        } catch {
+            check("vision/ocr 请求体：JSON {imageUrl}", false, detail: "\(error)")
+            check("vision/analyze 请求体：JSON {imageUrl}", false, detail: "\(error)")
+        }
+        check("vision URL：/api/vision/ocr",
+              NotesHTTP.visionOCRURL(base: base).absoluteString == "http://127.0.0.1:8787/api/vision/ocr")
+        check("vision URL：/api/vision/health",
+              NotesHTTP.visionHealthURL(base: base).absoluteString == "http://127.0.0.1:8787/api/vision/health")
+        let analyzeURL = NotesHTTP.visionAnalyzeURL(base: base, mode: "both").absoluteString
+        check("vision URL：analyze?mode=both", analyzeURL.contains("/api/vision/analyze") && analyzeURL.contains("mode=both"),
+              detail: analyzeURL)
+        check("vision mode 归一化",
+              NotesHTTP.normalizeVisionMode("VISION") == "vision"
+                  && NotesHTTP.normalizeVisionMode("both") == "both"
+                  && NotesHTTP.normalizeVisionMode("weird") == "ocr"
+                  && NotesHTTP.normalizeVisionMode("") == "ocr")
+        check("vision imageUrl 只接受相对资产路径",
+              NoteComposer.isValidAssetPath(assetPath)
+                  && !NoteComposer.isValidAssetPath("http://127.0.0.1:8787/api/notes/assets/a.png")
+                  && !NoteComposer.isValidAssetPath("/api/notes/assets/../x.png"))
+
+        // ---- OCR 文本清洗 / 截断 ----
+        check("OCR 清洗：trim/去空行/折叠空白",
+              VisionText.cleanOCR("  Hello  world \n\n  second\tline  \n") == "Hello world\nsecond line",
+              detail: VisionText.cleanOCR("  Hello  world \n\n  second\tline  \n") ?? "nil")
+        check("OCR 清洗：相邻重复行去重",
+              VisionText.cleanOCR("same line\nsame line\nother") == "same line\nother")
+        check("OCR 清洗：控制字符剔除",
+              VisionText.cleanOCR("\u{0007}abc\u{0000}") == "abc")
+        check("OCR 清洗：空/全空白 -> nil",
+              VisionText.cleanOCR("") == nil && VisionText.cleanOCR(" \n\t \n") == nil)
+        let longOCR = String(repeating: "x", count: 2_500)
+        let truncatedOCR = VisionText.cleanOCR(longOCR) ?? ""
+        check("OCR 清洗：截断到 2000 字并加省略号",
+              truncatedOCR.count == 2_000 && truncatedOCR.hasSuffix("…"),
+              detail: "count=\(truncatedOCR.count)")
+        let manyLines = (0..<100).map { "line-\($0)" }.joined(separator: "\n")
+        let cappedLines = VisionText.cleanOCR(manyLines)?.components(separatedBy: "\n").count ?? 0
+        check("OCR 清洗：最多 80 行", cappedLines == 80, detail: "lines=\(cappedLines)")
+
+        // ---- 代码块转义 ----
+        check("codeBlock：普通内容用 3 反引号",
+              VisionText.codeBlock("hello") == "```\nhello\n```")
+        check("codeBlock：内容含 ``` 时用更长 fence",
+              VisionText.codeBlock("use ``` fences") == "````\nuse ``` fences\n````")
+        check("longestBacktickRun", VisionText.longestBacktickRun("a``b```c") == 3
+              && VisionText.longestBacktickRun("no ticks") == 0)
+        let ocrSection = VisionText.ocrSection("Gradient descent\nFollow the slope") ?? ""
+        check("OCR 段落格式（**画面文字**（OCR）+ 代码块）",
+              ocrSection.hasPrefix("**画面文字**（OCR）：\n\n```\n")
+                  && ocrSection.hasSuffix("\n```")
+                  && ocrSection.contains("Gradient descent"))
+        check("OCR 段落：无文字不加", VisionText.ocrSection(" \n\t") == nil)
+        let captionSection = VisionText.captionSection("幻灯片在讲解梯度下降") ?? ""
+        check("画面理解段落格式",
+              captionSection.hasPrefix("**画面理解**：\n\n") && captionSection.contains("梯度下降"))
+        check("画面理解段落：空 -> nil", VisionText.captionSection("   \n") == nil)
+        let longCaption = String(repeating: "字", count: 1_500)
+        let truncatedCaption = VisionText.cleanCaption(longCaption) ?? ""
+        check("caption 截断到 1000 字", truncatedCaption.count == 1_000 && truncatedCaption.hasSuffix("…"))
+
+        // ---- 降级决策 ----
+        let healthGood = VisionStatus(
+            ok: true, ready: true,
+            ocr: VisionCapability(available: true, detail: "macos-vision"),
+            vision: VisionCapability(available: false, detail: "未配置"),
+            endpointMissing: false, error: nil, fetchedAt: nil
+        )
+        check("OCR 决策：关闭 -> disabled",
+              VisionPlanner.ocrDecision(enabled: false, hasImageAsset: true, endpointMissing: false, health: nil) == .skip(reason: "disabled"))
+        check("OCR 决策：无截图附件 -> noImage",
+              VisionPlanner.ocrDecision(enabled: true, hasImageAsset: false, endpointMissing: false, health: nil) == .skip(reason: "noImage"))
+        check("OCR 决策：旧引擎无端点 -> endpointMissing",
+              VisionPlanner.ocrDecision(enabled: true, hasImageAsset: true, endpointMissing: true, health: nil) == .skip(reason: "endpointMissing"))
+        let healthNoOCR = VisionStatus(
+            ok: true, ready: true,
+            ocr: .unavailable,
+            vision: .unavailable,
+            endpointMissing: false, error: nil, fetchedAt: nil
+        )
+        check("OCR 决策：health 说 OCR 不可用 -> ocrUnavailable",
+              VisionPlanner.ocrDecision(enabled: true, hasImageAsset: true, endpointMissing: false, health: healthNoOCR) == .skip(reason: "ocrUnavailable"))
+        check("OCR 决策：health 未检测/未知 -> 尝试",
+              VisionPlanner.ocrDecision(enabled: true, hasImageAsset: true, endpointMissing: false, health: nil) == .run)
+        check("VLM 决策：默认关闭 -> disabled",
+              VisionPlanner.visionDecision(enabled: false, hasImageAsset: true, endpointMissing: false, health: nil) == .skip(reason: "disabled"))
+        check("VLM 决策：health 未配置 -> visionUnavailable",
+              VisionPlanner.visionDecision(enabled: true, hasImageAsset: true, endpointMissing: false, health: healthGood) == .skip(reason: "visionUnavailable"))
+        let healthWithVLM = VisionStatus(
+            ok: true, ready: true,
+            ocr: VisionCapability(available: true, detail: "macos-vision"),
+            vision: VisionCapability(available: true, detail: "ark-plan"),
+            endpointMissing: false, error: nil, fetchedAt: nil
+        )
+        check("VLM 决策：health 已配置 -> 尝试",
+              VisionPlanner.visionDecision(enabled: true, hasImageAsset: true, endpointMissing: false, health: healthWithVLM) == .run)
+        check("旧引擎状态码识别 404/405/501",
+              VisionPlanner.endpointMissing(forHTTPStatus: 404)
+                  && VisionPlanner.endpointMissing(forHTTPStatus: 405)
+                  && VisionPlanner.endpointMissing(forHTTPStatus: 501)
+                  && !VisionPlanner.endpointMissing(forHTTPStatus: 500)
+                  && !VisionPlanner.endpointMissing(forHTTPStatus: 503))
+        check("视觉服务未就绪识别 503/vision_unavailable",
+              VisionPlanner.serviceUnavailable(forHTTPStatus: 503, message: "")
+                  && VisionPlanner.serviceUnavailable(forHTTPStatus: 503, message: "vision_unavailable")
+                  && !VisionPlanner.serviceUnavailable(forHTTPStatus: 500, message: "oops"))
+        check("shouldMarkEndpointMissing：404/503 为真",
+              VisionPlanner.shouldMarkEndpointMissing(NotesClientError.http(status: 404, message: "nope"))
+                  && VisionPlanner.shouldMarkEndpointMissing(NotesClientError.http(status: 503, message: "vision_unavailable"))
+                  && !VisionPlanner.shouldMarkEndpointMissing(NotesClientError.http(status: 500, message: "oops"))
+                  && !VisionPlanner.shouldMarkEndpointMissing(AudioFrameCodecError.emptyPcm))
+        check("降级文案不为空",
+              ["disabled", "noImage", "endpointMissing", "ocrUnavailable", "visionUnavailable"]
+                  .allSatisfy { !VisionPlanner.skipReasonText($0).isEmpty })
+
+        // ---- health 解析 ----
+        let healthJSON = "{\"ok\":true,\"ready\":true,"
+            + "\"ocr\":{\"available\":true,\"provider\":\"macos-vision\"},"
+            + "\"vision\":{\"available\":false,\"reason\":\"VLM 未配置\"}}"
+        if let parsed = VisionHealthParser.parse(data: Data(healthJSON.utf8)) {
+            check("health 解析：ok/ready", parsed.ok && parsed.ready)
+            check("health 解析：OCR 能力/提供商",
+                  parsed.ocr.available && parsed.ocr.label.contains("macos-vision"), detail: parsed.ocr.label)
+            check("health 解析：VLM 未配置",
+                  !parsed.vision.available && parsed.vision.detail == "VLM 未配置", detail: parsed.vision.detail)
+            check("health 摘要含 OCR/VLM",
+                  parsed.summaryText.contains("OCR") && parsed.summaryText.contains("VLM"), detail: parsed.summaryText)
+        } else {
+            check("health 解析：ok/ready", false)
+            check("health 解析：OCR 能力/提供商", false)
+            check("health 解析：VLM 未配置", false)
+            check("health 摘要含 OCR/VLM", false)
+        }
+        let boolHealth = VisionHealthParser.parse(dictionary: ["ok": true, "ready": true, "ocr": true, "vision": false])
+        check("health 解析：布尔能力", boolHealth.ocr.available && !boolHealth.vision.available)
+        check("health 解析：坏 JSON -> nil", VisionHealthParser.parse(data: Data("not-json".utf8)) == nil)
+        check("health 缺端点摘要", VisionStatus.missing().summaryText.contains("v0.5"))
+        check("health 失败摘要", VisionStatus.unavailable(error: "boom").summaryText.contains("检测失败"))
+        check("health 端点缺失状态", VisionStatus.missing().endpointMissing && !VisionStatus.missing().isUsable)
+
+        // ---- analyze 响应兼容（string / object 两种 ocr/caption 形态）----
+        do {
+            let analyzeJSON = "{\"ok\":true,\"mode\":\"both\",\"ocr\":{\"text\":\"line one\"},"
+                + "\"caption\":\"画面描述\",\"provider\":\"mock\",\"ms\":12}"
+            let decoded = try JSONDecoder().decode(VisionAnalyzeResponse.self, from: Data(analyzeJSON.utf8))
+            check("analyze 响应：object 形态 ocr + string caption",
+                  decoded.ok == true && decoded.ocrText == "line one" && decoded.caption == "画面描述" && decoded.ms == 12)
+            let analyzeJSON2 = "{\"ok\":true,\"ocr\":\"plain ocr\",\"caption\":{\"text\":\"object caption\"}}"
+            let decoded2 = try JSONDecoder().decode(VisionAnalyzeResponse.self, from: Data(analyzeJSON2.utf8))
+            check("analyze 响应：string ocr + object caption",
+                  decoded2.ocrText == "plain ocr" && decoded2.caption == "object caption")
+        } catch {
+            check("analyze 响应：object 形态 ocr + string caption", false, detail: "\(error)")
+            check("analyze 响应：string ocr + object caption", false)
+        }
+        do {
+            let ocrJSON = "{\"ok\":true,\"text\":\"hello\",\"lines\":[\"hello\"],\"provider\":\"macos-vision\",\"ms\":42}"
+            let objectLines = #"{"ok":true,"text":"a\nb","lines":[{"text":"a","confidence":1},{"text":"b","confidence":1}]}"#
+            let decodedObject = try JSONDecoder().decode(VisionOCRResponse.self, from: Data(objectLines.utf8))
+            check("vision/ocr lines 对象数组兼容", decodedObject.lines == ["a", "b"])
+            let decoded = try JSONDecoder().decode(VisionOCRResponse.self, from: Data(ocrJSON.utf8))
+            check("vision/ocr 响应解析", decoded.text == "hello" && decoded.lines == ["hello"] && decoded.provider == "macos-vision")
+        } catch {
+            check("vision/ocr 响应解析", false, detail: "\(error)")
+        }
+
+        // ---- quick note 图文正文（OCR + 画面理解）----
+        var context = NoteContext(
+            sessionId: "s_vision",
+            sessionTitle: "macOS 系统音频 · livedub app",
+            tMs: 42_000,
+            statusText: "聆听中",
+            translation: "今天我们来学习梯度下降。",
+            source: "Today we are going to learn gradient descent.",
+            latencyMs: 1_834,
+            frontmostApp: "Visual Studio Code",
+            frontmostBundleId: "com.microsoft.VSCode",
+            capturedAt: Date(timeIntervalSince1970: 1_790_000_000),
+            timeZone: TimeZone(identifier: "UTC") ?? .current
+        )
+        let asset = NoteAssetRef(absoluteURL: "http://127.0.0.1:8787/api/notes/assets/a.png", relativePath: assetPath)
+        let enriched = NoteComposer.makeQuickRequest(
+            context: context,
+            image: asset,
+            ocrText: "Gradient descent\nFollow the slope downhill",
+            visionCaption: "幻灯片在讲解梯度下降的几何直觉"
+        )
+        check("图文笔记：含画面文字代码块",
+              enriched.text.contains("**画面文字**（OCR）：\n\n```\nGradient descent\nFollow the slope downhill\n```"),
+              detail: String(enriched.text.prefix(160)))
+        check("图文笔记：含画面理解",
+              enriched.text.contains("**画面理解**：\n\n幻灯片在讲解梯度下降的几何直觉"))
+        check("图文笔记：保留原文/译文/记录/来源结构",
+              ["**原文**", "**译文**", "**记录**", "**来源**", "![截图]"].allSatisfy { enriched.text.contains($0) })
+        if let ocrRange = enriched.text.range(of: "**画面文字**"),
+           let sourceRange = enriched.text.range(of: "**原文**"),
+           let imageRange = enriched.text.range(of: "![截图]") {
+            check("图文笔记：顺序 原文 -> 画面文字 -> 截图",
+                  sourceRange.lowerBound < ocrRange.lowerBound && ocrRange.lowerBound < imageRange.lowerBound)
+        } else {
+            check("图文笔记：顺序 原文 -> 画面文字 -> 截图", false)
+        }
+        let plainNote = NoteComposer.makeQuickRequest(context: context, image: asset)
+        check("图文笔记：未识别时不加画面文字/画面理解",
+              !plainNote.text.contains("**画面文字**") && !plainNote.text.contains("**画面理解**"))
+        let backtickNote = NoteComposer.makeQuickRequest(
+            context: context, image: asset, ocrText: "code: ```python\nprint(1)\n```", visionCaption: nil
+        )
+        check("图文笔记：OCR 含反引号时用更长 fence",
+              backtickNote.text.contains("````\n") && backtickNote.text.contains("print(1)"),
+              detail: String(backtickNote.text.prefix(120)))
+        context.translation = ""
+        context.source = ""
+        let noCaptionNote = NoteComposer.makeQuickRequest(context: context, ocrText: "只有画面文字")
+        check("图文笔记：无字幕 + 有 OCR 也保存（（无字幕）+ 画面文字）",
+              noCaptionNote.text.contains("（无字幕）") && noCaptionNote.text.contains("**画面文字**（OCR）"))
+        let hugeOCR = String(repeating: "字", count: 2_000)
+        let hugeNote = NoteComposer.makeQuickRequest(context: context, image: asset, ocrText: hugeOCR, visionCaption: nil)
+        check("图文笔记：正文不超过 4000 字", hugeNote.text.count <= NoteComposer.maxTextChars,
+              detail: "count=\(hugeNote.text.count)")
+
+        // ---- 常量 ----
+        check("vision 超时：OCR 8s / analyze 45s",
+              VisionPlanner.ocrTimeout == 25 && VisionPlanner.analyzeTimeout == 45)
+        check("vision 上限：OCR 2000 字 / caption 1000 字 / 图片 4MB",
+              VisionPlanner.ocrMaxChars == 2_000
+                  && VisionPlanner.captionMaxChars == 1_000
+                  && VisionPlanner.maxImageBytes == 4 * 1024 * 1024)
     }
 
     // MARK: - 断言帮手

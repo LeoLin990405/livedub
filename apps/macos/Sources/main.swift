@@ -8,6 +8,8 @@
 //
 //  v0.4：全局 ⌥N「快捷笔记」——把当前双语字幕 + 时间戳 +（可选）屏幕截图
 //        记进本地引擎 Notes API（失败进离线队列，重连后自动补发）。
+//  v0.5：截图上传后调用引擎视觉端点，把「画面文字（OCR）」写进笔记；
+//        可选开「画面理解（VLM，慢）」；失败静默降级，不影响笔记保存。
 //
 //  入口参数：
 //    --self-test             headless 自检（不建窗口、不请求权限、不联网），退出码 0/1
@@ -30,6 +32,8 @@ struct LaunchOptions {
     var duration: Double?
     var engineURL: String?
     var noteOnce = false
+    /// 调试用：本次运行强制开启「画面理解（VLM）」，不写用户设置
+    var notesVision = false
     var help = false
 
     static let helpText = """
@@ -39,8 +43,9 @@ struct LaunchOptions {
 
       --simulate            不抓音频/不连引擎，循环演示双语字幕、状态与延迟（无权限环境验证 UI）
       --autostart           启动后自动点一次「开始同传」（适合登录项 / 自动化冒烟）
-      --note-once           调试/冒烟：启动 2.5s 后自动记一条笔记（截图/离线队列全链路），
+      --note-once           调试/冒烟：启动 2.5s 后自动记一条笔记（截图/OCR/离线队列全链路），
                             记录完成后退出（配合 --engine-url 指向测试引擎）
+      --notes-vision        调试用：本次运行开启「画面理解（VLM，慢）」开关（不写用户设置）
       --duration <秒>       调试用：N 秒后自动退出（配合 --simulate 可做冒烟）
       --engine-url <url>    覆盖引擎地址（默认 ws://127.0.0.1:8787/ws）
       --self-test           headless 自检（协议字节布局 / hello / 事件解析 / 字幕排版），退出码 0/1
@@ -64,6 +69,8 @@ struct LaunchOptions {
                 options.autoStart = true
             case "--note-once":
                 options.noteOnce = true
+            case "--notes-vision":
+                options.notesVision = true
             case "-h", "--help":
                 options.help = true
             case "--duration":
@@ -184,7 +191,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var openWorkbenchMenuItem: NSMenuItem?
     private var notesScreenshotMenuItem: NSMenuItem?
     private var notesWhenPausedMenuItem: NSMenuItem?
+    private var notesOCRMenuItem: NSMenuItem?
+    private var notesVisionMenuItem: NSMenuItem?
     private var notesQueueMenuItem: NSMenuItem?
+    private var visionStatusMenuItem: NSMenuItem?
+    private var visionStatus: VisionStatus?
+    private var visionHealthTimer: Timer?
+    private var visionUnavailableToastShown = false
     private let lastAudioTMs = AtomicDouble(0)
     private var isEnginePaused = false
     private var lastEngineSessionId: String?
@@ -238,6 +251,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         autoQuitTimer?.invalidate()
         notesFlushTimer?.invalidate()
         noteOnceTimer?.invalidate()
+        visionHealthTimer?.invalidate()
         GlobalHotKey.shared.unregister()
         capture?.stop()
         engine?.stop()
@@ -296,7 +310,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         notesScreenshotMenuItem?.toolTip = "开启后用 SCScreenshotManager 截当前屏幕作为笔记附件（复用屏幕录制权限，不含 livedub 浮层）"
         notesWhenPausedMenuItem = addMenuItem(to: menu, title: "暂停时仍可笔记", action: #selector(toggleNotesWhenPaused))
         notesWhenPausedMenuItem?.toolTip = "同传暂停时仍允许 \(GlobalHotKey.displayName) 记录当前字幕"
+        notesOCRMenuItem = addMenuItem(to: menu, title: "识别画面文字（OCR，快）", action: #selector(toggleNotesOCR))
+        notesOCRMenuItem?.toolTip = "⌥N 时识别截图中的文字并写入笔记（需要引擎 v0.5；本地 OCR，默认开）"
+        notesVisionMenuItem = addMenuItem(to: menu, title: "画面理解（VLM，慢，约 20–30s）", action: #selector(toggleNotesVision))
+        notesVisionMenuItem?.toolTip = "用 VLM 生成画面描述；较慢、可能产生云端费用，失败自动降级为仅 OCR（默认关）"
         notesQueueMenuItem = addMenuItem(to: menu, title: "笔记队列：空", action: nil)
+        visionStatusMenuItem = addMenuItem(to: menu, title: "视觉：检测中…", action: nil)
         menu.addItem(.separator())
 
         _ = addMenuItem(to: menu, title: "设置引擎地址…", action: #selector(editEngineURL))
@@ -343,6 +362,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         fontSizeDownMenuItem?.isEnabled = settings.fontSize > 11
         notesScreenshotMenuItem?.state = settings.notesIncludeScreenshot ? .on : .off
         notesWhenPausedMenuItem?.state = settings.notesWhenPaused ? .on : .off
+        notesOCRMenuItem?.state = settings.notesOCR ? .on : .off
+        notesVisionMenuItem?.state = (options.notesVision || settings.notesVision) ? .on : .off
+        visionStatusMenuItem?.title = visionStatus?.summaryText ?? "视觉：检测中…"
         refreshNotesQueueMenu()
     }
 
@@ -507,6 +529,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             isEnginePaused = false
             overlay?.setStatus("已连接 · 聆听中", latencyMs: currentLatencyMs)
             flushNotesQueue(reason: "引擎已连接")
+            refreshVisionHealth(reason: "引擎已连接")
         case .disconnected:
             if isRunning {
                 currentStatus = "引擎未连接"
@@ -765,7 +788,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     @objc private func showDiagnostics() {
         NSApp.activate(ignoringOtherApps: true)
         var lines: [String] = []
-        lines.append("livedub macOS app（v0.4）")
+        lines.append("livedub macOS app（v0.5）")
         lines.append("状态：\(currentStatus)")
         lines.append("引擎地址：\(settings.engineURL)")
         if let engine {
@@ -793,6 +816,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     + " · 暂停可笔记 \(settings.notesWhenPaused ? "开" : "关")"
             )
             lines.append("Notes API：\(notesClient.baseURLString)")
+            lines.append(visionStatus?.summaryText ?? "视觉：未检测")
+            lines.append(
+                "画面文字 OCR：\(settings.notesOCR ? "开" : "关")"
+                    + " · 画面理解 VLM：\((options.notesVision || settings.notesVision) ? "开" : "关")"
+            )
             if let error = notesClient.lastErrorText { lines.append("笔记最近错误：\(error)") }
         }
         if !lastNoteClock.isEmpty { lines.append("最近一条笔记：\(lastNoteClock)") }
@@ -835,7 +863,34 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         notesFlushTimer = Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { [weak self] _ in
             self?.flushNotesQueue(reason: "定时器")
         }
+
+        // 视觉能力检测（仅展示，不影响主流程；旧引擎 404 -> 菜单显示不可用）
+        refreshVisionHealth(reason: "启动")
+        visionHealthTimer?.invalidate()
+        visionHealthTimer = Timer.scheduledTimer(withTimeInterval: 300, repeats: true) { [weak self] _ in
+            self?.refreshVisionHealth(reason: "定时器")
+        }
         refreshNotesQueueMenu()
+    }
+
+    /// GET /api/vision/health，更新菜单「视觉：…」状态；失败只降级展示
+    private func refreshVisionHealth(reason: String) {
+        guard let notesClient else { return }
+        Task { [weak self, notesClient] in
+            let status = await notesClient.fetchVisionHealth()
+            let owner = self
+            DispatchQueue.main.async {
+                guard let owner else { return }
+                owner.visionStatus = status
+                owner.log("[vision] 能力检测（\(reason)）：\(status.summaryText)")
+                owner.refreshMenu()
+                let visionWanted = owner.settings.notesOCR || owner.settings.notesVision || owner.options.notesVision
+                if status.endpointMissing && visionWanted && !owner.visionUnavailableToastShown {
+                    owner.visionUnavailableToastShown = true
+                    owner.overlay?.showToast("视觉功能不可用（引擎需 v0.5）：笔记仍含截图+字幕", isError: true)
+                }
+            }
+        }
     }
 
     private func refreshNotesQueueMenu() {
@@ -871,9 +926,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let context = captureNoteContext()
         let includeScreenshot = settings.notesIncludeScreenshot
         let permission = ScreenAudioCapture.hasPermission()
+        let ocrEnabled = settings.notesOCR
+        let visionEnabled = options.notesVision || settings.notesVision
+        let visionSnapshot = visionStatus
         log(
             "[notes] 触发（\(trigger)）tMs=\(Int(context.tMs)) 字幕=\(context.source.isEmpty && context.translation.isEmpty ? "无" : "有")"
                 + " 截图=\(includeScreenshot ? "开" : "关") 附截图权限=\(permission ? "有" : "无")"
+                + " OCR=\(ocrEnabled ? "开" : "关") VLM=\(visionEnabled ? "开" : "关")"
         )
 
         Task { [weak self, notesClient] in
@@ -904,16 +963,97 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 }
             }
 
-            let note = NoteComposer.makeQuickRequest(context: context, image: imageRef)
-            let delivery = await notesClient.record(note)
-            let finalScreenshotLog = screenshotLog
-            let finalScreenshotNote = screenshotNote
+            // v0.5：画面文字（OCR）/ 可选画面理解（VLM）——失败静默降级，不影响笔记保存
             let owner = self
+            func showToast(_ text: String) {
+                DispatchQueue.main.async { owner?.overlay?.showToast(text) }
+            }
+            var ocrText: String?
+            var visionCaption: String?
+            var visionNote = "未请求"
+            var extraLogs: [String] = screenshotLog.isEmpty ? [] : [screenshotLog]
+
+            if let imageRef {
+                let ocrDecision = VisionPlanner.ocrDecision(
+                    enabled: ocrEnabled,
+                    hasImageAsset: true,
+                    endpointMissing: notesClient.visionEndpointMissing,
+                    health: visionSnapshot
+                )
+                switch ocrDecision {
+                case .skip(let reason):
+                    visionNote = "OCR 跳过：" + VisionPlanner.skipReasonText(reason)
+                case .run:
+                    showToast("识别画面文字…")
+                    do {
+                        let result = try await notesClient.recognizeImage(imagePath: imageRef.relativePath)
+                        if let cleaned = VisionText.cleanOCR(result.text) {
+                            ocrText = cleaned
+                            let ms = result.ms.map { String(format: " %.0fms", $0) } ?? ""
+                            let provider = result.provider.isEmpty ? "?" : result.provider
+                            visionNote = "OCR \(cleaned.count) 字（\(provider)\(ms)）"
+                        } else {
+                            visionNote = "OCR 无可读文字"
+                        }
+                    } catch {
+                        visionNote = "OCR 降级（不影响笔记）"
+                        extraLogs.append("[vision] OCR 失败已降级：\(error)")
+                    }
+                }
+
+                let visionDecision = VisionPlanner.visionDecision(
+                    enabled: visionEnabled,
+                    hasImageAsset: true,
+                    endpointMissing: notesClient.visionEndpointMissing,
+                    health: visionSnapshot
+                )
+                switch visionDecision {
+                case .skip(let reason):
+                    if visionEnabled {
+                        visionNote += " · VLM 跳过：" + VisionPlanner.skipReasonText(reason)
+                    }
+                case .run:
+                    showToast("画面理解中…（VLM 约 20–30s）")
+                    do {
+                        let analysis = try await notesClient.analyzeImage(imagePath: imageRef.relativePath, mode: "both")
+                        if ocrText == nil, let analysisOCR = VisionText.cleanOCR(analysis.ocrText ?? "") {
+                            ocrText = analysisOCR
+                        }
+                        if let caption = VisionText.cleanCaption(analysis.caption ?? "") {
+                            visionCaption = caption
+                            visionNote += " · VLM 已生成（\(caption.count) 字）"
+                        } else {
+                            visionNote += " · VLM 无描述"
+                        }
+                    } catch {
+                        visionNote += " · VLM 降级：仅 OCR"
+                        extraLogs.append("[vision] 画面理解失败已降级为仅 OCR：\(error)")
+                    }
+                }
+            } else {
+                visionNote = "跳过：无截图附件（OCR/VLM 需要画面）"
+            }
+
+            let note = NoteComposer.makeQuickRequest(
+                context: context,
+                image: imageRef,
+                ocrText: ocrText,
+                visionCaption: visionCaption
+            )
+            let delivery = await notesClient.record(note)
+            let finalScreenshotNote = screenshotNote
+            let finalVisionNote = visionNote
+            let finalLogs = extraLogs
             DispatchQueue.main.async {
                 guard let owner else { return }
                 owner.notesInFlight = false
-                if !finalScreenshotLog.isEmpty { owner.log(finalScreenshotLog) }
-                owner.handleNoteDelivery(delivery, context: context, screenshotNote: finalScreenshotNote)
+                for line in finalLogs { owner.log(line) }
+                owner.handleNoteDelivery(
+                    delivery,
+                    context: context,
+                    screenshotNote: finalScreenshotNote,
+                    visionNote: finalVisionNote
+                )
             }
         }
     }
@@ -935,18 +1075,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         )
     }
 
-    private func handleNoteDelivery(_ delivery: QuickNoteDelivery, context: NoteContext, screenshotNote: String) {
+    private func handleNoteDelivery(
+        _ delivery: QuickNoteDelivery,
+        context: NoteContext,
+        screenshotNote: String,
+        visionNote: String = ""
+    ) {
+        let visionSuffix = visionNote.isEmpty ? "" : " · 画面 \(visionNote)"
         let clock = NoteComposer.formatClock(context.capturedAt)
         switch delivery {
         case let .sent(result):
             lastNoteClock = clock
             let path = result.path ?? "(服务端未返回 path)"
-            log("[notes] 已记录（sent）· \(clock) · \(path) · 截图 \(screenshotNote)")
+            log("[notes] 已记录（sent）· \(clock) · \(path) · 截图 \(screenshotNote)\(visionSuffix)")
             overlay?.showToast("已记录笔记 · \(clock)")
             if exitAfterNote { finishNoteOnce(exitCode: 0) }
         case let .queued(count):
             lastNoteClock = clock
-            log("[notes] 已离线排队（queued \(count)）· \(clock) · 截图 \(screenshotNote)")
+            log("[notes] 已离线排队（queued \(count)）· \(clock) · 截图 \(screenshotNote)\(visionSuffix)")
             overlay?.showToast("引擎未连接，笔记已排队 · \(clock)", isError: true)
             if exitAfterNote {
                 // --note-once 不立即退出：等引擎重连后自动补发（由 flushNotesQueue 收尾），避免测不到队列链路
@@ -1022,6 +1168,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     @objc private func toggleNotesWhenPaused() {
         settings.notesWhenPaused.toggle()
         log("[notes] 暂停时仍可笔记 = \(settings.notesWhenPaused ? "开" : "关")")
+        refreshMenu()
+    }
+
+    @objc private func toggleNotesOCR() {
+        settings.notesOCR.toggle()
+        log("[vision] 识别画面文字（OCR）= \(settings.notesOCR ? "开" : "关")")
+        if settings.notesOCR { refreshVisionHealth(reason: "开启 OCR") }
+        refreshMenu()
+    }
+
+    @objc private func toggleNotesVision() {
+        settings.notesVision.toggle()
+        log("[vision] 画面理解（VLM）= \(settings.notesVision ? "开（慢，约 20–30s）" : "关")")
+        if settings.notesVision { refreshVisionHealth(reason: "开启 VLM") }
         refreshMenu()
     }
 

@@ -31,6 +31,10 @@ import {
 import { base64ToBytes, pickLatencyMs } from './lib/pcm.js';
 import { buildSrtFromCaptions, suggestSrtFilename } from './lib/srt.js';
 import {
+  VISION_ANALYZE_TIMEOUT_MS,
+  VISION_OCR_TIMEOUT_MS,
+  appendVisionToText,
+  buildEnrichedNoteBody,
   buildNoteToastText,
   buildQuickNoteMarkdown,
   buildQuickNoteRequest,
@@ -38,8 +42,12 @@ import {
   createNoteQueue,
   nextDailyStats,
   notesEndpoint,
+  pickVisionAnalysis,
+  pickVisionOcrText,
   readDailyCount,
   resolveAssetUrl,
+  visionEndpoint,
+  visionHealthSummary,
 } from './lib/notes.js';
 
 const LOG_PREFIX = '[livedub:bg]';
@@ -96,6 +104,8 @@ function emptyState(engineUrl = DEFAULT_ENGINE_URL) {
     noteQueueCount: 0,
     /** v0.4：最近一条笔记结果（popup 展示） */
     lastNote: null, // {at, tMs, text, queued, videoTitle, imageUrl?}
+    /** v0.5：视觉能力健康状态（popup 展示；GET /api/vision/health） */
+    visionHealth: null,
     updatedAt: Date.now(),
   };
 }
@@ -236,6 +246,8 @@ async function engineFetch(path, { method = 'GET', body = null, rawBody = null, 
 async function postQuickNote(payload) {
   const quickPayload = { ...payload };
   delete quickPayload.imageUrl;
+  // v0.5：quick 只有 text 字段，把 OCR/画面理解拼进 text 保留信息
+  if (payload.vision) quickPayload.text = appendVisionToText(payload.text, payload.vision);
   const data = await engineFetch(notesEndpoint(engineHttpBase(), 'quick'), {
     method: 'POST',
     body: quickPayload,
@@ -255,7 +267,12 @@ async function postNoteRecord(payload) {
   const body = {
     video: payload.video,
     tMs: payload.tMs,
-    body: buildQuickNoteMarkdown(payload),
+    // v0.5：正文 = 快捷笔记 + 画面文字（OCR）+ 可选画面理解（VLM）
+    body: buildEnrichedNoteBody({
+      baseBody: buildQuickNoteMarkdown(payload),
+      ocr: payload.vision ? payload.vision.ocr : '',
+      caption: payload.vision ? payload.vision.caption : '',
+    }),
     kind: 'quick',
     source: 'extension',
   };
@@ -299,6 +316,95 @@ async function postAssetPng(bytes) {
   });
   const relativeUrl = typeof data.url === 'string' ? data.url : '';
   return { ok: true, url: relativeUrl, absoluteUrl: resolveAssetUrl(engineHttpBase(), relativeUrl) };
+}
+
+// ---- v0.5 视觉理解（OCR / VLM）：截图 asset -> 画面文字/画面理解 ----
+
+/** 视觉健康检查缓存（popup 展示 + 每次笔记复用；30s 内不重复请求） */
+let visionHealthCache = { value: null, checkedAt: 0 };
+
+/** GET /api/vision/health -> state.visionHealth（旧引擎 404 时静默标记不可用） */
+async function fetchVisionHealth({ force = false } = {}) {
+  const now = Date.now();
+  if (!force && visionHealthCache.value && now - visionHealthCache.checkedAt < 30_000) return visionHealthCache.value;
+  try {
+    const data = await engineFetch(visionEndpoint(engineHttpBase(), 'health'), { timeoutMs: 3000 });
+    visionHealthCache = { value: visionHealthSummary(data), checkedAt: now };
+  } catch (err) {
+    const status = err && typeof err.status === 'number' ? err.status : 0;
+    const missing = status === 404 || status === 405 || status === 501;
+    const summary = visionHealthSummary(null);
+    summary.error = missing ? '引擎未提供视觉接口（旧版引擎，已静默跳过）' : String((err && err.message) || err);
+    visionHealthCache = { value: summary, checkedAt: now };
+    log('vision health unavailable', summary.error);
+  }
+  updateState({ visionHealth: visionHealthCache.value });
+  return visionHealthCache.value;
+}
+
+/** POST /api/vision/ocr {imageUrl}（8s 超时） */
+async function requestVisionOcr(imageUrl) {
+  const data = await engineFetch(visionEndpoint(engineHttpBase(), 'ocr'), {
+    method: 'POST',
+    body: { imageUrl },
+    timeoutMs: VISION_OCR_TIMEOUT_MS,
+  });
+  return { text: pickVisionOcrText(data), provider: data.provider || '', ms: data.ms || 0 };
+}
+
+/** POST /api/vision/analyze?mode=both（VLM 20-30s，45s 超时） */
+async function requestVisionAnalyze(imageUrl, mode = 'both') {
+  const url = `${visionEndpoint(engineHttpBase(), 'analyze')}?mode=${encodeURIComponent(mode)}`;
+  const data = await engineFetch(url, { method: 'POST', body: { imageUrl }, timeoutMs: VISION_ANALYZE_TIMEOUT_MS });
+  const picked = pickVisionAnalysis(data);
+  return { ocr: picked.ocr, caption: picked.caption, mode: data.mode || mode, ms: data.ms || 0 };
+}
+
+/**
+ * 给截图做视觉增强：OCR（默认开，快）+ 可选 VLM 画面理解（默认关，慢）。
+ * 任何失败都静默降级（返回空文本），不阻断笔记保存；旧引擎无 vision 端点时直接跳过。
+ * @param {{imageUrl?:string}} input
+ * @returns {Promise<{ocr:string, caption:string, skipped:boolean, reason:string}>}
+ */
+async function enrichNoteWithVision({ imageUrl = '' } = {}) {
+  const wantOcr = settings.visionOcr !== false;
+  const wantCaption = settings.visionCaption === true;
+  const result = { ocr: '', caption: '', skipped: true, reason: '' };
+  if (!imageUrl) {
+    result.reason = 'no-image';
+    return result;
+  }
+  if (!wantOcr && !wantCaption) {
+    result.reason = 'disabled';
+    return result;
+  }
+  const health = await fetchVisionHealth();
+  if (!health || health.available === false) {
+    result.reason = (health && health.error) || 'vision-unavailable';
+    return result;
+  }
+  if (wantCaption) {
+    try {
+      const analyzed = await requestVisionAnalyze(imageUrl, 'both');
+      result.caption = analyzed.caption;
+      result.ocr = result.ocr || analyzed.ocr; // analyze?mode=both 也会返回 OCR，省一次请求
+      result.skipped = false;
+    } catch (err) {
+      result.reason = `analyze-failed: ${String((err && err.message) || err)}`;
+      log('vision analyze skipped', result.reason);
+    }
+  }
+  if (wantOcr && !result.ocr && health.ocr !== false) {
+    try {
+      const ocr = await requestVisionOcr(imageUrl);
+      result.ocr = ocr.text;
+      result.skipped = false;
+    } catch (err) {
+      if (!result.reason) result.reason = `ocr-failed: ${String((err && err.message) || err)}`;
+      log('vision ocr skipped', result.reason);
+    }
+  }
+  return result;
 }
 
 /** 抓当前活动标签页截图（需要 activeTab / 命令手势）；返回 PNG bytes */
@@ -388,6 +494,23 @@ async function captureQuickNote({ tabId = null, withScreenshot = null, trigger =
     }
   }
 
+  // v0.5：截图 asset 成功后做视觉增强（OCR 默认开；VLM 默认关、慢 20-30s）
+  let vision = null;
+  const wantVision = payload.imageUrl && (settings.visionOcr !== false || settings.visionCaption === true);
+  if (wantVision) {
+    notifyContentNoteResult(tab.id, {
+      pending: true,
+      toast: settings.visionCaption === true ? '正在识别画面（OCR + 画面理解，约 20-30s）…' : '正在识别画面文字…',
+    });
+    vision = await enrichNoteWithVision({ imageUrl: payload.imageUrl }).catch((err) => {
+      log('vision enrich failed (silent)', err && err.message);
+      return { ocr: '', caption: '', skipped: true, reason: String((err && err.message) || err) };
+    });
+    if (vision && (vision.ocr || vision.caption)) {
+      payload.vision = { ocr: vision.ocr, caption: vision.caption };
+    }
+  }
+
   let queued = false;
   let queueSize = 0;
   let notePath = '';
@@ -425,6 +548,7 @@ async function captureQuickNote({ tabId = null, withScreenshot = null, trigger =
     imageSkipped,
     imageError,
     engineError,
+    vision: payload.vision ? { ocr: !!payload.vision.ocr, caption: !!payload.vision.caption } : null,
     toast,
   };
   updateState({
@@ -1076,7 +1200,17 @@ function sanitizeSettingsPatch(patch) {
     if (normalized) out.engineUrl = normalized;
   }
   if (typeof patch.voiceMode === 'string') out.voiceMode = patch.voiceMode === 'preset' ? 'preset' : 'clone-first';
-  for (const key of ['dubEnabled', 'showOriginal', 'hidden', 'captureReplay', 'globalDuck', 'fullscreenWorkaround']) {
+  for (const key of [
+    'dubEnabled',
+    'showOriginal',
+    'hidden',
+    'captureReplay',
+    'globalDuck',
+    'fullscreenWorkaround',
+    'noteScreenshot',
+    'visionOcr',
+    'visionCaption',
+  ]) {
     if (typeof patch[key] === 'boolean') out[key] = patch[key];
   }
   if (patch.duckRecoverMs != null) {
@@ -1163,6 +1297,10 @@ async function handleMessage(message, sender) {
         }
       }
       updateState({ noteStats: publicNoteStats(), noteQueueCount: getNoteQueue().list().length }, { broadcast: false, persist: false });
+      // v0.5：后台刷新视觉能力状态（旧引擎 404 会静默标记不可用）
+      if (visionHealthCache.value == null || Date.now() - visionHealthCache.checkedAt > 30_000) {
+        void fetchVisionHealth().catch((err) => log('vision health refresh failed', err && err.message));
+      }
       return { ok: true, state: publicState(), settings: { ...settings } };
     }
     case MSG.START:

@@ -109,6 +109,10 @@ export const DEFAULT_SETTINGS = Object.freeze({
   fullscreenWorkaround: true,
   /** v0.4：记笔记时是否附带页面截图（captureVisibleTab） */
   noteScreenshot: true,
+  /** v0.5：截图上传后调用视觉 OCR，把画面文字追加进笔记正文（快，~1s） */
+  visionOcr: true,
+  /** v0.5：调用 VLM 生成「画面理解」（慢，20-30s；默认关闭避免拖慢记笔记） */
+  visionCaption: false,
   langFrom: 'en',
   langTo: 'zh',
   /** 是否隐藏浮层（从 popup 可重新打开） */

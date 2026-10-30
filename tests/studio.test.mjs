@@ -28,6 +28,22 @@ import { PROJECT_ROOT, deepMerge, loadConfig } from '../engine/config.mjs';
 import { createMockDeps } from '../engine/mock.mjs';
 import { buildEventJsonl, parseSessionJsonl } from '../studio/session-parse.mjs';
 import {
+  buildVisualNoteMarkdown,
+  collectTranscript,
+  contactSheetLayout,
+  countVisualImages,
+  extractImageUrls,
+  frameChangeRatio,
+  normalizeVisionHealth,
+  nearestSegment,
+  resolveKeyframeOptions,
+  sampleTimes,
+  changedPixelRatio,
+  shouldAcceptFrame,
+  toGrayscale,
+  visualNoteTags,
+} from '../studio/vision-kit.mjs';
+import {
   buildNoteExportFilename,
   buildNotesMarkdown,
   buildOutlineMarkdown,
@@ -89,10 +105,16 @@ function makeTempDir(prefix = 'livedub-test-') {
  */
 function startTestServer(options = {}) {
   const dataDir = options.dataDir ?? makeTempDir('livedub-test-data-');
+  // 默认注入「视觉不可用」工厂：避免测试加载真实 engine/vision 模块或拉起 OCR/VLM 进程；
+  // 需要测试视觉端点时传 options.visionService（fake service）或 options.visionFactory。
+  const visionOptions = options.visionService
+    ? {}
+    : { visionFactory: options.visionFactory ?? (async () => { throw new Error('vision disabled in tests'); }) };
   return startServer({
     log: () => {},
     dataDir,
     desktopAppPath: options.desktopAppPath ?? path.join(dataDir, 'no-desktop-app'),
+    ...visionOptions,
     ...options,
   });
 }
@@ -393,6 +415,10 @@ test('HTTP 静态服务：/ -> /studio/、/studio/ 与 /replay/ 200、缺失 404
     assert.ok(studio.body.includes('notesDrawer'));
     assert.ok(studio.body.includes('notesEditor'));
     assert.ok(studio.body.includes('data/notes/'));
+    // v0.5：图文笔记入口 / 弹窗 / 捕获画面
+    assert.ok(studio.body.includes('图文笔记'));
+    assert.ok(studio.body.includes('visualModal'));
+    assert.ok(studio.body.includes('btnCaptureVisual'));
 
     const app = await httpRequest(srv.port, '/studio/app.mjs');
     assert.equal(app.status, 200);
@@ -1657,4 +1683,386 @@ test('Notes API：quick -> 笔记库 -> GET -> export 链路（扩展/CLI 快捷
     await srv.close();
     fs.rmSync(dataDir, { recursive: true, force: true });
   }
+});
+
+// ==================================================== v0.5 视觉端点 / 图文笔记
+
+/** fake vision service：测试用，记录调用次数；可通过参数模拟失败/慢响应 */
+function makeFakeVisionService(overrides = {}) {
+  const calls = { ocr: 0, analyze: 0, summarize: 0, health: 0, dispose: 0 };
+  const service = {
+    calls,
+    async ocr({ png: input }) {
+      calls.ocr += 1;
+      if (overrides.ocrDelayMs) await new Promise((resolve) => setTimeout(resolve, overrides.ocrDelayMs));
+      if (overrides.ocrThrows) throw new Error(overrides.ocrThrows);
+      return {
+        text: 'The Learning Rate\n学习率控制步长',
+        lines: [
+          { text: 'The Learning Rate', confidence: 0.98 },
+          { text: '学习率控制步长', confidence: 0.95 },
+        ],
+        provider: 'fake-ocr',
+        ms: 12,
+        bytes: input?.length ?? 0,
+      };
+    },
+    async analyze({ png: input, mode }) {
+      calls.analyze += 1;
+      if (overrides.analyzeThrows) throw new Error(overrides.analyzeThrows);
+      return {
+        ...(mode !== 'vision' ? { ocr: { text: 'OCR in analyze', lines: [], provider: 'fake-ocr', ms: 8 } } : {}),
+        ...(mode !== 'ocr'
+          ? { caption: { text: '一张关于学习率的幻灯片，列出三条要点。', provider: 'fake-vlm', model: 'fake-vlm-model', ms: 34 } }
+          : {}),
+      };
+    },
+    async summarize({ title, transcript, visuals }) {
+      calls.summarize += 1;
+      return {
+        summary: `《${title}》共 ${transcript.length} 句字幕、${visuals.length} 个画面：讲了梯度下降与学习率。`,
+        keyPoints: ['梯度下降沿反方向更新参数', '学习率控制步长'],
+        provider: 'fake-summary',
+        model: 'fake-summary-model',
+        ms: 55,
+      };
+    },
+    async health() {
+      calls.health += 1;
+      return {
+        ready: true,
+        ocr: { available: true, provider: 'fake-ocr', bin: '/tmp/fake-ocr' },
+        vision: { available: true, provider: 'fake-vlm', model: 'fake-vlm-model' },
+        provider: 'fake',
+      };
+    },
+    async dispose() {
+      calls.dispose += 1;
+    },
+    ...overrides.methods,
+  };
+  return service;
+}
+
+function visionConfigOverrides(extra = {}) {
+  return deepMerge(testConfig(), { vision: { timeoutMs: 5000, ocrTimeoutMs: 2000, summaryTimeoutMs: 5000 }, ...extra });
+}
+
+test('vision API：模块缺失（503）与 /health.vision 不可用摘要', async () => {
+  const srv = await startTestServer({ config: testConfig() });
+  try {
+    for (const [method, pathname] of [
+      ['POST', '/api/vision/ocr'],
+      ['POST', '/api/vision/analyze'],
+      ['POST', '/api/vision/summarize'],
+      ['GET', '/api/vision/health'],
+    ]) {
+      const response = await fetch(`${srv.url}${pathname}`, {
+        method,
+        headers: method === 'POST' ? { 'Content-Type': 'image/png' } : {},
+        body: method === 'POST' ? tinyPng('vision') : undefined,
+      });
+      assert.equal(response.status, 503, `${pathname} 应 503`);
+      const body = await response.json();
+      assert.equal(body.ok, false);
+      assert.equal(body.error, 'vision_unavailable');
+      assert.equal(typeof body.message, 'string');
+    }
+    const health = await (await fetch(`${srv.url}/health`)).json();
+    assert.equal(health.ok, true);
+    assert.equal(typeof health.vision, 'object');
+    assert.equal(health.vision.available, false);
+    assert.equal(typeof health.vision.reason, 'string');
+  } finally {
+    await srv.close();
+  }
+});
+
+test('vision API：注入 fake service 的 OCR / analyze / summarize / health + 输入校验与防穿越', async () => {
+  const fake = makeFakeVisionService();
+  const srv = await startTestServer({ config: visionConfigOverrides(), visionService: fake });
+  try {
+    const png = tinyPng('vision-input');
+    // raw PNG OCR
+    let result = await notesApi(srv, 'POST', '/api/vision/ocr', png, { 'Content-Type': 'image/png' });
+    assert.equal(result.status, 200);
+    assert.equal(result.data.ok, true);
+    assert.match(result.data.text, /Learning Rate/);
+    assert.equal(result.data.lines.length, 2);
+    assert.equal(result.data.provider, 'fake-ocr');
+    assert.equal(typeof result.data.ms, 'number');
+
+    // 先上传资产，再用 JSON {imageUrl} OCR（工作台图文笔记走这条路径）
+    const asset = await notesApi(srv, 'POST', '/api/notes/assets', png, { 'Content-Type': 'image/png' });
+    assert.equal(asset.status, 200);
+    const assetUrl = asset.data.url;
+    result = await notesApi(srv, 'POST', '/api/vision/ocr', { imageUrl: assetUrl });
+    assert.equal(result.status, 200);
+    assert.equal(result.data.imageUrl, assetUrl);
+    assert.match(result.data.text, /Learning Rate/);
+
+    // analyze 三种模式
+    result = await notesApi(srv, 'POST', '/api/vision/analyze?mode=ocr', { imageUrl: assetUrl });
+    assert.equal(result.status, 200);
+    assert.equal(result.data.mode, 'ocr');
+    assert.ok(result.data.ocr);
+    assert.equal(result.data.caption, undefined);
+    result = await notesApi(srv, 'POST', '/api/vision/analyze?mode=vision', png, { 'Content-Type': 'image/png' });
+    assert.equal(result.status, 200);
+    assert.equal(result.data.mode, 'vision');
+    assert.equal(result.data.caption.provider, 'fake-vlm');
+    assert.equal(result.data.ocr, undefined);
+    result = await notesApi(srv, 'POST', '/api/vision/analyze?mode=both', { imageUrl: assetUrl });
+    assert.equal(result.status, 200);
+    assert.ok(result.data.ocr);
+    assert.ok(result.data.caption);
+    assert.equal(result.data.provider, 'fake-vlm');
+
+    // analyze 非法 mode / 输入
+    result = await notesApi(srv, 'POST', '/api/vision/analyze?mode=bad', { imageUrl: assetUrl });
+    assert.equal(result.status, 400);
+    assert.equal(result.data.error, 'invalid_mode');
+    result = await notesApi(srv, 'POST', '/api/vision/analyze', { imageUrl: 'https://evil.example/x.png' });
+    assert.equal(result.status, 400);
+    assert.equal(result.data.error, 'invalid_image_url');
+    result = await notesApi(srv, 'POST', '/api/vision/analyze', { imageUrl: '/api/notes/assets/..%2F..%2Fui-settings.json' });
+    assert.equal(result.status, 400);
+    assert.equal(result.data.error, 'invalid_image_url');
+    result = await notesApi(srv, 'POST', '/api/vision/analyze', { imageUrl: '/api/notes/assets/nope.png' });
+    assert.equal(result.status, 404);
+    result = await notesApi(srv, 'POST', '/api/vision/analyze', { imageUrl: 123 });
+    assert.equal(result.status, 400);
+    result = await notesApi(srv, 'POST', '/api/vision/analyze', Buffer.from('not png'), { 'Content-Type': 'image/png' });
+    assert.equal(result.status, 400);
+    assert.equal(result.data.error, 'invalid_png');
+    result = await notesApi(srv, 'POST', '/api/vision/analyze', Buffer.alloc(4 * 1024 * 1024 + 32, 0x41), { 'Content-Type': 'image/png' });
+    assert.equal(result.status, 413);
+
+    // summarize
+    const summarizeBody = {
+      title: '梯度下降 Demo',
+      transcript: [
+        { t0Ms: 0, t1Ms: 2780, src: 'Welcome to gradient descent.', dst: '欢迎来到梯度下降。' },
+        { t0Ms: 2780, t1Ms: 6680, src: 'The learning rate controls the step.', dst: '学习率控制步长。' },
+      ],
+      visuals: [
+        { tMs: 0, ocrText: 'Gradient Descent', caption: '标题页' },
+        { tMs: 6000, ocrText: 'The Learning Rate' },
+      ],
+    };
+    result = await notesApi(srv, 'POST', '/api/vision/summarize', summarizeBody);
+    assert.equal(result.status, 200);
+    assert.match(result.data.summary, /梯度下降 Demo/);
+    assert.equal(result.data.keyPoints.length, 2);
+    assert.equal(result.data.provider, 'fake-summary');
+    assert.equal(result.data.model, 'fake-summary-model');
+    for (const [label, body] of [
+      ['unknown field', { ...summarizeBody, secret: 'x' }],
+      ['bad transcript', { title: 'x', transcript: 'nope' }],
+      ['too many transcript', { title: 'x', transcript: Array.from({ length: 201 }, (_, i) => ({ t0Ms: i, t1Ms: i + 1, src: 'a', dst: 'b' })) }],
+      ['too many visuals', { title: 'x', transcript: [], visuals: Array.from({ length: 81 }, (_, i) => ({ tMs: i, ocrText: 'x' })) }],
+    ]) {
+      result = await notesApi(srv, 'POST', '/api/vision/summarize', body);
+      assert.equal(result.status, 400, `${label} 应 400`);
+      assert.equal(typeof result.data.error, 'string');
+    }
+
+    // health 端点 / /health 摘要
+    result = await notesApi(srv, 'GET', '/api/vision/health');
+    assert.equal(result.status, 200);
+    assert.equal(result.data.ok, true);
+    assert.equal(result.data.ready, true);
+    assert.equal(result.data.ocr.provider, 'fake-ocr');
+    assert.equal(result.data.vision.provider, 'fake-vlm');
+    const health = await (await fetch(`${srv.url}/health`)).json();
+    assert.equal(health.vision.available, true);
+    assert.equal(health.vision.ocr.provider, 'fake-ocr');
+    assert.equal(health.vision.vision.provider, 'fake-vlm');
+    assert.ok(!JSON.stringify(health.vision).includes('apiKey'));
+
+    // kind:'visual' 的图文笔记可以存入笔记库
+    result = await notesApi(srv, 'POST', '/api/notes', {
+      video: { id: 'local-visual-video', title: '图文 Demo' },
+      tMs: 0,
+      body: '# 图文笔记\n\n![画面](/api/notes/assets/x.png)',
+      kind: 'visual',
+      tags: ['图文笔记'],
+      source: 'studio',
+    });
+    assert.equal(result.status, 200);
+    assert.equal(result.data.note.kind, 'visual');
+    const list = await notesApi(srv, 'GET', `/api/notes?videoId=${encodeURIComponent('local-visual-video')}`);
+    assert.equal(list.data.notes.length, 1);
+    assert.equal(list.data.notes[0].kind, 'visual');
+
+    // 方法限制
+    result = await notesApi(srv, 'GET', '/api/vision/ocr');
+    assert.equal(result.status, 405);
+    result = await notesApi(srv, 'POST', '/api/vision/health', {});
+    assert.equal(result.status, 405);
+  } finally {
+    await srv.close();
+  }
+});
+
+test('vision API：错误映射（超时 504 / 未配置 502）与 dispose 清理', async () => {
+  const slow = makeFakeVisionService({ ocrDelayMs: 1600 });
+  const srv = await startTestServer({
+    config: visionConfigOverrides({ vision: { ocrTimeoutMs: 1000, timeoutMs: 5000 } }),
+    visionService: slow,
+  });
+  try {
+    const result = await notesApi(srv, 'POST', '/api/vision/ocr', tinyPng('slow'), { 'Content-Type': 'image/png' });
+    assert.equal(result.status, 504);
+    assert.equal(result.data.error, 'vision_timeout');
+    assert.match(result.data.message, /超时/);
+  } finally {
+    await srv.close();
+  }
+
+  const notConfigured = makeFakeVisionService({ ocrThrows: 'vision provider 未配置 apiKey' });
+  const srv2 = await startTestServer({ config: visionConfigOverrides(), visionService: notConfigured });
+  try {
+    const result = await notesApi(srv2, 'POST', '/api/vision/ocr', tinyPng('nc'), { 'Content-Type': 'image/png' });
+    assert.equal(result.status, 502);
+    assert.equal(result.data.error, 'vision_not_configured');
+  } finally {
+    await srv2.close();
+    await waitFor(() => notConfigured.calls.dispose === 1, 3000, 'vision dispose');
+  }
+});
+
+test('vision-kit 纯函数：关键帧差异/采样/拼图/图文 Markdown/健康规范化', () => {
+  // 灰度化
+  const gray = toGrayscale(new Uint8Array([255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255]), 3, 1);
+  assert.equal(gray.length, 3);
+  assert.ok(Math.abs(gray[0] - 76) <= 1);
+  assert.ok(Math.abs(gray[1] - 149) <= 1);
+  assert.ok(Math.abs(gray[2] - 29) <= 1);
+
+  // 差异/去重
+  const black = new Uint8Array(64 * 36);
+  const white = new Uint8Array(64 * 36).fill(255);
+  assert.equal(frameChangeRatio(black, black), 0);
+  assert.equal(frameChangeRatio(black, white), 1);
+  assert.equal(frameChangeRatio(null, black), 1);
+  assert.equal(shouldAcceptFrame(null, black), true);
+  assert.equal(shouldAcceptFrame(black, black, 0.035), false);
+  assert.equal(shouldAcceptFrame(black, white, 0.035), true);
+  assert.equal(shouldAcceptFrame(black, new Uint8Array(64 * 36).fill(5), 0.035), false);
+  // 结构性差异：5% 像素大幅变化 -> 均值差异 < 3.5%，但明显变化像素占比 >= 3%，也应接受（暗色幻灯片切换场景）
+  const structural = new Uint8Array(64 * 36).fill(0);
+  for (let i = 0; i < Math.floor(64 * 36 * 0.05); i += 1) structural[i] = 150;
+  assert.ok(changedPixelRatio(black, structural) >= 0.03);
+  assert.ok(frameChangeRatio(black, structural) < 0.035);
+  assert.equal(shouldAcceptFrame(black, structural, 0.035), true);
+
+  // 采样时间点
+  assert.deepEqual(sampleTimes({ startMs: 0, endMs: 20000, intervalMs: 6000 }), [0, 6000, 12000, 18000, 20000]);
+  assert.deepEqual(sampleTimes({ startMs: 5000, endMs: 5000, intervalMs: 6000 }), [5000]);
+  assert.deepEqual(sampleTimes({ startMs: 5000, endMs: 1000, intervalMs: 6000 }), [5000]);
+  const capped = sampleTimes({ startMs: 0, endMs: 600000, intervalMs: 1000, maxCandidates: 10 });
+  assert.equal(capped.length, 10);
+  assert.equal(capped[capped.length - 1], 600000);
+
+  // 2x3 拼图布局
+  const layout = contactSheetLayout(6, { width: 1280, height: 960 });
+  assert.equal(layout.cols, 2);
+  assert.equal(layout.rows, 3);
+  assert.equal(layout.slots.length, 6);
+  assert.ok(layout.cellWidth > 0 && layout.cellHeight > 0);
+  for (const slot of layout.slots) {
+    assert.ok(slot.x >= 0 && slot.y >= 0);
+    assert.ok(slot.x + layout.cellWidth <= layout.width - 1);
+    assert.ok(slot.y + layout.cellHeight <= layout.height - 1);
+  }
+  const layout2 = contactSheetLayout(5, { width: 800, height: 600 });
+  assert.equal(layout2.rows, 3);
+  assert.equal(layout2.slots.length, 5);
+
+  // 最近字幕
+  const segments = [
+    { t0Ms: 0, t1Ms: 3000, text: 'First', translation: '第一' },
+    { t0Ms: 7000, t1Ms: 10000, text: 'Second', translation: '第二' },
+  ];
+  assert.equal(nearestSegment(segments, 500).text, 'First');
+  assert.equal(nearestSegment(segments, 9000).text, 'Second');
+  assert.equal(nearestSegment([], 0), null);
+  const transcript = collectTranscript(segments, { startMs: 2000, endMs: 9000 });
+  assert.equal(transcript.length, 2);
+  assert.equal(collectTranscript(segments, { limit: 1 }).length, 1);
+
+  // 关键帧配置
+  const kf = resolveKeyframeOptions({ vision: { keyframe: { intervalMs: 3000, minChange: 0.05, maxFrames: 12, sheetSize: 4 } } });
+  assert.equal(kf.intervalMs, 3000);
+  assert.equal(kf.minChange, 0.05);
+  assert.equal(kf.maxFrames, 12);
+  assert.equal(kf.sheetSize, 4);
+  assert.equal(resolveKeyframeOptions({}).intervalMs, 6000);
+  assert.equal(resolveKeyframeOptions({}).maxFrames, 12, '默认最多 12 个关键帧（OCR 逐帧约 1s）');
+
+  // 图文 Markdown
+  const markdown = buildVisualNoteMarkdown({
+    title: '梯度下降 Demo',
+    summary: '本节介绍了梯度下降的核心思想。',
+    keyPoints: ['沿负梯度方向更新', '学习率控制步长'],
+    frames: [
+      {
+        tMs: 61000,
+        imageUrl: '/api/notes/assets/a.png',
+        ocrText: 'The Learning Rate\n学习率',
+        caption: '一张关于学习率的幻灯片。',
+      },
+      { tMs: 0, imageUrl: '/api/notes/assets/b.png', ocrText: 'Gradient Descent' },
+    ],
+    segments,
+    range: { startMs: 0, endMs: 75000 },
+    langFrom: 'en',
+    langTo: 'zh',
+    generatedAt: new Date('2026-01-02T03:04:05'),
+    vlm: true,
+  });
+  assert.match(markdown, /^# 梯度下降 Demo · 图文笔记/);
+  assert.doesNotMatch(markdown, /^---\n/); // 不重复 YAML front matter
+  assert.match(markdown, /## 本节总结\n\n本节介绍了梯度下降的核心思想。/);
+  assert.match(markdown, /## 要点/);
+  assert.match(markdown, /- 沿负梯度方向更新/);
+  assert.match(markdown, /## 画面时间线/);
+  assert.match(markdown, /### \[00:00:00\]\(\?t=0\) · 画面/);
+  assert.match(markdown, /### \[00:01:01\]\(\?t=61000\) · 画面/);
+  assert.match(markdown, /!\[画面 00:00:00\]\(\/api\/notes\/assets\/b\.png\)/);
+  assert.match(markdown, /\*\*画面文字（OCR）\*\*/);
+  assert.match(markdown, /```text\nThe Learning Rate/);
+  assert.match(markdown, /\*\*画面理解（VLM）\*\*/);
+  assert.match(markdown, /一张关于学习率的幻灯片/);
+  assert.match(markdown, /\*\*双语字幕\*\*/);
+  assert.match(markdown, /> 原文：First/);
+  assert.ok(markdown.indexOf('[00:00:00]') < markdown.indexOf('[00:01:01]'), '时间线应按时间排序');
+
+  // 无 VLM 时不出现「画面理解」
+  const noVlm = buildVisualNoteMarkdown({ title: 'T', frames: [{ tMs: 0, imageUrl: '/api/notes/assets/a.png', caption: 'x' }], vlm: false });
+  assert.doesNotMatch(noVlm, /画面理解（VLM）/);
+
+  // 图片提取 / 徽标
+  assert.deepEqual(extractImageUrls('![a](/api/notes/assets/a.png)\n![b](/api/notes/assets/b.png)\n![a](/api/notes/assets/a.png)'), [
+    '/api/notes/assets/a.png',
+    '/api/notes/assets/b.png',
+  ]);
+  assert.deepEqual(extractImageUrls('no images'), []);
+  assert.equal(countVisualImages('![a](/api/notes/assets/a.png)\n![b](/api/notes/assets/b.png)'), 2);
+
+  // tags
+  assert.deepEqual(visualNoteTags({ vlm: true }), ['图文笔记', '画面理解']);
+  assert.deepEqual(visualNoteTags({ vlm: false }), ['图文笔记']);
+  assert.deepEqual(visualNoteTags({ vlm: false, extra: ['梯度下降', '图文笔记'] }), ['图文笔记', '梯度下降']);
+
+  // health 规范化
+  const healthOk = normalizeVisionHealth({ ok: true, ready: true, ocr: { available: true, provider: 'macos-vision' }, vision: { available: false } });
+  assert.equal(healthOk.available, true);
+  assert.equal(healthOk.ocrAvailable, true);
+  assert.equal(healthOk.visionAvailable, false);
+  assert.equal(healthOk.provider, 'macos-vision');
+  const healthDown = normalizeVisionHealth({ ok: false, error: 'vision_unavailable', message: 'not ready' });
+  assert.equal(healthDown.available, false);
+  assert.match(healthDown.reason, /not ready/);
 });

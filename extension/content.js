@@ -69,6 +69,8 @@
     duckRecoverMs: 800,
     fullscreenWorkaround: true,
     noteScreenshot: true,
+    visionOcr: true,
+    visionCaption: false,
     langFrom: 'en',
     langTo: 'zh',
     hidden: false,
@@ -159,6 +161,8 @@
     merged.globalDuck = merged.globalDuck !== false;
     merged.fullscreenWorkaround = merged.fullscreenWorkaround !== false;
     merged.noteScreenshot = merged.noteScreenshot !== false;
+    merged.visionOcr = merged.visionOcr !== false;
+    merged.visionCaption = merged.visionCaption === true;
     merged.duckRecoverMs = Math.round(clampNumber(merged.duckRecoverMs, DUCK_RECOVER_MS_MIN, DUCK_RECOVER_MS_MAX, 800));
     merged.panelPos =
       merged.panelPos && typeof merged.panelPos === 'object'
@@ -484,6 +488,8 @@
               <label><input type="checkbox" data-set="noteScreenshot" /> 附页面截图</label>
               <button type="button" data-act="note">记笔记</button>
             </div>
+            <div class="row"><label><input type="checkbox" data-set="visionOcr" /> 识别画面文字（OCR，快 ~1s）</label></div>
+            <div class="row"><label><input type="checkbox" data-set="visionCaption" /> 画面理解（VLM，慢 20-30s）</label></div>
             <div class="livedub-guide" data-part="guide" hidden>
               <div class="guide-title" data-part="guide-title"></div>
               <div class="guide-body" data-part="guide-body"></div>
@@ -498,7 +504,7 @@
               <button type="button" data-act="export">导出 SRT</button>
               <button type="button" data-act="hide">隐藏浮层</button>
             </div>
-            <div class="hint">Alt+Shift+N 记笔记（可附截图）· Alt+Shift+L 开始/停止。开始/停止需要用户手势；字幕可拖动，位置/样式自动保存。</div>
+            <div class="hint">Alt+Shift+N 记笔记（截图 + 画面文字 OCR）· Alt+Shift+L 开始/停止。开始/停止需要用户手势；字幕可拖动，位置/样式自动保存。</div>
             <div class="livedub-error" data-part="error" hidden></div>
           </div>
         </div>
@@ -1201,6 +1207,10 @@
     if (noteStats && noteStats.count > 0) lines.push(`今日笔记 ${noteStats.count} 条`);
     const noteQueueCount = (runtime.bgState && runtime.bgState.noteQueueCount) || 0;
     if (noteQueueCount > 0) lines.push(`离线待同步笔记 ${noteQueueCount} 条`);
+    const visionHealth = runtime.bgState && runtime.bgState.visionHealth;
+    if (visionHealth && (visionHealth.ocrLabel || visionHealth.visionLabel)) {
+      lines.push(`画面 ${visionHealth.ocrLabel || 'OCR ?'} · ${visionHealth.visionLabel || 'VLM ?'}`);
+    }
     meta.hidden = lines.length === 0;
     meta.textContent = lines.join('\n');
   }
@@ -1559,8 +1569,15 @@
         return false;
       case M.NOTE_RESULT: {
         const result = message.result || {};
-        if (result.toast) showToast(result.toast, result.queued ? 'warn' : 'ok');
-        else if (result.ok) showToast('已记笔记', 'ok');
+        if (result.pending) {
+          // v0.5：正在等 OCR/VLM（VLM 可能 20-30s）
+          if (result.toast) showToast(result.toast, 'warn', 4000);
+        } else if (result.toast) {
+          const suffix = result.vision && (result.vision.ocr || result.vision.caption) ? '（含画面文字）' : '';
+          showToast(`${result.toast}${suffix}`, result.queued ? 'warn' : 'ok');
+        } else if (result.ok) {
+          showToast('已记笔记', 'ok');
+        }
         sendResponse({ ok: true });
         return false;
       }

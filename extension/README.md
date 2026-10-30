@@ -44,6 +44,27 @@ v0.4 迭代（**边看边写笔记**）：
   （`data/exports/<slug>-<date>.md`，可直接放进 Obsidian vault 目录）。
   注意：Chrome 扩展快捷键只在 **Chrome 窗口聚焦**时生效；若当前焦点在 VSCode，先点回浏览器（或点浮层面板/popup 的按钮）。
 
+v0.5 迭代（快捷笔记加入画面理解）：
+- 截图上传 asset 成功后，自动调用引擎视觉端点，把**画面文字（OCR）**以代码块写进笔记正文：
+  `POST /api/vision/ocr`（超时 8s，本地 macOS Vision/tesseract，约 1s/帧）；默认开启 `visionOcr`；
+- 可选**画面理解（VLM）**：开启 `visionCaption`（默认关，慢 20-30s/次、消耗模型额度）后调用
+  `POST /api/vision/analyze?mode=both`，追加「**画面理解**：<描述>」；等待期间浮层 toast 提示「正在识别画面…」；
+- 视觉不可用（旧引擎无 `/api/vision/*`、OCR 未安装、VLM 未配置）时**静默跳过**，笔记照常保存；
+- popup / 浮层面板可开关「识别画面文字（OCR，快）」「画面理解（VLM，慢）」，popup 显示视觉健康状态
+  （`GET /api/vision/health`：本地 OCR provider / VLM 是否配置）；
+- 笔记正文新增结构（保留原有 原文/译文/记录）：
+  ```
+  **画面文字**（OCR）：
+
+  ```text
+  <PPT 标题 / 代码 / 板书文字，最长 2000 字>
+  ```
+
+  **画面理解**：
+
+  <VLM 对幻灯片/代码/图表的描述>
+  ```
+
 > 协议、时间轴、事件定义见 `docs/CONTRACTS.md` §3；引擎入口 `engine/server.mjs`。
 > 本目录零 npm 依赖、无远程代码 / CDN / 内联脚本，所有资源随扩展本地打包。
 
@@ -62,7 +83,8 @@ extension/
 │   ├── pcm.js             # 纯函数：PCM 编解码、重采样、base64、hello、文本清洗、duck 状态机、dub 排期
 │   ├── ui.js              # v0.2/v0.3 纯函数：全屏宿主/包裹决策、字幕停靠/避让、原声总线增益
 │   ├── srt.js             # v0.2 纯函数：caption -> SRT（时间戳/双语/文件名）
-│   └── notes.js           # v0.4 纯函数：videoId/quick note markdown/离线队列/今日计数/时间格式
+│   └── notes.js           # v0.4/v0.5 纯函数：videoId/quick note markdown/离线队列/今日计数/
+│                          #   OCR 代码块（围栏自适应）/画面理解/视觉健康解析
 ├── worklet/pcm-worklet.js # AudioWorklet：100ms 分片 + 兜底重采样到 16kHz + float32→s16
 └── README.md
 tests/extension.test.mjs   # manifest / 静态检查 / 纯函数单测（node --test）
@@ -126,6 +148,10 @@ offscreen: getUserMedia(tab) ─▶ 16k AudioContext + AudioWorklet（100ms）
 - 全屏兼容包裹：page-hook（MAIN world）与 content 通过 `window.postMessage`（source `livedub-content` /
   `livedub-page-hook`）同步 `fullscreenWorkaround` 开关；包裹层是 `<div>`，属于「可承载子节点」元素，
   content 的 `fullscreenchange` 迁移会把浮层放进包裹层内。
+- 视觉增强（v0.5）：`POST /api/notes/assets` 成功后，若 `visionOcr`（默认开）→ `POST /api/vision/ocr {imageUrl}`
+  （8s 超时）→ `lib/notes.js#buildVisionOcrSection` 生成「画面文字」代码块；若 `visionCaption`（默认关）→
+  `POST /api/vision/analyze?mode=both`（45s 超时）→ 追加「画面理解」。视觉失败/旧引擎无端点时静默跳过，
+  不阻断笔记保存；结果同时拼进 `POST /api/notes` 的 body（quick 兜底则拼进 text）。
 - 笔记：background 收到快捷键/按钮/命令后向 content 要 `{url,title,durationMs,tMs,text,quotes}` 上下文，
   用 `lib/notes.js` 计算稳定 videoId、构造笔记请求体；主写入 `POST /api/notes`（笔记库存档，工作台「笔记本」
   与导出 Markdown 都基于它，支持 `kind=quick`/`quotes`/`tags`/`imageUrl`），引擎无该路由时回退
@@ -200,6 +226,11 @@ offscreen: getUserMedia(tab) ─▶ 16k AudioContext + AudioWorklet（100ms）
 | 36 | popup →「打开笔记本」 | 打开 `http://127.0.0.1:8787/studio/?notes=1`，工作台切到笔记视图（若工作台尚未实现 notes 面板则显示主界面） |
 | 37 | popup →「导出 Markdown」 | 调用 `POST /api/notes/export`，显示落盘路径 `data/exports/<slug>-<date>.md`；引擎未启动时给 npm start 引导 |
 | 38 | 连续记 3 条后刷新页面再按 Alt+Shift+N | 视频/字幕上下文重建；同一视频笔记归到同一 id（元数据加载前记录的可能另归，见限制） |
+| 39 | 播放带有 PPT/代码/板书的视频，确认 `visionOcr` 开、附截图开，按 Alt+Shift+N | 浮层先 toast「正在识别画面文字…」，随后「已记笔记 @ mm:ss（含画面文字）」；笔记正文出现 `**画面文字**（OCR）：` 代码块，内容为画面上的文字 |
+| 40 | 画面无文字（纯人脸/风景）时记笔记 | 不出现空 OCR 代码块；笔记照常保存（无画面文字段落） |
+| 41 | popup 打开（引擎 v0.5 在线） | 「画面」行显示 `OCR macos-vision · VLM …已配置/未配置`；旧引擎显示「未检测到视觉接口（旧引擎）」 |
+| 42 | 开启「画面理解（VLM，慢）」后记笔记 | 等待 toast 提示 20-30s；完成后笔记追加 `**画面理解**：` 描述；关闭开关后恢复快速记录 |
+| 43 | 用旧版引擎（无 /api/vision/*）记笔记 | 视觉调用静默跳过（控制台无未捕获错误），笔记正常保存且无视觉段落 |
 
 ## 已知限制 / TODO
 
@@ -211,6 +242,9 @@ offscreen: getUserMedia(tab) ─▶ 16k AudioContext + AudioWorklet（100ms）
   实现说明：优先 `POST /api/notes`（笔记库存档、支持 imageUrl，工作台笔记本/导出可见）；若引擎只有 quick 路由则回退
   `POST /api/notes/quick`（写每日摘录 `quick-YYYY-MM-DD.md`，截图降级为无图）。
 - 「打开笔记本」跳到 `/studio/?notes=1`，笔记面板由工作台负责；若该版本工作台未实现 notes 视图，会显示主界面（扩展侧不报错）。
+- **画面文字/画面理解依赖引擎 `/api/vision/*` 与截图**：未附截图、截图上传失败、旧引擎无视觉端点或 OCR/VLM 未配置时静默跳过（笔记仍保存）；OCR 准确率取决于画面清晰度/字体/语言，复杂公式/代码可能有误。
+- **画面理解（VLM）慢且消耗模型额度**：默认关闭；开启后每次记笔记多等约 20-30s（超时 45s 会降级为仅 OCR/无视觉），适合「停下来精读某一帧」而不是连续打点。
+- 视觉能力健康状态（popup「画面」行）来自 `GET /api/vision/health`，引擎未启动/旧版时显示不可用，不影响记笔记。
 - 快捷键是 **Chrome 命令**，只在浏览器窗口聚焦时触发（VSCode 等外部编辑器内无法直接触发 OS 级快捷键）；可切回浏览器按 `Alt+Shift+N`，或使用浮层/popup 按钮。
 - 截图是 `captureVisibleTab`（当前可见区域），会包含页面 UI/水印；受 DRM 保护页面可能黑屏或失败，失败自动降级无图。
 - **原生全屏的浏览器限制（v0.3 尽力解决）**：容器型全屏（YouTube/B 站）一直正常；裸 `<video>` 全屏通过
@@ -250,6 +284,7 @@ node --test tests/extension.test.mjs
 - **线协议冒烟**：用 Node 起一个 `engine/ws.mjs` 回环服务，验证扩展的 `hello` + 二进制音频帧 + `control stop` 能被引擎解析；
 - `computeDubPlayhead`：dub 按 `startMs` 排期、落后立即播；
 - `lib/notes.js`（v0.4）：videoId 稳定/URL 规范化、quick note 请求体/Markdown、离线队列（入队/上限/flush 成功与失败/持久化）、今日计数、时间码、Notes API URL/响应解析；
+- `lib/notes.js`（v0.5）：画面文字清洗/2000 截断/反引号围栏自适应、画面理解段落、正文拼接（原文结构保留）、quick 文本兜底、OCR/analyze 响应解析、视觉 health 解析（含旧引擎降级）；
 - `page-hook.js`：MAIN world 猴补 `requestFullscreen`、裸 video 包裹/回滚、postMessage 协作协议；
 - content/background/offscreen/popup 的关键实现静态断言（user gesture、offscreen reasons、Shadow DOM、
   v0.3 原声总线 duck/恢复、全局限定压音让位、压音 800ms 等）。

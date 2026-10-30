@@ -133,6 +133,18 @@ async function checkConfig() {
     add('error', 'tts', err.message);
   }
 
+  // 视觉理解（v0.5，可选能力）
+  const visionCfg = config.vision ?? {};
+  const ocrBin = path.resolve(PROJECT_ROOT, String(visionCfg.ocr?.bin || 'data/bin/ocr-macos'));
+  const ocrReady = fs.existsSync(ocrBin);
+  add(ocrReady ? 'ok' : 'warn', 'vision OCR', ocrReady ? `本地 ${path.relative(PROJECT_ROOT, ocrBin)}` : '本地 OCR 未构建（npm run build:ocr；也可用 tesseract 兜底）');
+  try {
+    const vp = resolveProvider(config, visionCfg.provider || 'ark-plan');
+    add(vp.apiKey ? 'ok' : 'warn', 'vision VLM', `${visionCfg.model || vp.model} @ ${vp.baseUrl}${vp.apiKey ? '' : ' — 缺 apiKey（仅 OCR 可用）'}`);
+  } catch (err) {
+    add('warn', 'vision VLM', err.message);
+  }
+
   // 云端 ASR / 火山语音（可选能力）
   const asrProvider = config.asr?.provider ?? 'whisper-local';
   add('ok', 'asr.provider', asrProvider + (asrProvider === 'minimax-cloud' ? '（音频会上传到 MiniMax）' : '（本地识别）'));
@@ -175,6 +187,7 @@ async function checkFiles() {
     'config/livedub.fast.json',
     'config/livedub.cloud.json',
     'scripts/build-macos.sh',
+    'scripts/build-ocr.sh',
   ];
   for (const rel of required) {
     const ok = fs.existsSync(path.join(PROJECT_ROOT, rel));

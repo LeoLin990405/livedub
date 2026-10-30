@@ -13,9 +13,11 @@
 > 面向**教学视频**（公开课/网课/技术讲座）优化：术语表约束、子句级低延迟配音、原声自动压音。
 >
 
-**v0.3（2026-10-29）**：新增 **云端 ASR（MiniMax，e2e ~2.2s）**、**火山引擎 TTS + 声音复刻（真正原声克隆）**、
-**macOS 桌面悬浮窗（ScreenCaptureKit，覆盖 Zoom/会议/播放器）**、扩展**全局限定压音**（iframe/WebAudio 可压）、
-**裸 video 全屏叠加**；工作台支持本地/云端 ASR 切换与隐私提示。v0.2 的翻译×TTS 重叠、TTS 缓存、三档延迟等见 [CHANGELOG](CHANGELOG.md)。
+**v0.5（2026-10-30）**：**视频画面理解 → 图文笔记**——按画面变化抽关键帧，本地 macOS Vision OCR 提取幻灯片/代码文字，
+可选 VLM 画面语义理解，和双语字幕一起合成「音频 + 画面 + 总结」的图文笔记；快捷笔记自动附带画面文字。
+**v0.4**：学习笔记（Notes API / 工作台笔记抽屉 / 扩展 `Alt+Shift+N` / macOS `⌥N` / CLI / Markdown·Obsidian 导出）。
+**v0.3**：云端 ASR（MiniMax，e2e ~2.2s）、火山 TTS+声音复刻、macOS 桌面悬浮窗、全局限定压音/裸视频全屏。
+详见 [CHANGELOG](CHANGELOG.md)。
 > 形态：Chrome 扩展（任意网页视频） + 本地工作台（本地课程文件 / 回放 / 导出）。
 
 ```text
@@ -47,6 +49,7 @@ YouTube / B站 / 网课页面       本地引擎 (127.0.0.1)               输�
 | 音色克隆 | 火山声音复刻 v3 / MiniMax / 自动降级 preset | 协议已实现（火山需豆包语音 UUID Key，目前本机无此 Key，真机验证了 401→降级路径）；MiniMax Token Plan 返回 2061 自动降级 |
 | 云端 ASR | MiniMax `asr-1.0`（`npm run start:cloud`） | 4s≈0.79s / 12s≈1.0-1.2s；**云端档 e2e ≈2.2–2.4s**，音频会上传、失败自动降级本地 |
 | 学习笔记 | 时间戳 + 双语引用 + 截图 + 代码块 + 大纲；三端快捷记录（工作台 `N`、扩展 `Alt+Shift+N`、桌面 `⌥N`、CLI） | 笔记只落本机 `data/notes/`，导出 Markdown 可直接进 Obsidian（见 [docs/NOTES.md](docs/NOTES.md)） |
+| 图文笔记（画面理解） | 按画面变化抽关键帧 + 本地 macOS Vision OCR（serve 模式首帧 ~0.7–1.5s、后续 0.2–1.5s）+ 可选 VLM 画面语义理解 + 音频字幕综合总结 | demo 3 帧图文笔记全程 ~10s（真实 OCR+DeepSeek）；VLM 单帧约 20–22s（可选，默认关）；见 [docs/NOTES.md](docs/NOTES.md#图文笔记画面理解v05) |
 | 桌面端 | macOS 原生悬浮窗（ScreenCaptureKit） | `apps/macos/` 源码 + `scripts/build-macos.sh`（见 [apps/macos/README.md](apps/macos/README.md)） |
 | 管线 | Node 零依赖引擎，VAD 切分 + 子句级 TTS + 调度压音 | 52.7s 示例课实测：**质量档 e2e 3.0s** / **快速档 2.4s**（ASR 1.8s→0.9s、翻译首字 0.8s、TTS 首包 0.25s；[完整数据](docs/MEASUREMENTS.md)） |
 
@@ -171,12 +174,17 @@ npm run note -- "这里为什么要 detach？" --video "MIT 6.S191" --time 12:34
 
 - 笔记带**视频时间戳**，列表点击直接跳回对应画面；
 - 自动附带**中英双语原句**、可插**视频截图**与**代码块**；
+- **图文笔记（画面理解）**：一键按画面变化抽关键帧 → 本地 OCR 提取幻灯片/代码文字 →（可选）VLM 理解画面 → 和字幕一起生成「音频+画面+总结」的图文笔记；
 - 一键生成按时间轴的**课程大纲**，导出 Markdown（YAML front matter）到 `data/exports/`，可直接放进 Obsidian；
 - 详细用法与隐私说明：[docs/NOTES.md](docs/NOTES.md)。
 
 | 工作台笔记抽屉（真实会话 + 截图/大纲/快捷摘录） | Markdown 预览 |
 |---|---|
 | ![notes](docs/assets/studio-notes.png) | ![notes-preview](docs/assets/studio-notes-preview.png) |
+
+| 图文笔记（真实 OCR + 真实总结） | 图文预览/画廊（幻灯片截图 + OCR 原文） |
+|---|---|
+| ![visual-notes](docs/assets/studio-visual-note.png) | ![visual-gallery](docs/assets/studio-visual-gallery.png) |
 
 ## 目录结构
 

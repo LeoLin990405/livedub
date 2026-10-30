@@ -1,6 +1,6 @@
 {
   "name": "livedub",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "private": true,
   "type": "module",
   "description": "本地优先的实时同传引擎：看教学视频时流式 ASR -> 增量翻译 -> 克隆音色配音 + 双语字幕（Chrome 扩展 + 本地工作台，零运行时依赖）",
@@ -28,7 +28,9 @@
     "build:macos": "bash scripts/build-macos.sh",
     "test:macos": "node --test tests/macos.test.mjs",
     "note": "node scripts/note.mjs",
-    "start:notes": "node engine/server.mjs --open"
+    "start:notes": "node engine/server.mjs --open",
+    "build:ocr": "bash scripts/build-ocr.sh --check",
+    "note:vision": "node scripts/note.mjs --screenshot"
   },
   "license": "MIT",
   "keywords": [

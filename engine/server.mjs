@@ -872,12 +872,12 @@ const NOTES_MAX_JSON_BYTES = 1024 * 1024;
 const NOTES_ASSET_MAX_BYTES = 4 * 1024 * 1024;
 const NOTES_LIST_LIMIT_DEFAULT = 200;
 const NOTES_LIST_LIMIT_MAX = 500;
-const NOTE_KINDS = Object.freeze(['note', 'outline', 'quick', 'marker']);
+const NOTE_KINDS = Object.freeze(['note', 'outline', 'quick', 'marker', 'visual']);
 const NOTE_SOURCES = Object.freeze(['studio', 'extension', 'macos', 'cli']);
 const SAFE_RESOURCE_NAME_RE = /^[A-Za-z0-9._-]+$/;
 const NOTE_ID_RE = /^[A-Za-z0-9._-]{1,120}$/;
 const NOTE_ASSET_FILE_RE = /^[A-Za-z0-9._-]+\.png$/;
-const NOTES_KIND_LABELS = Object.freeze({ note: '笔记', outline: '课程大纲', quick: '快速摘录', marker: '标记' });
+const NOTES_KIND_LABELS = Object.freeze({ note: '笔记', outline: '课程大纲', quick: '快速摘录', marker: '标记', visual: '图文笔记' });
 
 function notesPaths(state) {
   const notesDir = path.join(state.dataDir, 'notes');
@@ -1694,7 +1694,396 @@ function allowedMethodsForPath(pathname) {
   if (pathname === '/api/notes/export') return ['POST'];
   if (pathname === '/api/notes/export.md') return ['GET', 'HEAD'];
   if (pathname.startsWith('/api/notes/')) return ['PUT', 'DELETE'];
+  if (pathname.startsWith('/api/vision/')) {
+    if (pathname === '/api/vision/health') return ['GET', 'HEAD'];
+    return ['POST'];
+  }
   return ['GET', 'HEAD'];
+}
+
+// ------------------------------------------------------ Vision API（v0.5）
+// 依赖 engine/vision/index.mjs（vision teammate 提供），动态 import；模块缺失时端点 503。
+// 输入：raw image/png 或 JSON {imageUrl:"/api/notes/assets/<file>.png"}；绝对 URL/穿越一律拒绝。
+
+const VISION_JSON_LIMIT = 512 * 1024;
+const VISION_IMAGE_MAX_BYTES = 4 * 1024 * 1024;
+const VISION_MODES = Object.freeze(['ocr', 'vision', 'both']);
+const VISION_DEFAULT_TIMEOUT_MS = 90_000;
+const VISION_DEFAULT_OCR_TIMEOUT_MS = 30_000;
+const VISION_DEFAULT_SUMMARY_TIMEOUT_MS = 60_000;
+const VISION_HEALTH_CACHE_MS = 5_000;
+
+function isPngBuffer(buffer) {
+  return Buffer.isBuffer(buffer) && buffer.length >= 8 && buffer[0] === 0x89 && buffer.toString('latin1', 1, 4) === 'PNG';
+}
+
+/** 动态获取视觉服务（懒加载；模块缺失/创建失败缓存 3s 后允许重试，便于热更新） */
+async function getVisionService(state) {
+  if (state.visionService) return state.visionService;
+  if (state.visionServicePromise) return state.visionServicePromise;
+  if (state.visionUnavailableError && Date.now() - (state.visionUnavailableAt ?? 0) < 3000) {
+    throw state.visionUnavailableError;
+  }
+  state.visionServicePromise = (async () => {
+    try {
+      let service = null;
+      if (typeof state.visionFactory === 'function') {
+        service = await Promise.resolve(state.visionFactory({ config: state.config, log: state.log }));
+      } else {
+        const mod = await import('./vision/index.mjs');
+        const factory =
+          typeof mod.createVisionService === 'function'
+            ? mod.createVisionService
+            : typeof mod.default === 'function'
+              ? mod.default
+              : typeof mod.default?.createVisionService === 'function'
+                ? mod.default.createVisionService
+                : null;
+        if (!factory) {
+          throw Object.assign(new Error('engine/vision/index.mjs 未导出 createVisionService'), { code: 'VISION_UNAVAILABLE' });
+        }
+        service = await Promise.resolve(factory({ config: state.config, log: state.log }));
+      }
+      if (!service || typeof service !== 'object') {
+        throw Object.assign(new Error('视觉服务创建失败（createVisionService 返回空）'), { code: 'VISION_UNAVAILABLE' });
+      }
+      state.visionService = service;
+      state.visionUnavailableError = null;
+      state.visionUnavailableAt = 0;
+      state.log('视觉服务已就绪（engine/vision/index.mjs）');
+      return service;
+    } catch (err) {
+      const unavailable = Object.assign(new Error(`视觉模块未就绪：${err?.message ?? err}`), {
+        code: 'VISION_UNAVAILABLE',
+        cause: err,
+      });
+      state.visionService = null;
+      state.visionUnavailableError = unavailable;
+      state.visionUnavailableAt = Date.now();
+      throw unavailable;
+    } finally {
+      state.visionServicePromise = null;
+    }
+  })();
+  return state.visionServicePromise;
+}
+
+function visionUnavailablePayload(err) {
+  return {
+    ok: false,
+    error: 'vision_unavailable',
+    message: err?.message ?? '视觉模块未就绪：缺少 engine/vision/index.mjs（由 vision 提供），可用本地 OCR/VLM 相关构建步骤后重启',
+  };
+}
+
+/** vision.* 超时包装：慢操作（VLM 20-30s）可配 vision.timeoutMs（默认 90s） */
+async function callVisionWithTimeout(task, timeoutMs, label) {
+  let timer = null;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => {
+      const error = new Error(`${label}超时（${Math.round(timeoutMs / 1000)} 秒）`);
+      error.code = 'VISION_TIMEOUT';
+      error.status = 504;
+      reject(error);
+    }, Math.max(1000, Math.round(timeoutMs) || VISION_DEFAULT_TIMEOUT_MS));
+    timer.unref?.();
+  });
+  try {
+    return await Promise.race([Promise.resolve().then(task), timeout]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function visionTimeoutFor(state, kind) {
+  const visionConfig = state.config?.vision ?? {};
+  const pick = (...values) => {
+    for (const value of values) {
+      const number = Number(value);
+      if (Number.isFinite(number) && number > 0) return number;
+    }
+    return null;
+  };
+  if (kind === 'ocr') return pick(visionConfig.ocrTimeoutMs, visionConfig.timeoutMs) ?? VISION_DEFAULT_OCR_TIMEOUT_MS;
+  if (kind === 'summarize') return pick(visionConfig.summaryTimeoutMs, visionConfig.timeoutMs) ?? VISION_DEFAULT_SUMMARY_TIMEOUT_MS;
+  return pick(visionConfig.timeoutMs) ?? VISION_DEFAULT_TIMEOUT_MS;
+}
+
+/** vision 异常 -> HTTP 可读错误（区分超时/未配置/其它失败） */
+function mapVisionError(err) {
+  const message = String(err?.message ?? err ?? '视觉处理失败');
+  if (err?.status === 504 || err?.code === 'VISION_TIMEOUT' || /超时|timeout/i.test(message)) {
+    return { status: 504, error: 'vision_timeout', message };
+  }
+  if (/not configured|未配置|缺少.*(key|api|provider)|api key|apiKey|unauthorized|401|not support|不支持|cannot|no .*provider/i.test(message)) {
+    return { status: 502, error: 'vision_not_configured', message };
+  }
+  return { status: 502, error: 'vision_failed', message };
+}
+
+function sendVisionError(res, mapped) {
+  return sendJson(res, mapped.status, { ok: false, error: mapped.error, message: mapped.message });
+}
+
+/** 读取视觉输入：raw PNG 或 JSON {imageUrl}（仅允许本机 notes assets 相对路径，防穿越） */
+async function readVisionImageInput(state, req) {
+  const contentType = String(req.headers['content-type'] ?? '').toLowerCase();
+  if (contentType.startsWith('image/png')) {
+    const raw = await readRawBodyForNotes(req, VISION_IMAGE_MAX_BYTES);
+    if (!raw.ok) return { ok: false, status: raw.status, error: raw.error.code, message: raw.error.message };
+    if (!isPngBuffer(raw.buffer)) return { ok: false, status: 400, error: 'invalid_png', message: '文件不是合法 PNG' };
+    return { ok: true, png: raw.buffer, imageUrl: null };
+  }
+  const parsed = await readJsonBodyForNotes(req, VISION_JSON_LIMIT);
+  if (!parsed.ok) return { ok: false, status: parsed.status, error: parsed.error.code, message: parsed.error.message };
+  const body = parsed.value && typeof parsed.value === 'object' ? parsed.value : {};
+  const rawUrl = typeof body.imageUrl === 'string' ? body.imageUrl.trim() : '';
+  if (!rawUrl) {
+    return {
+      ok: false,
+      status: 400,
+      error: 'missing_image',
+      message: '需要 raw image/png，或 JSON {imageUrl:"/api/notes/assets/<file>.png"}',
+    };
+  }
+  if (!/^\/api\/notes\/assets\/[A-Za-z0-9._-]+\.png$/.test(rawUrl) || rawUrl.includes('..')) {
+    return {
+      ok: false,
+      status: 400,
+      error: 'invalid_image_url',
+      message: 'imageUrl 必须指向本机 /api/notes/assets/<file>.png（拒绝绝对 URL、目录穿越）',
+    };
+  }
+  const file = path.join(notesPaths(state).assetsDir, rawUrl.split('/').pop());
+  let stat;
+  try {
+    stat = fs.statSync(file);
+  } catch {
+    return { ok: false, status: 404, error: 'image_not_found', message: '截图不存在（先 POST /api/notes/assets）' };
+  }
+  if (!stat.isFile()) return { ok: false, status: 404, error: 'image_not_found', message: '截图不存在' };
+  if (stat.size > VISION_IMAGE_MAX_BYTES) return { ok: false, status: 413, error: 'image_too_large', message: '图片超过 4MB 上限' };
+  try {
+    return { ok: true, png: fs.readFileSync(file), imageUrl: rawUrl };
+  } catch (err) {
+    return { ok: false, status: 500, error: 'image_read_failed', message: `读取截图失败：${err?.message ?? err}` };
+  }
+}
+
+/** 校验 summarize 请求体（transcript≤200 / visuals≤80 / body≤512KB 由 reader 限制） */
+function normalizeSummarizeInput(input) {
+  const fail = (code, message, field) => ({ ok: false, error: { code, message, ...(field ? { field } : {}) } });
+  if (!input || typeof input !== 'object' || Array.isArray(input)) return fail('invalid_body', '请求体必须是 JSON 对象');
+  const allowed = new Set(['title', 'transcript', 'visuals', 'lang']);
+  for (const key of Object.keys(input)) {
+    if (!allowed.has(key)) return fail('unknown_field', `不支持的字段：${key}`, key);
+  }
+  const title = typeof input.title === 'string' && input.title.trim() ? input.title.trim().slice(0, 300) : '未命名视频';
+  const lang = typeof input.lang === 'string' && input.lang.trim() ? input.lang.trim().slice(0, 20) : 'zh';
+  if (!Array.isArray(input.transcript)) return fail('invalid_transcript', 'transcript 必须是数组', 'transcript');
+  if (input.transcript.length > 200) return fail('too_many_transcript', 'transcript 最多 200 句', 'transcript');
+  const transcript = [];
+  for (const item of input.transcript) {
+    if (!item || typeof item !== 'object' || Array.isArray(item)) continue;
+    const src = typeof item.src === 'string' ? item.src.slice(0, 2000) : '';
+    const dst = typeof item.dst === 'string' ? item.dst.slice(0, 2000) : '';
+    if (!src && !dst) continue;
+    transcript.push({
+      t0Ms: Math.max(0, Math.round(Number(item.t0Ms) || 0)),
+      t1Ms: Math.max(0, Math.round(Number(item.t1Ms) || Number(item.t0Ms) || 0)),
+      src,
+      dst,
+    });
+  }
+  const visualsInput = input.visuals ?? [];
+  if (!Array.isArray(visualsInput)) return fail('invalid_visuals', 'visuals 必须是数组', 'visuals');
+  if (visualsInput.length > 80) return fail('too_many_visuals', 'visuals 最多 80 条', 'visuals');
+  const visuals = [];
+  for (const item of visualsInput) {
+    if (!item || typeof item !== 'object' || Array.isArray(item)) continue;
+    const ocrText = typeof item.ocrText === 'string' ? item.ocrText.slice(0, 5000) : '';
+    const caption = typeof item.caption === 'string' ? item.caption.slice(0, 3000) : '';
+    if (!ocrText && !caption) continue;
+    visuals.push({
+      tMs: Math.max(0, Math.round(Number(item.tMs) || 0)),
+      ocrText,
+      ...(caption ? { caption } : {}),
+    });
+  }
+  return { ok: true, value: { title, lang, transcript, visuals } };
+}
+
+/** /api/vision/health 的规范化返回（不含密钥） */
+function buildVisionHealthPayload(rawHealth) {
+  const health = rawHealth && typeof rawHealth === 'object' ? rawHealth : {};
+  const ocr = health.ocr && typeof health.ocr === 'object' ? health.ocr : {};
+  const vision = health.vision && typeof health.vision === 'object' ? health.vision : {};
+  const pick = (source) => ({
+    available: source.available !== false && Boolean(source.available || source.provider || source.bin),
+    provider: source.provider ?? null,
+    ...(source.model ? { model: String(source.model) } : {}),
+    ...(source.bin ? { bin: toProjectRelative(source.bin) } : {}),
+    ...(source.reason ? { reason: String(source.reason).slice(0, 400) } : {}),
+    ...(Number.isFinite(Number(source.filesize)) ? { filesize: Number(source.filesize) } : {}),
+  });
+  const ocrInfo = pick(ocr);
+  const visionInfo = pick(vision);
+  return {
+    ok: true,
+    ready: Boolean(health.ready ?? (ocrInfo.available || visionInfo.available)),
+    ocr: ocrInfo,
+    vision: visionInfo,
+    ...(health.provider ? { provider: String(health.provider) } : {}),
+    ...(health.ms != null ? { ms: Number(health.ms) || 0 } : {}),
+  };
+}
+
+/** /health 的 vision 摘要（可用性/默认 provider；不阻塞主健康检查，5s 缓存，绝不带密钥） */
+async function visionHealthSummary(state) {
+  const now = Date.now();
+  if (state.visionHealthCache && now - state.visionHealthCache.at < VISION_HEALTH_CACHE_MS) {
+    return state.visionHealthCache.value;
+  }
+  let value;
+  try {
+    const service = await getVisionService(state);
+    const raw = await callVisionWithTimeout(
+      () => (typeof service.health === 'function' ? service.health() : { ready: true }),
+      2000,
+      '视觉健康检查',
+    );
+    const payload = buildVisionHealthPayload(raw);
+    value = {
+      available: true,
+      ready: payload.ready,
+      ocr: { available: payload.ocr.available, provider: payload.ocr.provider ?? null },
+      vision: { available: payload.vision.available, provider: payload.vision.provider ?? null, ...(payload.vision.model ? { model: payload.vision.model } : {}) },
+      provider: payload.provider ?? payload.ocr.provider ?? payload.vision.provider ?? null,
+    };
+  } catch (err) {
+    value = { available: false, reason: String(err?.message ?? err).slice(0, 400) };
+  }
+  state.visionHealthCache = { at: now, value };
+  return value;
+}
+
+async function handleVisionRequest(state, req, res, { method, pathname, url }) {
+  const head = method === 'HEAD';
+
+  if (pathname === '/api/vision/health') {
+    let service;
+    try {
+      service = await getVisionService(state);
+    } catch (err) {
+      return sendJson(res, 503, visionUnavailablePayload(err));
+    }
+    if (typeof service.health !== 'function') {
+      return sendJson(res, 200, buildVisionHealthPayload({ ready: true }), { head });
+    }
+    try {
+      const raw = await callVisionWithTimeout(() => service.health(), 5000, '视觉健康检查');
+      return sendJson(res, 200, buildVisionHealthPayload(raw), { head });
+    } catch (err) {
+      const mapped = mapVisionError(err);
+      return sendJson(res, mapped.status === 504 ? 504 : 502, { ok: false, error: mapped.error, message: mapped.message });
+    }
+  }
+
+  let service;
+  try {
+    service = await getVisionService(state);
+  } catch (err) {
+    return sendJson(res, 503, visionUnavailablePayload(err));
+  }
+
+  if (pathname === '/api/vision/ocr') {
+    if (typeof service.ocr !== 'function') {
+      return sendJson(res, 503, { ok: false, error: 'vision_unavailable', message: '视觉服务未提供 ocr()' });
+    }
+    const input = await readVisionImageInput(state, req);
+    if (!input.ok) return sendJson(res, input.status, { ok: false, error: input.error, message: input.message });
+    try {
+      const result = await callVisionWithTimeout(() => service.ocr({ png: input.png }), visionTimeoutFor(state, 'ocr'), 'OCR ');
+      return sendJson(res, 200, {
+        ok: true,
+        text: String(result?.text ?? ''),
+        lines: Array.isArray(result?.lines) ? result.lines : [],
+        provider: result?.provider ?? null,
+        ms: Number(result?.ms) || 0,
+        ...(input.imageUrl ? { imageUrl: input.imageUrl } : {}),
+      });
+    } catch (err) {
+      return sendVisionError(res, mapVisionError(err));
+    }
+  }
+
+  if (pathname === '/api/vision/analyze') {
+    if (typeof service.analyze !== 'function') {
+      return sendJson(res, 503, { ok: false, error: 'vision_unavailable', message: '视觉服务未提供 analyze()' });
+    }
+    const mode = String(url.searchParams.get('mode') ?? 'ocr').toLowerCase();
+    if (!VISION_MODES.includes(mode)) {
+      return sendJson(res, 400, {
+        ok: false,
+        error: 'invalid_mode',
+        message: `mode 必须是 ${VISION_MODES.join(' / ')}`,
+        allowed: [...VISION_MODES],
+      });
+    }
+    const input = await readVisionImageInput(state, req);
+    if (!input.ok) return sendJson(res, input.status, { ok: false, error: input.error, message: input.message });
+    try {
+      const result = await callVisionWithTimeout(
+        () => service.analyze({ png: input.png, mode }),
+        visionTimeoutFor(state, mode === 'ocr' ? 'ocr' : 'vision'),
+        mode === 'ocr' ? 'OCR ' : '画面理解（VLM）',
+      );
+      const payload = {
+        ok: true,
+        mode,
+        provider: result?.caption?.provider ?? result?.ocr?.provider ?? result?.provider ?? null,
+        ms: Number(result?.ms) || (Number(result?.ocr?.ms) || 0) + (Number(result?.caption?.ms) || 0),
+        ...(result?.ocr ? { ocr: result.ocr } : {}),
+        ...(result?.caption ? { caption: result.caption } : {}),
+        ...(input.imageUrl ? { imageUrl: input.imageUrl } : {}),
+      };
+      return sendJson(res, 200, payload);
+    } catch (err) {
+      return sendVisionError(res, mapVisionError(err));
+    }
+  }
+
+  if (pathname === '/api/vision/summarize') {
+    if (typeof service.summarize !== 'function') {
+      return sendJson(res, 503, { ok: false, error: 'vision_unavailable', message: '视觉服务未提供 summarize()' });
+    }
+    const parsed = await readJsonBodyForNotes(req, VISION_JSON_LIMIT);
+    if (!parsed.ok) return sendJson(res, parsed.status, { ok: false, error: parsed.error.code, message: parsed.error.message });
+    const normalized = normalizeSummarizeInput(parsed.value);
+    if (!normalized.ok) {
+      return sendJson(res, 400, { ok: false, error: normalized.error.code, message: normalized.error.message, ...(normalized.error.field ? { field: normalized.error.field } : {}) });
+    }
+    try {
+      const { title, transcript, visuals, lang } = normalized.value;
+      const result = await callVisionWithTimeout(
+        () => service.summarize({ title, transcript, visuals, lang }),
+        visionTimeoutFor(state, 'summarize'),
+        '图文总结',
+      );
+      return sendJson(res, 200, {
+        ok: true,
+        summary: String(result?.summary ?? ''),
+        keyPoints: Array.isArray(result?.keyPoints) ? result.keyPoints.map((point) => String(point)).slice(0, 20) : [],
+        provider: result?.provider ?? null,
+        model: result?.model ?? null,
+        ms: Number(result?.ms) || 0,
+      });
+    } catch (err) {
+      return sendVisionError(res, mapVisionError(err));
+    }
+  }
+
+  return sendJson(res, 404, { ok: false, error: 'not_found', message: '视觉路由不存在' });
 }
 
 function createRequestHandler(state) {
@@ -1745,7 +2134,16 @@ function createRequestHandler(state) {
           state.log(`whisper 状态探测失败（不影响 /health）：${err?.message ?? err}`);
           health.whisper.server = { running: null, source: 'unknown', error: 'status probe failed' };
         }
+        try {
+          health.vision = await visionHealthSummary(state);
+        } catch (err) {
+          health.vision = { available: false, reason: String(err?.message ?? err).slice(0, 300) };
+        }
         return sendJson(res, 200, health, { head: method === 'HEAD' });
+      }
+
+      if (pathname === '/api/vision' || pathname.startsWith('/api/vision/')) {
+        return await handleVisionRequest(state, req, res, { method, pathname, url });
       }
 
       if (pathname === '/api/notes' || pathname.startsWith('/api/notes/')) {
@@ -2497,6 +2895,13 @@ export async function startServer(options = {}) {
     // v0.4：共享 Notes API（data/notes、data/exports；文件级串行化 + 原子写）
     noteQueues: new Map(),
     notesStatsCache: null,
+    // v0.5：视觉服务（懒加载 engine/vision/index.mjs；测试可注入 visionService/visionFactory）
+    visionService: options.visionService ?? null,
+    visionFactory: typeof options.visionFactory === 'function' ? options.visionFactory : null,
+    visionServicePromise: null,
+    visionUnavailableError: null,
+    visionUnavailableAt: 0,
+    visionHealthCache: null,
     env,
   };
 
@@ -2603,6 +3008,11 @@ export async function startServer(options = {}) {
     });
     // 重要：共享 whisper-server 不随会话关闭；引擎退出时必须显式收尾，避免 18765 残留孤儿进程。
     if (state.closeAsrOnShutdown) await closeSharedWhisperServers(state);
+    try {
+      await state.visionService?.dispose?.();
+    } catch (err) {
+      log(`释放视觉服务失败（不影响退出）：${err?.message ?? err}`);
+    }
     log('livedub 引擎已关闭');
   }
 
@@ -2755,6 +3165,17 @@ async function main(argv = process.argv.slice(2)) {
   line('并发', `最多 ${started.maxSessions} 个会话（config.server.maxSessions）`);
   const notesStats = getNotesStats(started.state);
   line('笔记', `${notesStats.count} 条 · ${notesStats.notesDir}（导出 ${notesStats.exportsDir}）`);
+  try {
+    const vision = await visionHealthSummary(started.state);
+    line(
+      '视觉',
+      vision.available
+        ? `OCR ${vision.ocr?.available ? '可用' : '不可用'} · 画面理解 ${vision.vision?.available ? '可用' : '不可用'}${vision.provider ? `（${vision.provider}）` : ''}`
+        : '未就绪（缺少 engine/vision/index.mjs 或依赖）',
+    );
+  } catch (err) {
+    line('视觉', `检测失败：${err?.message ?? err}`);
+  }
   line('凭据', saylessPath ? `~/.sayless 配置已发现` : '未发现 ~/.sayless/config.json（可使用 --demo 体验）');
   console.log('  ─────────────────────────────────────────────');
   console.log('  按 Ctrl+C 退出');

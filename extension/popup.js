@@ -14,12 +14,14 @@ import {
   DEFAULT_SETTINGS,
   MSG,
   STORAGE_KEYS,
+  deriveEngineHttpBase,
   deriveHealthUrl,
   deriveStudioUrl,
   isCapturablePage,
   normalizeEngineUrl,
 } from './lib/constants.js';
 import { formatLatency, pickLatencyMs } from './lib/pcm.js';
+import { visionEndpoint, visionHealthSummary } from './lib/notes.js';
 
 const $ = (id) => document.getElementById(id);
 
@@ -58,6 +60,9 @@ const ui = {
   exportNotes: $('export-notes'),
   noteScreenshot: $('note-screenshot'),
   noteHint: $('note-hint'),
+  visionHealth: $('vision-health'),
+  visionOcr: $('vision-ocr'),
+  visionCaption: $('vision-caption'),
 };
 
 const runtime = {
@@ -66,6 +71,8 @@ const runtime = {
   busy: false,
   errorTimer: null,
   health: { state: 'unknown', data: null, error: '' },
+  /** v0.5：视觉能力健康状态（GET /api/vision/health 解析结果） */
+  visionHealth: null,
 };
 
 // ---------------------------------------------------------------------------
@@ -246,7 +253,18 @@ function render() {
   const queueCount = (runtime.bgState && runtime.bgState.noteQueueCount) || 0;
   ui.noteStats.textContent = `今日 ${todayCount} 条 · 待同步 ${queueCount}`;
   ui.noteScreenshot.checked = runtime.settings.noteScreenshot !== false;
-  ui.noteHint.textContent = '快捷键 Alt+Shift+N 记笔记 · Alt+Shift+L 开始/停止。截图与笔记只存本机 data/notes/。';
+  ui.visionOcr.checked = runtime.settings.visionOcr !== false;
+  ui.visionCaption.checked = runtime.settings.visionCaption === true;
+  const visionHealth = runtime.visionHealth || (runtime.bgState && runtime.bgState.visionHealth) || null;
+  if (visionHealth && (visionHealth.ocrLabel || visionHealth.visionLabel)) {
+    ui.visionHealth.textContent = `${visionHealth.ocrLabel || 'OCR ?'} · ${visionHealth.visionLabel || 'VLM ?'}`;
+  } else if (runtime.health.state === 'online') {
+    ui.visionHealth.textContent = '未检测到视觉接口（旧引擎）';
+  } else {
+    ui.visionHealth.textContent = '—';
+  }
+  ui.noteHint.textContent =
+    '快捷键 Alt+Shift+N 记笔记 · Alt+Shift+L 开始/停止。截图与笔记只存本机 data/notes/；画面理解（VLM）较慢且消耗模型额度。';
 
   renderHealth();
   renderGuidance();
@@ -324,8 +342,10 @@ async function probeEngineHealth({ silent = false } = {}) {
     if (!response.ok) throw new Error(`/health 返回 HTTP ${response.status}`);
     const data = await response.json();
     runtime.health = { state: 'online', data, error: '' };
+    void probeVisionHealth();
   } catch (err) {
     runtime.health = { state: 'offline', data: null, error: describeFetchError(err) };
+    runtime.visionHealth = null;
     if (!silent) {
       showError(
         `无法连接本地引擎（${runtime.health.error}）。请在 livedub 目录执行 npm start，确认 http://127.0.0.1:8787/health 可访问后点「重新检测」。`,
@@ -335,6 +355,37 @@ async function probeEngineHealth({ silent = false } = {}) {
   }
   renderHealth();
   renderGuidance();
+}
+
+// ---------------------------------------------------------------------------
+// v0.5 视觉能力健康检查（GET /api/vision/health；旧引擎 404 -> 显示不可用）
+// ---------------------------------------------------------------------------
+
+async function probeVisionHealth() {
+  const base = deriveEngineHttpBase(runtime.settings.engineUrl);
+  if (!base) {
+    runtime.visionHealth = null;
+    return;
+  }
+  const visionUrl = visionEndpoint(base, 'health');
+  try {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 2500);
+    let response;
+    try {
+      response = await fetch(visionUrl, { cache: 'no-store', signal: controller.signal });
+    } finally {
+      clearTimeout(timer);
+    }
+    if (!response.ok) {
+      runtime.visionHealth = { ...visionHealthSummary(null), error: `HTTP ${response.status}` };
+    } else {
+      runtime.visionHealth = visionHealthSummary(await response.json());
+    }
+  } catch (err) {
+    runtime.visionHealth = { ...visionHealthSummary(null), error: describeFetchError(err) };
+  }
+  render();
 }
 
 // ---------------------------------------------------------------------------
@@ -612,6 +663,15 @@ function bindEvents() {
 
   ui.noteScreenshot.addEventListener('change', async () => {
     await saveSettings({ noteScreenshot: ui.noteScreenshot.checked });
+  });
+
+  ui.visionOcr.addEventListener('change', async () => {
+    await saveSettings({ visionOcr: ui.visionOcr.checked });
+  });
+
+  ui.visionCaption.addEventListener('change', async () => {
+    await saveSettings({ visionCaption: ui.visionCaption.checked });
+    if (ui.visionCaption.checked) showError('已开启画面理解（VLM）：每次记笔记会慢约 20-30s，并消耗模型额度', 'info');
   });
 
   ui.voiceMode.addEventListener('change', async () => {

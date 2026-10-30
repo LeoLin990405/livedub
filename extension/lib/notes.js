@@ -410,3 +410,182 @@ export function createNoteQueue({ storage = null, maxNotes = NOTE_QUEUE_LIMIT, k
     },
   };
 }
+
+// ---------------------------------------------------------------------------
+// v0.5 视觉理解（OCR / VLM）：把截图内容写进笔记正文
+// ---------------------------------------------------------------------------
+
+/** 画面文字/画面理解文本上限（清洗后截断） */
+export const VISION_TEXT_LIMIT = 2000;
+/** OCR 请求超时（本地 OCR ~1s） */
+export const VISION_OCR_TIMEOUT_MS = 15000;
+/** VLM analyze 超时（视觉模型 20-30s/次，留余量） */
+export const VISION_ANALYZE_TIMEOUT_MS = 45000;
+
+/**
+ * 视觉端点 URL：/api/vision/ocr | /api/vision/analyze | /api/vision/health
+ * @param {string} httpBase
+ * @param {'ocr'|'analyze'|'health'} kind
+ * @returns {string}
+ */
+export function visionEndpoint(httpBase, kind) {
+  const base = String(httpBase || '').replace(/\/+$/, '');
+  const paths = {
+    ocr: '/api/vision/ocr',
+    analyze: '/api/vision/analyze',
+    health: '/api/vision/health',
+  };
+  const path = paths[kind];
+  if (!path) throw new Error(`unknown vision endpoint: ${kind}`);
+  return `${base}${path}`;
+}
+
+/**
+ * 清洗画面理解文本：去控制字符、压缩空白/空行、trim、截断 2000 字。
+ * 保留换行（OCR 多行文字有意义），但最多保留连续 2 个换行。
+ * @param {unknown} text
+ * @param {{maxLen?:number}} [opts]
+ * @returns {string}
+ */
+export function sanitizeVisionText(text, { maxLen = VISION_TEXT_LIMIT } = {}) {
+  if (text == null) return '';
+  const limit = Number.isFinite(maxLen) && maxLen > 0 ? Math.floor(maxLen) : VISION_TEXT_LIMIT;
+  const clean = String(text)
+    .replace(/\r\n?/g, '\n')
+    .replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g, '')
+    .replace(/[ \t]+/g, ' ')
+    .replace(/ *\n */g, '\n')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+  if (clean.length <= limit) return clean;
+  return `${clean.slice(0, Math.max(1, limit - 1)).trimEnd()}…`;
+}
+
+/**
+ * 用足够长的反引号围栏包住文本（内容里有 ``` 时自动用更长的围栏，避免破坏 Markdown）。
+ * @param {unknown} text
+ * @param {{lang?:string}} [opts]
+ * @returns {string}
+ */
+export function buildFencedCode(text, { lang = '' } = {}) {
+  const content = String(text == null ? '' : text).replace(/\r\n?/g, '\n').replace(/\s+$/, '');
+  if (!content) return '';
+  const runs = content.match(/`+/g) || [];
+  const longest = runs.reduce((max, run) => Math.max(max, run.length), 0);
+  const fence = '`'.repeat(Math.max(3, longest + 1));
+  const language = String(lang || '').replace(/[^A-Za-z0-9_+.-]/g, '');
+  return `${fence}${language}\n${content}\n${fence}`;
+}
+
+/**
+ * 「画面文字（OCR）」Markdown 段；无文字返回空字符串（不写空块）。
+ * @param {unknown} text
+ * @returns {string}
+ */
+export function buildVisionOcrSection(text) {
+  const clean = sanitizeVisionText(text);
+  if (!clean) return '';
+  return `**画面文字**（OCR）：\n\n${buildFencedCode(clean)}`;
+}
+
+/**
+ * 「画面理解」Markdown 段（VLM caption）；空返回空字符串。
+ * @param {unknown} caption
+ * @returns {string}
+ */
+export function buildVisionCaptionSection(caption) {
+  const clean = sanitizeVisionText(caption);
+  if (!clean) return '';
+  return `**画面理解**：\n\n${clean}`;
+}
+
+/**
+ * 把 OCR/画面理解拼进笔记正文（保留原文/译文/记录结构，sections 追加在末尾）。
+ * @param {{baseBody?:string, ocr?:unknown, caption?:unknown}} input
+ * @returns {string}
+ */
+export function buildEnrichedNoteBody({ baseBody = '', ocr = '', caption = '' } = {}) {
+  const base = String(baseBody == null ? '' : baseBody).replace(/\s+$/, '');
+  const sections = [buildVisionOcrSection(ocr), buildVisionCaptionSection(caption)].filter(Boolean);
+  if (sections.length === 0) return base;
+  return `${base ? `${base}\n\n` : ''}${sections.join('\n\n')}\n`;
+}
+
+/**
+ * 纯文本兜底（POST /api/notes/quick 的 text 字段）：追加视觉段落。
+ * @param {unknown} text
+ * @param {{ocr?:unknown, caption?:unknown}} [vision]
+ * @returns {string}
+ */
+export function appendVisionToText(text, { ocr = '', caption = '' } = {}) {
+  const base = String(text == null ? '' : text).trim() || '（无字幕）';
+  const sections = [buildVisionOcrSection(ocr), buildVisionCaptionSection(caption)].filter(Boolean);
+  if (sections.length === 0) return base;
+  return `${base}\n\n${sections.join('\n\n')}`;
+}
+
+/** 从 OCR 响应里取文本：{ok,text,lines} / {ocr:{text}} */
+export function pickVisionOcrText(response) {
+  if (!response || typeof response !== 'object') return '';
+  if (typeof response.text === 'string') return sanitizeVisionText(response.text);
+  if (Array.isArray(response.lines)) {
+    const lines = response.lines
+      .map((line) => (typeof line === 'string' ? line : line && (line.text || line.value)))
+      .filter((line) => typeof line === 'string' && line.trim());
+    if (lines.length > 0) return sanitizeVisionText(lines.join('\n'));
+  }
+  if (response.ocr) {
+    if (typeof response.ocr === 'string') return sanitizeVisionText(response.ocr);
+    if (typeof response.ocr.text === 'string') return sanitizeVisionText(response.ocr.text);
+  }
+  return '';
+}
+
+/**
+ * 从 analyze 响应取 {ocr, caption}：
+ * 契约 {ok,mode,ocr?,caption?:{text,provider,model,ms}}，兼容 caption 为字符串/ocr 为对象。
+ * @param {unknown} response
+ * @returns {{ocr:string, caption:string}}
+ */
+export function pickVisionAnalysis(response) {
+  if (!response || typeof response !== 'object') return { ocr: '', caption: '' };
+  const ocr = pickVisionOcrText(response);
+  let caption = '';
+  const rawCaption = response.caption;
+  if (typeof rawCaption === 'string') caption = sanitizeVisionText(rawCaption);
+  else if (rawCaption && typeof rawCaption.text === 'string') caption = sanitizeVisionText(rawCaption.text);
+  else if (typeof response.vision === 'string') caption = sanitizeVisionText(response.vision);
+  else if (response.vision && typeof response.vision.text === 'string') caption = sanitizeVisionText(response.vision.text);
+  return { ocr, caption };
+}
+
+/**
+ * 解析 GET /api/vision/health：
+ * 契约 {ok,ocr:{ok,provider,bin},vision:{configured,provider,model},ready}；
+ * 兼容旧版/简化形态（{ok,ocr:true,vision:false} / {ready:false,error}）。
+ * @param {unknown} response
+ * @returns {{available:boolean, ready:boolean, ocr:boolean, vision:boolean, ocrLabel:string, visionLabel:string, error:string}}
+ */
+export function visionHealthSummary(response) {
+  const empty = { available: false, ready: false, ocr: false, vision: false, ocrLabel: '不可用', visionLabel: '不可用', error: '' };
+  if (!response || typeof response !== 'object') return empty;
+  const ocrRaw = response.ocr;
+  const visionRaw = response.vision;
+  const ocrOk = typeof ocrRaw === 'boolean' ? ocrRaw : !!(ocrRaw && typeof ocrRaw === 'object' && ocrRaw.ok !== false && (ocrRaw.ok || ocrRaw.provider || ocrRaw.bin));
+  const visionConfigured =
+    typeof visionRaw === 'boolean'
+      ? visionRaw
+      : !!(visionRaw && typeof visionRaw === 'object' && (visionRaw.configured === true || (visionRaw.provider && visionRaw.model)));
+  const ready = response.ready === true || (response.ok === true && ocrOk);
+  const ocrProvider = ocrRaw && typeof ocrRaw === 'object' ? String(ocrRaw.provider || '') : '';
+  const visionProvider = visionRaw && typeof visionRaw === 'object' ? String(visionRaw.provider || '') : '';
+  return {
+    available: ready && (ocrOk || visionConfigured),
+    ready,
+    ocr: ocrOk,
+    vision: visionConfigured,
+    ocrLabel: ocrOk ? (ocrProvider ? `OCR ${ocrProvider}` : 'OCR 可用') : 'OCR 不可用',
+    visionLabel: visionConfigured ? (visionProvider ? `VLM ${visionProvider}` : 'VLM 已配置') : 'VLM 未配置',
+    error: typeof response.error === 'string' ? response.error : typeof response.message === 'string' ? response.message : '',
+  };
+}

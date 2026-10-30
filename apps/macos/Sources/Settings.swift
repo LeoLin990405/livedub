@@ -29,6 +29,8 @@ final class Settings {
         static let autoStart = prefix + "autoStart"
         static let notesIncludeScreenshot = prefix + "notesIncludeScreenshot"
         static let notesWhenPaused = prefix + "notesWhenPaused"
+        static let notesOCR = prefix + "notesOCR"
+        static let notesVision = prefix + "notesVision"
     }
 
     init(defaults: UserDefaults = .standard) {
@@ -154,6 +156,18 @@ final class Settings {
     var notesWhenPaused: Bool {
         get { bool(forKey: Key.notesWhenPaused, default: true) }
         set { defaults.set(newValue, forKey: Key.notesWhenPaused) }
+    }
+
+    /// 记笔记时识别画面文字（OCR，快，默认开；需要引擎 v0.5 + 本地 OCR）
+    var notesOCR: Bool {
+        get { bool(forKey: Key.notesOCR, default: true) }
+        set { defaults.set(newValue, forKey: Key.notesOCR) }
+    }
+
+    /// 记笔记时用 VLM 做「画面理解」（慢，约 20-30s，默认关；可能产生云端费用）
+    var notesVision: Bool {
+        get { bool(forKey: Key.notesVision, default: false) }
+        set { defaults.set(newValue, forKey: Key.notesVision) }
     }
 
     var langFrom: String {

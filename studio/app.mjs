@@ -9,6 +9,20 @@
  * 用会话 JSONL 驱动同一套 UI，用于离线演示与无头截图。
  */
 import {
+  buildVisualNoteMarkdown,
+  collectTranscript,
+  contactSheetLayout,
+  changedPixelRatio,
+  extractImageUrls,
+  frameChangeRatio,
+  normalizeVisionHealth,
+  resolveKeyframeOptions,
+  sampleTimes,
+  shouldAcceptFrame,
+  toGrayscale,
+  visualNoteTags,
+} from './vision-kit.mjs';
+import {
   buildNoteExportFilename,
   buildNotesMarkdown,
   buildOutlineMarkdown,
@@ -81,6 +95,22 @@ const els = {
   notesCount: $('notesCount'),
   btnNotesNew: $('btnNotesNew'),
   btnNotesOutline: $('btnNotesOutline'),
+  btnNotesVisual: $('btnNotesVisual'),
+  btnCaptureVisual: $('btnCaptureVisual'),
+  visualModal: $('visualModal'),
+  visualVideoTitle: $('visualVideoTitle'),
+  visualVisionBadge: $('visualVisionBadge'),
+  visualRange: $('visualRange'),
+  visualVlm: $('visualVlm'),
+  visualPlan: $('visualPlan'),
+  visualProgress: $('visualProgress'),
+  visualProgressBar: $('visualProgressBar'),
+  visualProgressText: $('visualProgressText'),
+  visualError: $('visualError'),
+  btnVisualClose: $('btnVisualClose'),
+  btnVisualCancel: $('btnVisualCancel'),
+  btnVisualStart: $('btnVisualStart'),
+  visualFootHint: $('visualFootHint'),
   btnNotesClose: $('btnNotesClose'),
   notesExportMenu: $('notesExportMenu'),
   notesOfflineBanner: $('notesOfflineBanner'),
@@ -265,6 +295,8 @@ const state = {
   media: { name: '', url: '', objectUrl: null, isFile: false, size: null },
   // v0.4：当前视频身份（Notes API 的 VideoRef 基础）+ 学习笔记状态
   video: null,
+  vision: { available: null, health: null, checkedAt: null, checking: false },
+  visual: { open: false, running: false, cancelled: false, sampling: false, phase: 'idle', debug: {}, range: 'rest', vlm: false, abort: null, lastError: null },
   notes: {
     open: false,
     loadedFor: null,
@@ -2205,6 +2237,7 @@ function onVideoChanged() {
   setNotesTab('edit');
   renderNotesAll();
   updateNotesBadge(0);
+  renderVisionAvailability();
   if (videoId) void refreshNotes({ silent: true });
 }
 
@@ -2230,7 +2263,7 @@ function isLocalNoteId(id) {
 
 // ------------------------------------------------------------ Notes API client
 
-async function notesFetch(pathname, { method = 'GET', body, rawBody = null, headers = {} } = {}) {
+async function notesFetch(pathname, { method = 'GET', body, rawBody = null, headers = {}, signal = null } = {}) {
   const requestHeaders = { ...headers };
   let requestBody;
   if (rawBody !== null) {
@@ -2239,7 +2272,7 @@ async function notesFetch(pathname, { method = 'GET', body, rawBody = null, head
     requestHeaders['Content-Type'] = 'application/json';
     requestBody = JSON.stringify(body);
   }
-  const response = await fetch(pathname, { method, headers: requestHeaders, body: requestBody, cache: 'no-store' });
+  const response = await fetch(pathname, { method, headers: requestHeaders, body: requestBody, cache: 'no-store', ...(signal ? { signal } : {}) });
   const contentType = String(response.headers.get('content-type') ?? '');
   const data = contentType.includes('application/json') ? await response.json() : await response.text();
   if (!response.ok) {
@@ -2342,6 +2375,7 @@ async function openNotesDrawer({ create = false, allowNoVideo = false } = {}) {
   els.notesDrawer.classList.add('open');
   els.notesDrawer.setAttribute('aria-hidden', 'false');
   els.btnNotes.setAttribute('aria-expanded', 'true');
+  if (state.vision.checkedAt == null || Date.now() - state.vision.checkedAt > 30_000) void loadVisionHealth();
   if (!state.video) {
     renderNotesAll();
     setNotesStatus('等待视频…');
@@ -2829,6 +2863,656 @@ async function togglePip() {
   }
 }
 
+// ================================================= v0.5 图文笔记（OCR/VLM/关键帧）
+
+async function loadVisionHealth({ silent = true } = {}) {
+  state.vision.checking = true;
+  renderVisionAvailability();
+  try {
+    const response = await fetch('/api/vision/health', { cache: 'no-store' });
+    const payload = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(payload.message ?? payload.error ?? `HTTP ${response.status}`);
+    const normalized = normalizeVisionHealth(payload);
+    state.vision = { available: normalized.available, health: normalized, checkedAt: Date.now(), checking: false, error: '' };
+    if (!silent) logEvent('vision', `视觉健康：OCR ${normalized.ocrAvailable ? '可用' : '不可用'} · VLM ${normalized.visionAvailable ? '可用' : '不可用'}`, normalized.available ? 'ok' : 'warn');
+  } catch (error) {
+    state.vision = {
+      available: false,
+      health: normalizeVisionHealth({ ok: false, message: error.message }),
+      checkedAt: Date.now(),
+      checking: false,
+      error: error.message,
+    };
+    if (!silent) logEvent('vision', `视觉引擎未就绪：${error.message}`, 'warn');
+  }
+  renderVisionAvailability();
+  return state.vision;
+}
+
+function renderVisionAvailability() {
+  const available = state.vision.available === true;
+  const visionAvailable = Boolean(state.vision.health?.visionAvailable);
+  const ocrAvailable = Boolean(state.vision.health?.ocrAvailable);
+  if (els.btnNotesVisual) {
+    els.btnNotesVisual.disabled = !state.video || !available;
+    els.btnNotesVisual.title = !state.video
+      ? '先载入视频'
+      : available
+        ? `抽取关键帧 + OCR/${visionAvailable ? 'VLM ' : ''}生成图文笔记（v0.5）`
+        : '视觉引擎未就绪：缺少 engine/vision/index.mjs 或 OCR 依赖（/api/vision 返回 503）';
+  }
+  if (els.visualVlm) {
+    els.visualVlm.disabled = !available || !visionAvailable;
+    if (!visionAvailable) els.visualVlm.checked = false;
+  }
+  if (els.visualVisionBadge) {
+    els.visualVisionBadge.textContent = state.vision.checking
+      ? '视觉引擎检测中…'
+      : available
+        ? `OCR ${ocrAvailable ? '可用' : '不可用'} · VLM ${visionAvailable ? '可用' : '不可用'}`
+        : '视觉引擎未就绪';
+    els.visualVisionBadge.className = `tag ${available ? (visionAvailable ? 'ok' : '') : 'warn'}`.trim();
+  }
+  if (els.btnVisualStart) {
+    els.btnVisualStart.disabled = !available;
+    els.btnVisualStart.title = available ? '开始抽取关键帧并生成图文笔记' : '视觉引擎未就绪（/api/vision 返回 503）';
+  }
+  if (els.visualFootHint) {
+    els.visualFootHint.textContent = !available
+      ? '视觉引擎未就绪：图文笔记不可用（/api/vision 返回 503）'
+      : visionAvailable
+        ? '默认仅 OCR（快）；VLM 可选，慢且可能产生模型费用'
+        : '默认仅 OCR（快）；VLM 未配置，无法开启';
+  }
+  renderVisualPlan();
+}
+
+function visualDurationMs() {
+  if (Number.isFinite(els.video.duration) && els.video.duration > 0) return Math.round(els.video.duration * 1000);
+  if (state.sim.parsed && state.sim.maxMs > 0) return state.sim.maxMs;
+  return Math.max(1000, state.maxEndMs, Math.round((els.video.currentTime || 0) * 1000));
+}
+
+function computeVisualRange() {
+  const durationMs = visualDurationMs();
+  const nowMs =
+    state.sim.active && state.sim.frozen ? Math.round(state.sim.clock || 0) : Math.round((els.video.currentTime || 0) * 1000);
+  if (state.visual.range === 'all') return { startMs: 0, endMs: durationMs };
+  const startMs = Math.max(0, Math.min(durationMs - 1000, nowMs));
+  return { startMs, endMs: durationMs };
+}
+
+function setVisualRange(range) {
+  state.visual.range = range === 'all' ? 'all' : 'rest';
+  for (const button of els.visualRange.querySelectorAll('button[data-range]')) {
+    const active = button.dataset.range === state.visual.range;
+    button.setAttribute('aria-pressed', String(active));
+    button.dataset.active = String(active);
+  }
+  renderVisualPlan();
+}
+
+function renderVisualPlan() {
+  if (!els.visualPlan) return;
+  const options = resolveKeyframeOptions(state.config);
+  const range = computeVisualRange();
+  const candidates = sampleTimes({
+    startMs: range.startMs,
+    endMs: range.endMs,
+    intervalMs: options.intervalMs,
+    maxCandidates: options.maxFrames * 6,
+  }).length;
+  const vlm = Boolean(state.visual.vlm && state.vision.health?.visionAvailable);
+  const parts = [
+    `范围 ${formatNoteTimestamp(range.startMs)} – ${formatNoteTimestamp(range.endMs)}（${((range.endMs - range.startMs) / 1000).toFixed(1)}s）`,
+    `每 ${(options.intervalMs / 1000).toFixed(0)}s 采样 ${candidates} 个候选点`,
+    `差异阈值 ${(options.minChange * 100).toFixed(1)}%，最多 ${options.maxFrames} 个关键帧`,
+    vlm ? `VLM 画面理解（每 ${options.sheetSize} 帧一批，较慢）` : '仅 OCR（快、离线、免费）',
+  ];
+  els.visualPlan.textContent = parts.join(' · ');
+}
+
+function setVisualProgress(text, percent) {
+  els.visualProgress.hidden = false;
+  els.visualProgressText.textContent = text;
+  els.visualProgressBar.style.width = `${clamp(percent, 0, 100)}%`;
+}
+
+function openVisualModal() {
+  if (!state.video) {
+    toast('请先载入视频，再生成图文笔记', 'warn');
+    return;
+  }
+  state.visual.open = true;
+  els.visualModal.hidden = false;
+  els.visualModal.setAttribute('aria-hidden', 'false');
+  els.visualVideoTitle.textContent = state.video.title;
+  els.visualError.hidden = true;
+  els.visualVlm.checked = Boolean(state.visual.vlm && state.vision.health?.visionAvailable);
+  setVisualRange(state.visual.range);
+  if (state.vision.checkedAt == null || Date.now() - state.vision.checkedAt > 30_000) void loadVisionHealth({ silent: false });
+  else renderVisionAvailability();
+}
+
+function closeVisualModal({ force = false } = {}) {
+  if (state.visual.running && !force) {
+    toast('正在生成图文笔记：可以先取消或等待完成', 'warn');
+    return;
+  }
+  state.visual.open = false;
+  els.visualModal.hidden = true;
+  els.visualModal.setAttribute('aria-hidden', 'true');
+}
+
+function checkVisualCancel() {
+  if (state.visual.cancelled) {
+    const error = new Error('cancelled');
+    error.name = 'AbortError';
+    throw error;
+  }
+}
+
+function cancelVisualRun() {
+  if (!state.visual.running) return;
+  state.visual.cancelled = true;
+  try {
+    state.visual.abort?.abort();
+  } catch {
+    /* ignore */
+  }
+  setVisualProgress('正在取消…', 0);
+}
+
+// ---------------------------------------------------------- 画面采样/截图
+
+/** 等待视频把 seek 后的新帧呈现出来（rVFC 优先，其次 rAF 双帧），避免 canvas 拿到旧帧 */
+function waitForVideoFramePresented(video, timeoutMs = 1500) {
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve();
+    };
+    const timer = setTimeout(finish, Math.max(300, timeoutMs));
+    try {
+      if (typeof video.requestVideoFrameCallback === 'function') {
+        video.requestVideoFrameCallback(() => finish());
+        return;
+      }
+    } catch {
+      /* fall through */
+    }
+    requestAnimationFrame(() => requestAnimationFrame(finish));
+  });
+}
+
+/** seek 到指定时间并等 seeked（超时 best-effort resolve） */
+function seekVideoForCapture(tMs, timeoutMs = 5000) {
+  return new Promise((resolve, reject) => {
+    const duration = Number.isFinite(els.video.duration) && els.video.duration > 0 ? els.video.duration : 0;
+    if (duration <= 0) {
+      reject(new Error('视频尚未加载完成（需要先播放/等待元数据）'));
+      return;
+    }
+    const targetSeconds = Math.max(0, Math.min(duration, (Number(tMs) || 0) / 1000));
+    if (Math.abs(els.video.currentTime - targetSeconds) < 0.02) {
+      waitForVideoFramePresented(els.video).then(resolve);
+      return;
+    }
+    let settled = false;
+    const finish = (error) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      els.video.removeEventListener('seeked', onSeeked);
+      if (error) reject(error);
+      else waitForVideoFramePresented(els.video).then(resolve);
+    };
+    const onSeeked = () => finish();
+    const timer = setTimeout(() => finish(), Math.max(1000, timeoutMs));
+    els.video.addEventListener('seeked', onSeeked, { once: true });
+    try {
+      els.video.currentTime = targetSeconds;
+    } catch (error) {
+      finish(error);
+    }
+  });
+}
+
+function blobToImage(blob) {
+  return new Promise((resolve, reject) => {
+    const url = URL.createObjectURL(blob);
+    const image = new Image();
+    image.onload = () => {
+      URL.revokeObjectURL(url);
+      resolve(image);
+    };
+    image.onerror = () => {
+      URL.revokeObjectURL(url);
+      reject(new Error('画面图片加载失败'));
+    };
+    image.src = url;
+  });
+}
+
+/** 抓取某一时刻的整帧 PNG + 64x36 灰度签名（用于关键帧去重） */
+async function grabFrameAt(tMs) {
+  await seekVideoForCapture(tMs);
+  const decodeStarted = performance.now();
+  while (els.video.readyState < 2 && performance.now() - decodeStarted < 800) {
+    await new Promise((resolve) => setTimeout(resolve, 30));
+  }
+  const width = els.video.videoWidth;
+  const height = els.video.videoHeight;
+  if (!width || !height) throw new Error('视频还没有可读取的画面（先播放一下或等待加载）');
+  const canvas = document.createElement('canvas');
+  canvas.width = width;
+  canvas.height = height;
+  const context = canvas.getContext('2d');
+  context.drawImage(els.video, 0, 0, width, height);
+  const blob = await new Promise((resolve, reject) => {
+    try {
+      canvas.toBlob((value) => (value ? resolve(value) : reject(new Error('生成画面 PNG 失败'))), 'image/png');
+    } catch (error) {
+      reject(error);
+    }
+  });
+  const small = document.createElement('canvas');
+  small.width = 64;
+  small.height = 36;
+  const smallContext = small.getContext('2d');
+  smallContext.drawImage(canvas, 0, 0, 64, 36);
+  const gray = toGrayscale(smallContext.getImageData(0, 0, 64, 36).data, 64, 36);
+  return { blob, gray };
+}
+
+/** 2x3 拼图（关键帧批次 -> VLM 单次理解） */
+async function buildContactSheet(frames) {
+  const layout = contactSheetLayout(frames.length, { width: 1280, height: 960 });
+  const canvas = document.createElement('canvas');
+  canvas.width = layout.width;
+  canvas.height = layout.height;
+  const context = canvas.getContext('2d');
+  context.fillStyle = '#0b0f18';
+  context.fillRect(0, 0, canvas.width, canvas.height);
+  for (const slot of layout.slots) {
+    const frame = frames[slot.index];
+    if (!frame) continue;
+    try {
+      const image = await blobToImage(frame.blob);
+      context.drawImage(image, slot.x, slot.y, slot.width, slot.height);
+    } catch {
+      context.fillStyle = '#1a2030';
+      context.fillRect(slot.x, slot.y, slot.width, slot.height);
+    }
+    context.fillStyle = 'rgba(8, 12, 20, 0.88)';
+    context.fillRect(slot.x, slot.y + slot.height, slot.width, slot.labelHeight);
+    context.fillStyle = '#7ff0df';
+    context.font = '13px monospace';
+    context.fillText(`${formatNoteTimestamp(frame.tMs)} · 帧 ${frame.index ?? slot.index + 1}`, slot.x + 6, slot.y + slot.height + 16);
+  }
+  return await new Promise((resolve, reject) => {
+    try {
+      canvas.toBlob((value) => (value ? resolve(value) : reject(new Error('拼图生成失败'))), 'image/png');
+    } catch (error) {
+      reject(error);
+    }
+  });
+}
+
+/** 单次异步操作超时（OCR 首帧本地 Vision 初始化可能 ~6s；15s 兜底，失败跳过该帧） */
+function timeoutAfter(promise, timeoutMs, label) {
+  let timer = null;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => {
+      const error = new Error(`${label}超时（${Math.round(timeoutMs / 1000)} 秒）`);
+      error.name = 'TimeoutError';
+      reject(error);
+    }, Math.max(1000, Math.round(timeoutMs) || 15000));
+    timer.unref?.();
+  });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+}
+
+async function uploadVisualAsset(blob, signal = null) {
+  const payload = await notesFetch('/api/notes/assets', {
+    method: 'POST',
+    rawBody: blob,
+    headers: { 'Content-Type': 'image/png' },
+    signal,
+  });
+  if (!payload?.url) throw new Error('上传截图失败（响应缺少 url）');
+  return payload.url;
+}
+
+async function visionOcrAsset(imageUrl, signal = null) {
+  return await notesFetch('/api/vision/ocr', { method: 'POST', body: { imageUrl }, signal });
+}
+
+async function visionAnalyzeSheet(blob, signal = null) {
+  return await notesFetch('/api/vision/analyze?mode=vision', {
+    method: 'POST',
+    rawBody: blob,
+    headers: { 'Content-Type': 'image/png' },
+    signal,
+  });
+}
+
+async function visionSummarize(payload, signal = null) {
+  return await notesFetch('/api/vision/summarize', { method: 'POST', body: payload, signal });
+}
+
+// ---------------------------------------------------------- 图文笔记生成
+
+async function runVisualPipeline() {
+  if (state.visual.running) return;
+  if (!state.video) {
+    toast('请先载入视频', 'warn');
+    return;
+  }
+  if (state.vision.available !== true) {
+    toast('视觉引擎未就绪：/api/vision 返回 503（需要 engine/vision/index.mjs 与本地 OCR 依赖）', 'warn', 6000);
+    return;
+  }
+  const range = computeVisualRange();
+  if (range.endMs - range.startMs < 1000) {
+    toast('范围太短（至少 1 秒），请切换范围或稍后再试', 'warn');
+    return;
+  }
+  const options = resolveKeyframeOptions(state.config);
+  state.visual.running = true;
+  state.visual.cancelled = false;
+  state.visual.lastError = null;
+  state.visual.phase = 'sampling';
+  state.visual.debug = { times: [], grabbed: 0, accepted: 0, ocrDone: 0, ocrFailed: 0, vlmDone: 0, summaryDone: false, saved: false };
+  state.visual.abort = new AbortController();
+  const signal = state.visual.abort.signal;
+  els.btnVisualStart.disabled = true;
+  els.btnVisualStart.textContent = '生成中…';
+  els.btnVisualCancel.hidden = false;
+  els.visualError.hidden = true;
+  els.visualProgress.hidden = false;
+  const wasPaused = els.video.paused;
+  const originalTime = Number(els.video.currentTime) || 0;
+  try {
+    if (!wasPaused) els.video.pause();
+    state.visual.sampling = true;
+    setVisualProgress('采样关键帧…', 2);
+    const times = sampleTimes({
+      startMs: range.startMs,
+      endMs: range.endMs,
+      intervalMs: options.intervalMs,
+      maxCandidates: options.maxFrames * 6,
+    });
+    state.visual.debug.times = times;
+    const frames = [];
+    let previousGray = null;
+    for (let index = 0; index < times.length; index += 1) {
+      checkVisualCancel();
+      setVisualProgress(`采样中 ${index + 1}/${times.length}（已选 ${frames.length} 帧）`, 2 + ((index + 1) / times.length) * 18);
+      const grab = await grabFrameAt(times[index]);
+      state.visual.debug.grabbed += 1;
+      if (frames.length === 0 || shouldAcceptFrame(previousGray, grab.gray, options.minChange)) {
+        frames.push({ tMs: times[index], index: frames.length + 1, blob: grab.blob, imageUrl: '', ocrText: '', caption: '', lines: [] });
+        previousGray = grab.gray;
+        state.visual.debug.accepted = frames.length;
+      }
+      if (frames.length >= options.maxFrames) break;
+    }
+    state.visual.sampling = false;
+    if (frames.length === 0) throw new Error('没有抽取到关键帧（可能范围太短或画面没有变化）');
+
+    state.visual.phase = 'ocr';
+    // 1) 本地 OCR（串行，避免把 OCR helper 打满；单帧 15s 超时，失败跳过继续）
+    let ocrFailure = '';
+    const ocrStartAt = Date.now();
+    for (let index = 0; index < frames.length; index += 1) {
+      checkVisualCancel();
+      setVisualProgress(`识别中 ${index + 1}/${frames.length}…`, 20 + ((index + 1) / frames.length) * 35);
+      const frame = frames[index];
+      const frameStartedAt = Date.now();
+      try {
+        frame.imageUrl = await timeoutAfter(uploadVisualAsset(frame.blob, signal), 20_000, '上传截图');
+        const result = await timeoutAfter(visionOcrAsset(frame.imageUrl, signal), 15_000, 'OCR 识别');
+        frame.ocrText = String(result?.text ?? '');
+        frame.lines = Array.isArray(result?.lines) ? result.lines : [];
+        state.visual.debug.ocrDone += 1;
+      } catch (error) {
+        if (state.visual.cancelled || error?.name === 'AbortError') throw error;
+        state.visual.debug.ocrFailed += 1;
+        ocrFailure = ocrFailure || error.message;
+      }
+      const elapsed = Date.now() - frameStartedAt;
+      if (index === 0 && elapsed > 5000) {
+        toast('首次 OCR 引擎加载较慢（本地 Vision 首次初始化约 6s），后续帧会更快', 'info', 5000);
+      }
+    }
+    if (ocrFailure) logEvent('vision', `部分帧 OCR 失败/超时已跳过：${ocrFailure}`, 'warn');
+    logEvent('vision', `OCR 完成 ${frames.length} 帧，用时 ${Date.now() - ocrStartAt}ms`, 'mt');
+
+    // 2) 可选 VLM：关键帧拼 2x3 图 -> 一次画面理解（每批 6 帧）
+    const useVlm = Boolean(state.visual.vlm && state.vision.health?.visionAvailable);
+    state.visual.phase = useVlm ? 'vlm' : 'summarize';
+    if (useVlm) {
+      const batches = [];
+      for (let index = 0; index < frames.length; index += options.sheetSize) batches.push(frames.slice(index, index + options.sheetSize));
+      let vlmFailure = '';
+      for (let batchIndex = 0; batchIndex < batches.length; batchIndex += 1) {
+        checkVisualCancel();
+        setVisualProgress(`画面理解中（批次 ${batchIndex + 1}/${batches.length}，VLM 较慢）…`, 55 + ((batchIndex + 1) / batches.length) * 20);
+        try {
+          const sheet = await buildContactSheet(batches[batchIndex]);
+          const analysis = await visionAnalyzeSheet(sheet, signal);
+          const caption = String(analysis?.caption?.text ?? analysis?.caption?.summary ?? '').trim();
+          if (caption) for (const frame of batches[batchIndex]) frame.caption = caption;
+          state.visual.debug.vlmDone += 1;
+        } catch (error) {
+          if (state.visual.cancelled || error?.name === 'AbortError') throw error;
+          vlmFailure = vlmFailure || error.message;
+        }
+      }
+      if (vlmFailure) state.visual.lastError = `画面理解部分失败：${vlmFailure}`;
+    }
+
+    // 3) 文本总结（字幕 + 画面文字 + 画面理解）
+    state.visual.phase = 'summarize';
+    setVisualProgress('生成总结…', 78);
+    const segments = getSessionSegments();
+    const transcript = collectTranscript(segments, { startMs: range.startMs, endMs: range.endMs, limit: 200 });
+    const visuals = frames.map((frame) => ({
+      tMs: frame.tMs,
+      ocrText: frame.ocrText,
+      ...(frame.caption ? { caption: frame.caption } : {}),
+    }));
+    let summary = '';
+    let keyPoints = [];
+    try {
+      const result = await visionSummarize({ title: state.video.title, transcript, visuals, lang: 'zh' }, signal);
+      summary = String(result?.summary ?? '');
+      keyPoints = Array.isArray(result?.keyPoints) ? result.keyPoints : [];
+      state.visual.debug.summaryDone = true;
+    } catch (error) {
+      if (state.visual.cancelled || error?.name === 'AbortError') throw error;
+      state.visual.lastError = `总结失败（已保留 OCR 时间线）：${error.message}`;
+    }
+
+    // 4) 组装 Markdown 并保存为 kind:'visual' 笔记
+    state.visual.phase = 'save';
+    setVisualProgress('组装并保存图文笔记…', 90);
+    const markdown = buildVisualNoteMarkdown({
+      title: state.video.title,
+      summary,
+      keyPoints,
+      frames,
+      segments,
+      range,
+      langFrom: 'en',
+      langTo: 'zh',
+      generatedAt: new Date(),
+      vlm: useVlm,
+    });
+    const payload = await notesFetch('/api/notes', {
+      method: 'POST',
+      signal,
+      body: {
+        video: currentVideoRef(),
+        tMs: range.startMs,
+        body: markdown,
+        kind: 'visual',
+        tags: visualNoteTags({ vlm: useVlm, extra: ['OCR'] }),
+        source: 'studio',
+        ...(frames[0]?.imageUrl ? { imageUrl: frames[0].imageUrl } : {}),
+      },
+    });
+    if (!payload?.note) throw new Error('保存图文笔记失败（响应缺少 note）');
+    state.visual.debug.saved = true;
+    await refreshNotes({ silent: true });
+    selectNote(payload.note.id);
+    await openNotesDrawer();
+    setVisualProgress('完成 ✓', 100);
+    const degraded = [
+      ocrFailure ? `OCR 失败：${ocrFailure}` : '',
+      state.visual.lastError ?? '',
+    ].filter(Boolean);
+    toast(
+      `图文笔记已生成：${frames.length} 个关键帧、${transcript.length} 句字幕${useVlm ? ' + VLM 画面理解' : ''}${degraded.length ? '（部分降级）' : ''}`,
+      degraded.length ? 'warn' : 'ok',
+      6000,
+    );
+    logEvent('vision', `图文笔记 ${payload.note.id}：${frames.length} 帧 · ${markdown.length} 字符`, 'ok');
+    if (degraded.length) logEvent('vision', degraded.join('；'), 'warn');
+    setTimeout(() => closeVisualModal({ force: true }), 700);
+  } catch (error) {
+    state.visual.phase = state.visual.cancelled ? 'cancelled' : 'error';
+    if (state.visual.cancelled || error?.name === 'AbortError') {
+      setVisualProgress('已取消', 0);
+      toast('已取消图文笔记生成', 'info');
+    } else {
+      state.visual.lastError = error.message;
+      els.visualError.hidden = false;
+      els.visualError.textContent = `生成失败：${error.message}`;
+      setVisualProgress(`失败：${error.message}`, 0);
+      toast(`图文笔记生成失败：${error.message}`, 'err', 7000);
+      logEvent('vision', `图文笔记生成失败：${error.message}`, 'err');
+    }
+  } finally {
+    if (state.visual.phase !== 'error' && state.visual.phase !== 'cancelled') state.visual.phase = 'done';
+    state.visual.running = false;
+    state.visual.sampling = false;
+    state.visual.abort = null;
+    els.btnVisualStart.disabled = state.vision.available !== true;
+    els.btnVisualStart.textContent = '开始生成';
+    els.btnVisualCancel.hidden = true;
+    try {
+      els.video.currentTime = Math.min(Number.isFinite(els.video.duration) ? els.video.duration : originalTime, originalTime);
+    } catch {
+      /* ignore */
+    }
+    if (state.sim.active && state.sim.frozen) {
+      state.sim.clock = Math.round(originalTime * 1000);
+      applySimAt(state.sim.clock);
+    } else if (!wasPaused) {
+      els.video.play().catch(() => {});
+    }
+  }
+}
+
+/** 调试用：只采样关键帧并返回帧间差异（不 OCR/不保存） */
+async function debugSampleFrames({ limit = 7 } = {}) {
+  const range = computeVisualRange();
+  const options = resolveKeyframeOptions(state.config);
+  const times = sampleTimes({
+    startMs: range.startMs,
+    endMs: range.endMs,
+    intervalMs: options.intervalMs,
+    maxCandidates: options.maxFrames * 6,
+  }).slice(0, Math.max(1, limit));
+  const wasPaused = els.video.paused;
+  const originalTime = els.video.currentTime || 0;
+  state.visual.sampling = true;
+  if (!wasPaused) els.video.pause();
+  const out = [];
+  let previous = null;
+  try {
+    for (const tMs of times) {
+      const grab = await grabFrameAt(tMs);
+      const diff = previous ? frameChangeRatio(previous, grab.gray) : 1;
+      const changed = previous ? changedPixelRatio(previous, grab.gray) : 1;
+      out.push({ tMs, diff: Number(diff.toFixed(4)), changed: Number(changed.toFixed(4)) });
+      previous = grab.gray;
+    }
+  } finally {
+    state.visual.sampling = false;
+    try {
+      els.video.currentTime = Math.min(els.video.duration || Infinity, originalTime);
+    } catch {
+      /* ignore */
+    }
+    if (state.sim.active && state.sim.frozen) {
+      state.sim.clock = Math.round(originalTime * 1000);
+      applySimAt(state.sim.clock);
+    } else if (!wasPaused) {
+      els.video.play().catch(() => {});
+    }
+  }
+  return { times, results: out, threshold: options.minChange };
+}
+
+// ------------------------------------------------ 捕获当前画面（插入笔记）
+
+async function captureCurrentVisual() {
+  if (!state.video) {
+    toast('请先载入视频', 'warn');
+    return;
+  }
+  if (!currentNote()) {
+    const note = await createNoteAtCurrentTime();
+    if (!note) return;
+  }
+  const tMs = state.sim.active && state.sim.frozen ? Math.round(state.sim.clock || 0) : Math.round((els.video.currentTime || 0) * 1000);
+  try {
+    const grab = await grabFrameAt(tMs);
+    const imageUrl = await uploadVisualAsset(grab.blob);
+    let ocrText = '';
+    if (state.vision.available) {
+      try {
+        const result = await visionOcrAsset(imageUrl);
+        ocrText = String(result?.text ?? '').trim();
+      } catch (error) {
+        toast(`画面 OCR 失败：${error.message}`, 'warn', 5000);
+      }
+    }
+    let caption = '';
+    if (state.visual.vlm && state.vision.health?.visionAvailable) {
+      try {
+        const analysis = await visionAnalyzeSheet(grab.blob);
+        caption = String(analysis?.caption?.text ?? '').trim();
+      } catch (error) {
+        toast(`画面理解失败：${error.message}`, 'warn', 5000);
+      }
+    }
+    if (!state.notes.imageUrl) state.notes.imageUrl = imageUrl;
+    const parts = [`![画面 ${formatNoteTimestamp(tMs)}](${imageUrl})`];
+    if (ocrText) parts.push('', '**画面文字（OCR）**', '', '```text', ...ocrText.split('\n').slice(0, 40), '```');
+    if (caption) parts.push('', '**画面理解（VLM）**', '', caption);
+    const quote = getCurrentBilingual();
+    if (quote) {
+      const existed = state.notes.quotes.some((item) => item.src === quote.src && item.t0Ms === quote.t0Ms);
+      if (!existed) state.notes.quotes.push(quote);
+      parts.push('', buildQuoteMarkdown(quote));
+    }
+    insertIntoNotesEditor(`${parts.join('\n')}\n`);
+    await flushNotesSave();
+    toast(ocrText ? '已捕获当前画面（截图 + OCR + 当前句）' : '已插入当前画面截图（OCR 不可用，仅截图）', 'ok', 4200);
+    logEvent('vision', `捕获当前画面 @ ${formatNoteTimestamp(tMs)}${ocrText ? '' : '（OCR 不可用）'}`, 'ok');
+  } catch (error) {
+    toast(`捕获画面失败：${error.message}${/taint|Security|CORS/i.test(error.message) ? '（跨域视频无法读取画面）' : ''}`, 'err', 7000);
+    logEvent('vision', `捕获画面失败：${error.message}`, 'err');
+  }
+}
+
 // ---------------------------------------------------------------- 渲染
 
 function renderNotesAll() {
@@ -2843,7 +3527,7 @@ function renderNotesAll() {
 }
 
 function noteKindLabel(kind) {
-  return { note: '笔记', outline: '大纲', quick: '摘录', marker: '标记' }[kind] ?? '笔记';
+  return { note: '笔记', outline: '大纲', quick: '摘录', marker: '标记', visual: '图文' }[kind] ?? '笔记';
 }
 
 function renderNotesList() {
@@ -2884,6 +3568,12 @@ function renderNotesList() {
     kind.className = `notes-kind ${note.kind ?? 'note'}`;
     kind.textContent = noteKindLabel(note.kind);
     meta.appendChild(kind);
+    const visualImages = note.kind === 'visual' ? extractImageUrls(note.body) : [];
+    if (note.kind === 'visual' && visualImages.length > 0) {
+      const imageBadge = document.createElement('span');
+      imageBadge.textContent = `${visualImages.length} 图`;
+      meta.appendChild(imageBadge);
+    }
     if (Array.isArray(note.quotes) && note.quotes.length > 0) {
       const quoteBadge = document.createElement('span');
       quoteBadge.textContent = `${note.quotes.length} 条引用`;
@@ -2903,10 +3593,22 @@ function renderNotesList() {
     body.appendChild(meta);
     item.appendChild(body);
 
-    if (note.imageUrl) {
+    const thumbUrls = (visualImages.length > 0 ? visualImages : note.imageUrl ? [note.imageUrl] : []).slice(0, 3);
+    if (thumbUrls.length > 1) {
+      const thumbs = document.createElement('div');
+      thumbs.className = 'notes-thumbs';
+      for (const url of thumbUrls) {
+        const thumb = document.createElement('img');
+        thumb.src = url;
+        thumb.alt = '画面截图';
+        thumb.loading = 'lazy';
+        thumbs.appendChild(thumb);
+      }
+      item.appendChild(thumbs);
+    } else if (thumbUrls.length === 1) {
       const thumb = document.createElement('img');
       thumb.className = 'notes-thumb';
-      thumb.src = note.imageUrl;
+      thumb.src = thumbUrls[0];
       thumb.alt = '笔记截图';
       thumb.loading = 'lazy';
       item.appendChild(thumb);
@@ -3148,6 +3850,7 @@ function bindEvents() {
     }
   });
   els.video.addEventListener('seeked', () => {
+    if (state.visual.sampling) return; // 图文笔记采样期间由采样器控制播放头
     if (state.sim.active) {
       // 回放/演示模式：seek 是为了显示对应帧，不能把字幕清掉
       if (state.sim.frozen) applySimAt(state.sim.clock);
@@ -3235,6 +3938,19 @@ function bindEvents() {
   els.btnNotesClose.addEventListener('click', closeNotesDrawer);
   els.btnNotesNew.addEventListener('click', () => void openNotesDrawer({ create: true }));
   els.btnNotesOutline.addEventListener('click', () => void generateOutlineNote());
+  els.btnNotesVisual.addEventListener('click', openVisualModal);
+  els.btnVisualClose.addEventListener('click', () => closeVisualModal());
+  els.btnVisualStart.addEventListener('click', () => void runVisualPipeline());
+  els.btnVisualCancel.addEventListener('click', cancelVisualRun);
+  els.visualRange.addEventListener('click', (event) => {
+    const button = event.target.closest('button[data-range]');
+    if (button) setVisualRange(button.dataset.range);
+  });
+  els.visualVlm.addEventListener('change', () => {
+    state.visual.vlm = Boolean(els.visualVlm.checked);
+    renderVisualPlan();
+  });
+  els.btnCaptureVisual.addEventListener('click', () => void captureCurrentVisual());
   els.btnNotesRetry.addEventListener('click', () => void syncLocalNotes());
   els.notesSearch.addEventListener('input', () => {
     state.notes.query = els.notesSearch.value;
@@ -3343,7 +4059,7 @@ async function bootstrap() {
     renderAsrEngine,
     renderDesktopApp,
     selectAsrEngine,
-    version: '0.4.0',
+    version: '0.5.0',
     notes: {
       state: state.notes,
       open: (options) => openNotesDrawer(options ?? {}),
@@ -3361,6 +4077,23 @@ async function bootstrap() {
       exportNotes,
       syncLocal: syncLocalNotes,
       delete: deleteNoteById,
+    },
+    vision: {
+      state: state.vision,
+      visual: state.visual,
+      health: () => loadVisionHealth({ silent: false }),
+      openModal: openVisualModal,
+      closeModal: closeVisualModal,
+      run: runVisualPipeline,
+      cancel: cancelVisualRun,
+      captureCurrent: captureCurrentVisual,
+      debugSample: debugSampleFrames,
+      setRange: setVisualRange,
+      setVlm: (value) => {
+        state.visual.vlm = Boolean(value);
+        els.visualVlm.checked = state.visual.vlm;
+        renderVisualPlan();
+      },
     },
   };
   if (!simMode) {
@@ -3381,6 +4114,8 @@ async function bootstrap() {
     renderAsrEngine();
     renderDesktopApp();
   }
+
+  void loadVisionHealth({ silent: true });
 
   // 扩展 / macOS App 的「打开笔记本」会链到 /studio/?notes=1
   if (params.get('notes') === '1') {

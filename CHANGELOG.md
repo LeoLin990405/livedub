@@ -3,6 +3,27 @@
 All notable changes to livedub are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/), versioning: [SemVer](https://semver.org/).
 
+## [0.5.0] - 2026-10-30
+
+视频画面理解 → 音频 + 画面双重内容的图文笔记。
+
+### Added
+
+- **视觉能力层**（`engine/vision/`）：本地 macOS Vision OCR（Swift helper，~1s/帧、离线）、
+  OpenAI 兼容 VLM 画面理解（默认 ark-plan/doubao，可选/批量）、文本 LLM 图文总结；
+  配置 `vision.{provider,model,prompt,ocr,summary,keyframe}`；`npm run build:ocr`。
+- **视觉端点**：`/api/vision/ocr`、`/api/vision/analyze?mode=ocr|vision|both`、
+  `/api/vision/summarize`、`/api/vision/health`（raw PNG 或本机 asset 相对路径；防穿越/大小限制）。
+- **工作台「图文笔记」**：范围选择 → 关键帧采样（画面差异去重）→ 本地 OCR（默认快）→
+  可选 VLM 拼图理解（慢，默认关）→ 字幕+画面综合总结 → 自动生成 `kind:'visual'` 图文笔记
+  （时间线截图/画面文字/画面理解/双语引用 + 本节总结与要点）；笔记编辑区可「捕获当前画面」。
+- **快捷笔记增强**：扩展 `Alt+Shift+N` / macOS `⌥N` 截图后自动 OCR，把「画面文字」写入笔记正文；
+  CLI `npm run note -- ... --screenshot` 同样自动带画面文字（`--vision` 可加画面理解）。
+
+### Changed
+
+- 版本 0.5.0；notes 相关文档更新（docs/NOTES.md「图文笔记：画面理解」、docs/CONTRACTS.md §7.7）。
+
 ## [0.4.0] - 2026-10-30
 
 看视频边实现边写笔记。

@@ -143,6 +143,30 @@ enum NotesHTTP {
         return components.url
     }
 
+    static let visionModes = ["ocr", "vision", "both"]
+
+    static func normalizeVisionMode(_ raw: String) -> String {
+        let mode = raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return visionModes.contains(mode) ? mode : "ocr"
+    }
+
+    static func visionOCRURL(base: URL) -> URL {
+        base.appendingPathComponent("api").appendingPathComponent("vision").appendingPathComponent("ocr")
+    }
+
+    static func visionHealthURL(base: URL) -> URL {
+        base.appendingPathComponent("api").appendingPathComponent("vision").appendingPathComponent("health")
+    }
+
+    static func visionAnalyzeURL(base: URL, mode: String) -> URL {
+        let endpoint = base.appendingPathComponent("api")
+            .appendingPathComponent("vision")
+            .appendingPathComponent("analyze")
+        var components = URLComponents(url: endpoint, resolvingAgainstBaseURL: false)
+        components?.queryItems = [URLQueryItem(name: "mode", value: normalizeVisionMode(mode))]
+        return components?.url ?? endpoint
+    }
+
     /// 服务端 assets 返回的可能是相对路径（/api/notes/assets/x.png），转成绝对 URL 便于 Markdown 渲染
     static func absoluteAssetURLString(base: String, assetPath: String) -> String {
         let trimmed = assetPath.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -315,7 +339,13 @@ enum NoteComposer {
 
     /// 生成 quick note 的 text（Markdown 片段）。
     /// 有字幕：原文/译文双语引用；无字幕："（无字幕）"；总是带视频标题/时间戳/状态/来源/前台 App。
-    static func quickText(context: NoteContext, videoTitle: String, imageURL: String?) -> String {
+    static func quickText(
+        context: NoteContext,
+        videoTitle: String,
+        imageURL: String?,
+        ocrText: String? = nil,
+        visionCaption: String? = nil
+    ) -> String {
         var lines: [String] = []
         let src = normalizeInline(context.source, maxLength: maxQuoteChars)
         let dst = normalizeInline(context.translation, maxLength: maxQuoteChars)
@@ -342,6 +372,15 @@ enum NoteComposer {
                 + formatDateStamp(context.capturedAt, timeZone: context.timeZone) + " "
                 + formatClock(context.capturedAt, timeZone: context.timeZone)
         )
+        // v0.5 图文笔记：画面文字（OCR）/ 可选画面理解（VLM）
+        if let section = ocrText.flatMap({ VisionText.ocrSection($0) }) {
+            lines.append("")
+            lines.append(section)
+        }
+        if let section = visionCaption.flatMap({ VisionText.captionSection($0) }) {
+            lines.append("")
+            lines.append(section)
+        }
         if let imageURL = normalizeInline(imageURL ?? "", maxLength: 500).nilIfEmpty {
             lines.append("")
             lines.append("![截图](\(imageURL))")
@@ -355,6 +394,8 @@ enum NoteComposer {
     static func makeQuickRequest(
         context: NoteContext,
         image: NoteAssetRef? = nil,
+        ocrText: String? = nil,
+        visionCaption: String? = nil,
         tags: [String]? = nil
     ) -> QuickNoteRequest {
         let title = deriveVideoTitle(
@@ -389,7 +430,13 @@ enum NoteComposer {
         return QuickNoteRequest(
             video: NoteVideoRef(id: videoID, title: title, url: nil),
             tMs: safeTMs,
-            text: quickText(context: context, videoTitle: title, imageURL: image?.absoluteURL),
+            text: quickText(
+                context: context,
+                videoTitle: title,
+                imageURL: image?.absoluteURL,
+                ocrText: ocrText,
+                visionCaption: visionCaption
+            ),
             quotes: quotes,
             source: source,
             tags: cleanTags.isEmpty ? nil : Array(cleanTags.prefix(20)),
@@ -565,6 +612,8 @@ final class NotesClient {
     private let offlineQueue: NotesOfflineQueue
     private var engineURL: String
     private var flushing = false
+    /// 引擎没有 /api/vision/*（旧版 v0.4）时置 true：本次运行内跳过视觉调用（health 成功会重置）
+    private var visionEndpointMissingValue = false
 
     init(engineURL: String, queueStore: NotesQueueStore = UserDefaultsNotesStore()) {
         self.engineURL = engineURL
@@ -761,5 +810,155 @@ final class NotesClient {
     private static func bodySnippet(_ data: Data) -> String {
         let text = String(data: data.prefix(400), encoding: .utf8) ?? "<\(data.count) bytes>"
         return text.replacingOccurrences(of: "\n", with: " ")
+    }
+}
+
+// MARK: - Vision（v0.5 画面文字 / 画面理解）
+
+extension NotesClient {
+    /// 本次运行内是否已确认引擎没有 /api/vision/*（旧版 v0.4）
+    var visionEndpointMissing: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return visionEndpointMissingValue
+    }
+
+    /// 标记视觉端点缺失（404/405/501）或视觉服务不可用（503 vision_unavailable）
+    func markVisionEndpointMissing() {
+        lock.lock()
+        let alreadyMissing = visionEndpointMissingValue
+        visionEndpointMissingValue = true
+        lock.unlock()
+        if !alreadyMissing {
+            onLog?("[vision] 引擎无 /api/vision/*（旧版 < v0.5）：本次运行跳过画面文字/画面理解，笔记照常保存")
+        }
+    }
+
+    /// 视觉能力恢复（health 正常）时重置缺省标记
+    private func markVisionEndpointAvailable() {
+        lock.lock()
+        visionEndpointMissingValue = false
+        lock.unlock()
+    }
+
+    /// GET /api/vision/health（永不 throw）
+    func fetchVisionHealth() async -> VisionStatus {
+        let now = Date()
+        let baseString = baseURLString
+        guard let base = URL(string: baseString) else {
+            return .unavailable(error: "引擎地址无效", fetchedAt: now)
+        }
+        var request = URLRequest(url: NotesHTTP.visionHealthURL(base: base), timeoutInterval: 5)
+        request.httpMethod = "GET"
+        do {
+            let (data, response) = try await session.data(for: request)
+            let status = (response as? HTTPURLResponse)?.statusCode ?? 0
+            if VisionPlanner.endpointMissing(forHTTPStatus: status) {
+                markVisionEndpointMissing()
+                return .missing(fetchedAt: now)
+            }
+            guard (200..<300).contains(status) else {
+                if VisionPlanner.serviceUnavailable(forHTTPStatus: status, message: "") {
+                    return .unavailable(error: "视觉服务未就绪（vision_unavailable）", fetchedAt: now)
+                }
+                return .unavailable(error: "HTTP \(status)", fetchedAt: now)
+            }
+            guard let parsed = VisionHealthParser.parse(data: data) else {
+                return .unavailable(error: "health 响应无法解析", fetchedAt: now)
+            }
+            markVisionEndpointAvailable()
+            return parsed
+        } catch {
+            return .unavailable(error: (error as NSError).localizedDescription, fetchedAt: now)
+        }
+    }
+
+    /// POST /api/vision/ocr（JSON {imageUrl:"/api/notes/assets/<file>.png"}，8s 超时）
+    func recognizeImage(imagePath: String) async throws -> VisionOCRResult {
+        guard NoteComposer.isValidAssetPath(imagePath) else {
+            throw NotesClientError.invalidResponse("imageUrl 必须是 /api/notes/assets/<file>.png（相对路径）")
+        }
+        if visionEndpointMissing {
+            throw NotesClientError.http(status: 404, message: "vision endpoint missing")
+        }
+        let baseString = baseURLString
+        guard let base = URL(string: baseString) else { throw NotesClientError.notConfigured }
+        var request = URLRequest(
+            url: NotesHTTP.visionOCRURL(base: base),
+            timeoutInterval: VisionPlanner.ocrTimeout
+        )
+        request.httpMethod = "POST"
+        request.setValue("application/json; charset=utf-8", forHTTPHeaderField: "Content-Type")
+        request.httpBody = try JSONEncoder().encode(VisionOCRRequest(imageUrl: imagePath))
+
+        let (data, response) = try await session.data(for: request)
+        let status = (response as? HTTPURLResponse)?.statusCode ?? 0
+        if VisionPlanner.shouldMarkEndpointMissing(NotesClientError.http(status: status, message: Self.bodySnippet(data))) {
+            markVisionEndpointMissing()
+            throw NotesClientError.http(status: status, message: "引擎视觉端点不可用（需 v0.5 / 安装 vision 模块）")
+        }
+        guard (200..<300).contains(status) else {
+            throw NotesClientError.http(status: status, message: Self.bodySnippet(data))
+        }
+        let decoded: VisionOCRResponse
+        do {
+            decoded = try JSONDecoder().decode(VisionOCRResponse.self, from: data)
+        } catch {
+            throw NotesClientError.invalidResponse("无法解析 vision/ocr 响应：\(error)")
+        }
+        if decoded.ok == false {
+            throw NotesClientError.invalidResponse("vision/ocr 返回 ok=false")
+        }
+        return VisionOCRResult(
+            text: decoded.text ?? "",
+            lines: decoded.lines ?? [],
+            provider: decoded.provider ?? "",
+            ms: decoded.ms
+        )
+    }
+
+    /// POST /api/vision/analyze?mode=ocr|vision|both（VLM 慢，客户端超时 45s；失败降级为仅 OCR）
+    func analyzeImage(imagePath: String, mode: String = "both") async throws -> VisionAnalyzeResult {
+        guard NoteComposer.isValidAssetPath(imagePath) else {
+            throw NotesClientError.invalidResponse("imageUrl 必须是 /api/notes/assets/<file>.png（相对路径）")
+        }
+        if visionEndpointMissing {
+            throw NotesClientError.http(status: 404, message: "vision endpoint missing")
+        }
+        let baseString = baseURLString
+        guard let base = URL(string: baseString) else { throw NotesClientError.notConfigured }
+        var request = URLRequest(
+            url: NotesHTTP.visionAnalyzeURL(base: base, mode: mode),
+            timeoutInterval: VisionPlanner.analyzeTimeout
+        )
+        request.httpMethod = "POST"
+        request.setValue("application/json; charset=utf-8", forHTTPHeaderField: "Content-Type")
+        request.httpBody = try JSONEncoder().encode(VisionAnalyzeRequest(imageUrl: imagePath))
+
+        let (data, response) = try await session.data(for: request)
+        let status = (response as? HTTPURLResponse)?.statusCode ?? 0
+        if VisionPlanner.shouldMarkEndpointMissing(NotesClientError.http(status: status, message: Self.bodySnippet(data))) {
+            // 503 vision_unavailable 也视为本次运行不可用，避免每次热键都等 8~45s
+            markVisionEndpointMissing()
+            throw NotesClientError.http(status: status, message: "引擎视觉服务不可用（vision_unavailable）")
+        }
+        guard (200..<300).contains(status) else {
+            throw NotesClientError.http(status: status, message: Self.bodySnippet(data))
+        }
+        let decoded: VisionAnalyzeResponse
+        do {
+            decoded = try JSONDecoder().decode(VisionAnalyzeResponse.self, from: data)
+        } catch {
+            throw NotesClientError.invalidResponse("无法解析 vision/analyze 响应：\(error)")
+        }
+        if decoded.ok == false {
+            throw NotesClientError.invalidResponse("vision/analyze 返回 ok=false")
+        }
+        return VisionAnalyzeResult(
+            ocrText: decoded.ocrText,
+            caption: decoded.caption,
+            provider: decoded.provider,
+            ms: decoded.ms
+        )
     }
 }

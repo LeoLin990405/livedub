@@ -54,6 +54,45 @@ npm run note -- "用 npm script 也可以"
 - 给编辑器/终端配快捷键：iTerm/Tmux/Alfred/Raycast 里绑 `node livedub/scripts/note.mjs "..."` 即可。
 - 视频标题/URL 决定 `video.id`，同一视频的所有笔记会聚合在一起。
 
+## 图文笔记：画面理解（v0.5）
+
+不只是记字幕：笔记可以同时包含**视频画面理解 + 音频字幕 + 综合总结**。
+
+- **工作台「图文笔记」**（笔记抽屉）：
+  1. 选范围（当前时间→结尾 / 全片）；
+  2. 自动按画面变化抽**关键帧**（默认每 6s 采样、64×36 灰度差异去重、最多 24 帧）；
+  3. 默认跑**本地 OCR**（macOS Vision，约 1s/帧，离线、免费）提取幻灯片/代码/板书文字；
+  4. 可选「画面理解（VLM，慢 ~20-30s/批）」对拼图画面做中文语义描述（默认关闭，产生模型费用）；
+  5. 用文本模型把「范围内字幕 + 画面文字 + 画面描述」合成**本节总结 + 要点 + 按时间线的图文条目**，保存为一篇 `kind:'visual'` 笔记；
+  6. 每条包含：时间跳转链接、画面截图、画面文字（代码块）、画面理解（可选）、该时段双语字幕引用。
+
+  **实测**（M2/16GB，demo 53s 片段）：范围 00:20–00:52 → 7 个候选点、去重后 3 个关键帧，真实 macOS Vision OCR + DeepSeek 总结，
+  全程约 **10s**，生成 2081 字图文笔记（3 张截图）。OCR serve 模式实测首帧 0.65–1.5s、后续 0.2–1.5s；VLM 单帧 20.3–21.9s（可选）。
+
+  | 图文笔记（真实 OCR + 真实总结） | 图文预览/画廊 |
+  |---|---|
+  | ![visual](assets/studio-visual-note.png) | ![gallery](assets/studio-visual-gallery.png) |
+- **快捷笔记**（扩展 `Alt+Shift+N` / macOS `⌥N`）：截图上传后自动做 OCR，把「画面文字」追加到笔记正文（VLM 可选关闭/开启）。
+- **CLI**：`npm run note -- "..." --screenshot frame.png` 自动带画面文字；加 `--vision` 额外做画面理解（慢）。
+
+配置（`config/livedub.config.json` → `vision`）：
+
+```json
+{
+  "vision": {
+    "provider": "ark-plan",
+    "model": "doubao-seed-2-1-turbo-260628",
+    "prompt": "你是课程笔记助手……",
+    "ocr": { "provider": "macos-vision", "bin": "data/bin/ocr-macos", "fallback": ["tesseract"] },
+    "summary": { "provider": "deepseek", "model": "deepseek-flash" },
+    "keyframe": { "intervalMs": 6000, "minChange": 0.035, "maxFrames": 24, "sheetSize": 6 }
+  }
+}
+```
+
+- 本地 OCR 构建：`npm run build:ocr`（Swift + macOS Vision，产物 `data/bin/ocr-macos`）；没有时回退 `tesseract`（仅 eng）。
+- VLM 走 OpenAI 兼容视觉接口（默认 ark-plan / doubao，可换任意兼容 provider）；未配置 Key 时只有 OCR，不影响笔记保存。
+
 ## 数据与隐私
 
 ```

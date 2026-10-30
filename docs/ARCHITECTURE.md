@@ -169,3 +169,24 @@ apps/macos/  Swift (无第三方依赖)
   `status=speaking` 时 160ms 渐变 duck 到设定比例，空闲恢复 → **iframe / WebAudio 站点也能压原声**（不再依赖 DOM 音量）。
 - 裸 `<video>` 原生全屏无法叠加 DOM：content script 在 MAIN world 猴补 `requestFullscreen`，对替换元素先包一层容器再对容器全屏；
   退出/失败自动回滚（`settings.fullscreenWorkaround`，默认开）。
+
+## 11. v0.5 视频画面理解（图文笔记）
+
+```text
+工作台（canvas 抽帧）
+  ├─ 关键帧：每 6s 采样 + 64×36 灰度差异去重（minChange 0.035，最多 24 帧）
+  ├─ 每帧 → PNG → assets → /api/vision/ocr（本地 macOS Vision，~1s/帧，离线）
+  ├─ 可选批量 → 2×3 拼图 → /api/vision/analyze?mode=vision
+  │        （OpenAI 兼容视觉模型，默认 ark-plan/doubao；单帧 20-30s，默认关闭）
+  └─ transcript(字幕) + visuals(OCR/描述) → /api/vision/summarize（deepseek）
+        → 「本条总结 + 要点 + 按时间线的截图/画面文字/双语引用」Markdown → Notes API 保存
+```
+
+- **本地 OCR**：`scripts/ocr-macos.swift`（Vision VNRecognizeTextRequest，en-US/zh-Hans）编译为 `data/bin/ocr-macos`；
+  缺失时回退 `tesseract`（仅 eng）。构建：`npm run build:ocr`。
+- **VLM**：`engine/vision/index.mjs` 调用 `config.vision.provider`（默认 ark-plan）的 OpenAI 兼容 `image_url`；
+  未配置 Key 时只有 OCR，不影响笔记。
+- **总结**：文本 LLM（默认 deepseek）消费字幕+画面文字/描述，输出中文总结与 3-6 要点。
+- **快捷笔记**：扩展 `Alt+Shift+N` / macOS `⌥N` 的截图会自动做 OCR，把「画面文字」追加进正文（VLM 可选）。
+- 实测（M2）：OCR serve 首帧 ~0.65–1.5s、后续 0.2–1.5s/帧；VLM 单帧 20.3–21.9s、6 帧拼图 38.7s；总结 2–6s；demo 3 帧图文笔记 ~10s。
+- 局限：VLM 慢且按调用计费，默认只做 OCR；DRM/跨域画面可能截不到；OCR 质量取决于画面清晰度。
