@@ -13,6 +13,8 @@
 > 面向**教学视频**（公开课/网课/技术讲座）优化：术语表约束、子句级低延迟配音、原声自动压音。
 >
 
+**v0.6（2026-10-30）**：**按章节自动生成图文笔记**（字幕停顿+画面切换分章 + 课程总览）、
+**画面 OCR 作为翻译上下文**（术语/公式更一致）、**Obsidian 目录自动同步**（Markdown+截图+索引，保存后自动导出）。
 **v0.5（2026-10-30）**：**视频画面理解 → 图文笔记**——按画面变化抽关键帧，本地 macOS Vision OCR 提取幻灯片/代码文字，
 可选 VLM 画面语义理解，和双语字幕一起合成「音频 + 画面 + 总结」的图文笔记；快捷笔记自动附带画面文字。
 **v0.4**：学习笔记（Notes API / 工作台笔记抽屉 / 扩展 `Alt+Shift+N` / macOS `⌥N` / CLI / Markdown·Obsidian 导出）。
@@ -50,6 +52,7 @@ YouTube / B站 / 网课页面       本地引擎 (127.0.0.1)               输�
 | 云端 ASR | MiniMax `asr-1.0`（`npm run start:cloud`） | 4s≈0.79s / 12s≈1.0-1.2s；**云端档 e2e ≈2.2–2.4s**，音频会上传、失败自动降级本地 |
 | 学习笔记 | 时间戳 + 双语引用 + 截图 + 代码块 + 大纲；三端快捷记录（工作台 `N`、扩展 `Alt+Shift+N`、桌面 `⌥N`、CLI） | 笔记只落本机 `data/notes/`，导出 Markdown 可直接进 Obsidian（见 [docs/NOTES.md](docs/NOTES.md)） |
 | 图文笔记（画面理解） | 按画面变化抽关键帧 + 本地 macOS Vision OCR（serve 模式首帧 ~0.7–1.5s、后续 0.2–1.5s）+ 可选 VLM 画面语义理解 + 音频字幕综合总结 | demo 3 帧图文笔记全程 ~10s（真实 OCR+DeepSeek）；VLM 单帧约 20–22s（可选，默认关）；见 [docs/NOTES.md](docs/NOTES.md#图文笔记画面理解v05) |
+| 章节 / Obsidian / 画面上下文（v0.6） | 字幕停顿+画面变化自动分章 → 逐章图文笔记 + 课程总览；Obsidian vault 自动同步（Markdown+截图+索引）；画面 OCR 经 WS 推给翻译作术语参考 | demo 全片 52s → **2 章 + 1 篇总览**、7 张截图、约 42s；画面上下文默认关闭（工作台 9s / macOS 10s 采样，仅 WS 连接时发送）；见 [docs/NOTES.md](docs/NOTES.md) |
 | 桌面端 | macOS 原生悬浮窗（ScreenCaptureKit） | `apps/macos/` 源码 + `scripts/build-macos.sh`（见 [apps/macos/README.md](apps/macos/README.md)） |
 | 管线 | Node 零依赖引擎，VAD 切分 + 子句级 TTS + 调度压音 | 52.7s 示例课实测：**质量档 e2e 3.0s** / **快速档 2.4s**（ASR 1.8s→0.9s、翻译首字 0.8s、TTS 首包 0.25s；[完整数据](docs/MEASUREMENTS.md)） |
 
@@ -175,6 +178,9 @@ npm run note -- "这里为什么要 detach？" --video "MIT 6.S191" --time 12:34
 - 笔记带**视频时间戳**，列表点击直接跳回对应画面；
 - 自动附带**中英双语原句**、可插**视频截图**与**代码块**；
 - **图文笔记（画面理解）**：一键按画面变化抽关键帧 → 本地 OCR 提取幻灯片/代码文字 →（可选）VLM 理解画面 → 和字幕一起生成「音频+画面+总结」的图文笔记；
+- **按章节生成图文笔记**：字幕停顿 + 画面切换自动分章，逐章生成图文笔记，并自动维护一篇「课程总览」；
+- **Obsidian 自动同步**：在 config 配置 vault 目录后，导出 Markdown + 截图资产 + `livedub-notes-index.md`，笔记保存后自动同步；
+- **画面 OCR 辅助翻译**：开启后每 8–10s 把当前画面文字推给引擎，翻译时参考幻灯片术语/公式（默认关闭，仅实时会话）；
 - 一键生成按时间轴的**课程大纲**，导出 Markdown（YAML front matter）到 `data/exports/`，可直接放进 Obsidian；
 - 详细用法与隐私说明：[docs/NOTES.md](docs/NOTES.md)。
 
@@ -185,6 +191,26 @@ npm run note -- "这里为什么要 detach？" --video "MIT 6.S191" --time 12:34
 | 图文笔记（真实 OCR + 真实总结） | 图文预览/画廊（幻灯片截图 + OCR 原文） |
 |---|---|
 | ![visual-notes](docs/assets/studio-visual-note.png) | ![visual-gallery](docs/assets/studio-visual-gallery.png) |
+
+| 章节图文笔记（第 2/2 章） | 课程总览（章节时间锚点） |
+|---|---|
+| ![chapter](docs/assets/studio-chapter-note.png) | ![overview](docs/assets/studio-course-overview.png) |
+
+| Obsidian 自动同步状态（vault + 索引） |
+|---|
+| ![obsidian](docs/assets/studio-obsidian-sync.png) |
+
+### Obsidian 自动同步（可选）
+
+```json
+// config/livedub.config.json
+"notes": {
+  "obsidian": { "enabled": true, "dir": "~/Obsidian/课程笔记", "assetsSubdir": "livedub-assets", "autoExport": true }
+}
+```
+
+配置后重新启动 `npm start`：工作台笔记抽屉会显示「已启用 → 路径 · 最近同步」；生成/编辑笔记后自动导出 Markdown + 截图到 vault，
+并维护 `livedub-notes-index.md`。也可随时点「同步 Obsidian」手动导出。
 
 ## 目录结构
 

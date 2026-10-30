@@ -35,6 +35,8 @@ const SWIFT_FILES = [
   'Screenshot.swift',
   // v0.5 画面文字 / 画面理解
   'Vision.swift',
+  // v0.6 实时画面上下文推送
+  'VisualContext.swift',
 ];
 
 test('macos: 构建脚本存在，bash -n 语法检查通过', () => {
@@ -199,6 +201,55 @@ test('macos: 引擎地址 / 事件名与 docs+protocol.mjs 对齐', () => {
   assert.match(protocolSwift, /"type":\s*"hello"/);
   const main = readSource('main.swift');
   assert.match(main, /sendAudioFrame/);
+});
+
+test('macos: visual-context 常量与 engine/protocol.mjs 对齐', () => {
+  const protocol = read('engine/protocol.mjs');
+  assert.match(protocol, /VISUAL_CONTEXT: 'visual-context'/, '引擎协议缺少 VISUAL_CONTEXT 消息类型');
+  assert.match(protocol, /VISUAL_CONTEXT_MAX_CHARS = 2000/, '引擎文本上限应为 2000');
+  assert.match(protocol, /VISUAL_CONTEXT_TTL_MS = 120000/, '引擎 TTL 应为 120s');
+  const visual = readSource('VisualContext.swift');
+  assert.match(visual, /maxTextChars = 2_000/);
+  assert.match(visual, /engineTTLMs = 120_000/);
+  assert.match(visual, /"visual-context"/);
+});
+
+test('macos: v0.6 实时画面上下文推送（visual-context / 默认关 / 决策 / 状态）', () => {
+  const visual = readSource('VisualContext.swift');
+  assert.match(visual, /visual-context/, '缺少 v0.6 WS 事件类型');
+  assert.match(visual, /VisualContextEvent/);
+  assert.match(visual, /maxTextChars = 2_000/);
+  assert.match(visual, /engineTTLMs = 120_000/);
+  assert.match(visual, /defaultIntervalSeconds: TimeInterval = 10/);
+  assert.match(visual, /minIntervalSeconds: TimeInterval = 8/);
+  assert.match(visual, /maxIntervalSeconds: TimeInterval = 15/);
+  assert.match(visual, /isDuplicate/, '缺少同帧去重');
+  assert.match(visual, /formatStatus/, '缺少菜单/浮层状态文案');
+  assert.match(visual, /capturedAtMs/, '缺少契约字段 capturedAtMs');
+  assert.match(visual, /"source": "macos"|source = "macos"/);
+
+  const settings = readSource('Settings.swift');
+  assert.match(settings, /visualContextEnabled/);
+  assert.match(settings, /bool\(forKey: Key\.visualContextEnabled, default: false\)/, '画面上下文默认必须关闭');
+  assert.match(settings, /visualContextInterval/);
+
+  const main = readSource('main.swift');
+  assert.match(main, /--visual-context/);
+  assert.match(main, /pushVisualContextTick/);
+  assert.match(main, /toggleVisualContext/);
+  assert.match(main, /画面上下文：/);
+  assert.match(main, /visualContextTimer/);
+  assert.match(main, /engineConnectionState/);
+  assert.match(main, /sendJSON\(event\.jsonObject\)/);
+
+  const engine = readSource('EngineClient.swift');
+  assert.match(engine, /var isConnected/);
+  assert.match(engine, /func sendJSON/);
+
+  const selfTest = readSource('SelfTest.swift');
+  for (const must of ['checkVisualContext()', 'visual-context', '画面上下文', 'isDuplicate', 'engineTTLMs']) {
+    assert.ok(selfTest.includes(must), `SelfTest.swift 缺少 v0.6 检查：${must}`);
+  }
 });
 
 test('macos: v0.5 画面文字（OCR）/ 画面理解（VLM）（Vision + NotesClient + 菜单）', () => {
@@ -370,6 +421,12 @@ test('macos: apps/macos/README.md 覆盖构建/权限/运行/已知限制/手动
     '画面理解',
     'VLM',
     'api/vision',
+    // v0.6 实时画面上下文
+    '画面上下文',
+    'visual-context',
+    '默认关闭',
+    '每 10s',
+    'CPU',
   ]) {
     assert.ok(readme.includes(must), `README 缺少关键说明：${must}`);
   }
@@ -393,7 +450,7 @@ test(
     });
     const match = output.match(/self-test: (\d+) checks passed/);
     assert.ok(match, '构建输出缺少 self-test 统计');
-    assert.ok(Number(match[1]) >= 150, `self-test 项数应 >= 150（v0.5 含视觉检查），实际 ${match[1]}`);
+    assert.ok(Number(match[1]) >= 200, `self-test 项数应 >= 200（v0.6 含画面上下文检查），实际 ${match[1]}`);
     assert.ok(existsSync(path.join(APP_DIR, 'build', 'livedub.app', 'Contents', 'MacOS', 'livedub')));
   },
 );

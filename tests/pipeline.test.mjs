@@ -396,3 +396,60 @@ test('pipeline v0.2: asr onError is forwarded as error(asr) event', async () => 
   await session.close('done');
 });
 
+// v0.6：画面 OCR 上下文（WS visual-context）传给翻译器，带 TTL/去重/清洗
+test('pipeline: visual-context 传给翻译器（top-level 参数）+ 去重/TTL/seek 清空', async () => {
+  const calls = [];
+  const config = makeConfig();
+  const recorder = makeRecorder();
+  const baseDeps = makeDeps(config);
+  const session = await createSession({
+    id: 'test-visual-context',
+    options: { source: 'test', langFrom: 'en', langTo: 'zh' },
+    emit: (e) => recorder.emit(e),
+    log: () => {},
+    deps: {
+      ...baseDeps,
+      createTranslator: (opts) => {
+        const t = baseDeps.createTranslator(opts);
+        const orig = t.translate.bind(t);
+        t.translate = async (args) => {
+          calls.push(args);
+          return orig(args);
+        };
+        return t;
+      },
+    },
+  });
+  await recorder.waitFor((e) => e.type === 'ready', { label: 'ready' });
+
+  // 空/纯标点忽略；有效文本接受
+  session.onJson({ type: 'visual-context', text: '   ', tMs: 0, source: 'test' });
+  session.onJson({ type: 'visual-context', text: '...', tMs: 0, source: 'test' });
+  assert.equal(session.stats().visualContext.received, 0);
+  session.onJson({ type: 'visual-context', text: 'Gradient Descent · learning rate 学习率', tMs: 1000, source: 'test' });
+  // 相同内容去重
+  session.onJson({ type: 'visual-context', text: 'Gradient Descent · learning rate 学习率', tMs: 1200, source: 'test' });
+  const st1 = session.stats();
+  assert.equal(st1.visualContext.received, 1);
+  assert.equal(st1.visualContext.ignored >= 2, true);
+  assert.equal(st1.visualContext.hasContext, true);
+
+  await feedAudio(session, 5200);
+  await recorder.waitFor((e) => e.type === 'translation' && e.id === 1 && e.final, { label: 'translation' });
+  assert.ok(calls.length >= 1, 'translator 应被调用');
+  assert.equal(calls[0].visualContext, 'Gradient Descent · learning rate 学习率');
+  assert.equal(calls[0].visualContextAtMs, 1000);
+  assert.equal(session.stats().visualContext.used >= 1, true);
+
+  // seek 后旧画面上下文作废
+  await session.onJson({ type: 'control', action: 'seek' });
+  assert.equal(session.stats().visualContext.hasContext, false);
+
+  // TTL：把 ttl 配成 1ms 后旧上下文过期
+  session.onJson({ type: 'visual-context', text: '另一帧画面文字', tMs: 2000, source: 'test' });
+  await new Promise((r) => setTimeout(r, 5));
+  session._configForTest = null;
+  session.config.visual = { contextTtlMs: 1 };
+  assert.equal(session.stats().visualContext.hasContext, false);
+  await session.close('done');
+});

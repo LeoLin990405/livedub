@@ -161,3 +161,18 @@ test('ws: rejects wrong path', async () => {
     server.close();
   }
 });
+
+// v0.6：画面 OCR 上下文清洗（只作翻译参考）
+import { sanitizeVisualContext, VISUAL_CONTEXT_MAX_CHARS } from '../engine/protocol.mjs';
+
+test('protocol: sanitizeVisualContext 清洗/截断/拒绝无效输入', () => {
+  assert.equal(sanitizeVisualContext(''), '');
+  assert.equal(sanitizeVisualContext(null), '');
+  assert.equal(sanitizeVisualContext('   \n\t  '), '');
+  assert.equal(sanitizeVisualContext('...!!!'), '');
+  assert.equal(sanitizeVisualContext('Gradient\u0000 Descent'), 'Gradient Descent');
+  assert.equal(sanitizeVisualContext('a\n\n\n b'), 'a\nb');
+  assert.equal(sanitizeVisualContext('x'.repeat(VISUAL_CONTEXT_MAX_CHARS + 10)).length, VISUAL_CONTEXT_MAX_CHARS);
+  assert.equal(sanitizeVisualContext('学习率 learning rate', 4), '学习率 ');
+  assert.equal(sanitizeVisualContext('😀abc', 2), '😀a'); // 不切坏代理对
+});

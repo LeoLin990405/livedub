@@ -190,3 +190,13 @@ apps/macos/  Swift (无第三方依赖)
 - **快捷笔记**：扩展 `Alt+Shift+N` / macOS `⌥N` 的截图会自动做 OCR，把「画面文字」追加进正文（VLM 可选）。
 - 实测（M2）：OCR serve 首帧 ~0.65–1.5s、后续 0.2–1.5s/帧；VLM 单帧 20.3–21.9s、6 帧拼图 38.7s；总结 2–6s；demo 3 帧图文笔记 ~10s。
 - 局限：VLM 慢且按调用计费，默认只做 OCR；DRM/跨域画面可能截不到；OCR 质量取决于画面清晰度。
+
+## 12. v0.6：章节图文笔记 / 画面 OCR 翻译上下文 / Obsidian 同步
+
+- **章节图文笔记**：工作台用「字幕间隙 >2.5s + 画面变化点」把视频切成章节（20s–180s，最多 30 章），
+  每章独立采样/OCR/总结并保存为一篇 `kind:'visual'` 笔记，最后生成 `kind:'outline'` 课程总览（章节时间锚点）。
+  实测 demo 52s → 2 章 + 总览、7 张截图、约 42s。
+- **画面上下文翻译**：客户端（工作台/桌面端）每 8–10s 把当前画面 OCR 通过 WS `visual-context` 推给引擎；
+  引擎保存 TTL 120s 的最近一条，翻译时作为「仅术语/语境参考」注入 prompt；`seek` 清空。
+- **Obsidian 同步**：`notes.obsidian.{enabled,dir,assetsSubdir,autoExport}`；导出 Markdown 到 vault、
+  复制截图资产并改写相对路径、维护 `livedub-notes-index.md`；启用 autoExport 时笔记增删改后 debounce(~1s) 自动同步。

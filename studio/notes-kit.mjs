@@ -487,3 +487,209 @@ export function resolveEditorShortcut(event) {
   if ((event.shiftKey && (event.code === 'KeyC' || String(event.key ?? '').toLowerCase() === 'c'))) return 'codeblock';
   return null;
 }
+
+// ==================================================== v0.6 章节分段 / 课程总览
+
+const CHAPTER_DEFAULTS = Object.freeze({
+  minGapMs: 2500,
+  minChapterMs: 20000,
+  maxChapterMs: 180000,
+  maxChapters: 30,
+  changeThreshold: 0.035,
+  snapMs: 2000,
+});
+
+function chapterNumber(value, fallback) {
+  const number = Number(value);
+  return Number.isFinite(number) && number > 0 ? number : fallback;
+}
+
+function chapterClamp(value, min, max) {
+  return Math.min(max, Math.max(min, value));
+}
+
+/** 章标题：该章范围内第一个有 OCR 的候选帧首行，否则「第 N 章 · hh:mm:ss」 */
+function chapterTitleFor(intervals, index, candidates, startMs) {
+  const candidatesInRange = candidates.filter((candidate) => candidate.tMs >= startMs && candidate.tMs <= intervals.endMs && String(candidate.ocrText ?? '').trim());
+  const first = candidatesInRange[0];
+  if (first) {
+    const line = String(first.ocrText)
+      .split('\n')
+      .map((text) => text.trim().replace(/^#+\s*/, '').replace(/[`*_>]/g, '').trim())
+      .find(Boolean);
+    if (line) return line.slice(0, 48);
+  }
+  return `第 ${index} 章 · ${formatNoteTimestamp(startMs)}`;
+}
+
+/**
+ * v0.6 按章节自动分段：
+ * - 字幕间隙 > minGapMs（默认 2.5s）处切分；
+ * - 关键帧画面变化点（changeRatio >= changeThreshold，默认 0.035）吸附到 ±snapMs 内最近的段边界切分；
+ * - 章节最短 minChapterMs（20s，过短合并）、最长 maxChapterMs（180s，按段边界再切）、最多 maxChapters（30）；
+ * - 输出 [{index,startMs,endMs,title}]，保证升序、不重叠、覆盖完整范围。
+ */
+export function computeChapters(segments = [], keyframeCandidates = [], opts = {}) {
+  const minGapMs = chapterNumber(opts.minGapMs, CHAPTER_DEFAULTS.minGapMs);
+  const minChapterMs = chapterNumber(opts.minChapterMs, CHAPTER_DEFAULTS.minChapterMs);
+  const maxChapterMs = Math.max(minChapterMs, chapterNumber(opts.maxChapterMs, CHAPTER_DEFAULTS.maxChapterMs));
+  const maxChapters = Math.max(1, Math.round(chapterNumber(opts.maxChapters, CHAPTER_DEFAULTS.maxChapters)));
+  const changeThreshold = Number.isFinite(Number(opts.changeThreshold)) ? Number(opts.changeThreshold) : CHAPTER_DEFAULTS.changeThreshold;
+  const snapMs = chapterNumber(opts.snapMs, CHAPTER_DEFAULTS.snapMs);
+
+  const segs = (Array.isArray(segments) ? segments : [])
+    .filter((segment) => segment && Number.isFinite(Number(segment.t0Ms)))
+    .map((segment) => {
+      const t0Ms = Math.max(0, Math.round(Number(segment.t0Ms) || 0));
+      const t1Ms = Math.max(t0Ms, Math.round(Number(segment.t1Ms) || t0Ms));
+      return { t0Ms, t1Ms, text: String(segment.text ?? segment.src ?? ''), translation: String(segment.translation ?? segment.dst ?? '') };
+    })
+    .sort((a, b) => a.t0Ms - b.t0Ms);
+
+  const candidates = (Array.isArray(keyframeCandidates) ? keyframeCandidates : [])
+    .filter((candidate) => candidate && Number.isFinite(Number(candidate.tMs)))
+    .map((candidate) => ({
+      tMs: Math.max(0, Math.round(Number(candidate.tMs) || 0)),
+      changeRatio: Number(candidate.changeRatio) || 0,
+      ocrText: String(candidate.ocrText ?? ''),
+      imageUrl: candidate.imageUrl ? String(candidate.imageUrl) : '',
+    }))
+    .sort((a, b) => a.tMs - b.tMs);
+
+  let startMs = 0;
+  let endMs = 0;
+  if (segs.length > 0) {
+    startMs = segs[0].t0Ms;
+    endMs = segs.reduce((max, segment) => Math.max(max, segment.t1Ms), segs[0].t1Ms);
+  } else if (candidates.length > 0) {
+    startMs = candidates[0].tMs;
+    endMs = candidates.reduce((max, candidate) => Math.max(max, candidate.tMs), candidates[0].tMs);
+  } else {
+    return [];
+  }
+  if (endMs < startMs) endMs = startMs;
+
+  const cuts = new Set();
+  for (let index = 1; index < segs.length; index += 1) {
+    const gap = segs[index].t0Ms - segs[index - 1].t1Ms;
+    if (gap > minGapMs) {
+      const cut = chapterClamp(segs[index].t0Ms, startMs, endMs);
+      if (cut > startMs && cut < endMs) cuts.add(cut);
+    }
+  }
+  for (const candidate of candidates) {
+    if (candidate.changeRatio < changeThreshold) continue;
+    let snapped = null;
+    let bestDistance = Number.POSITIVE_INFINITY;
+    for (const segment of segs) {
+      const distance = Math.abs(segment.t0Ms - candidate.tMs);
+      if (distance <= snapMs && distance < bestDistance) {
+        bestDistance = distance;
+        snapped = segment.t0Ms;
+      }
+    }
+    const cut = chapterClamp(snapped ?? candidate.tMs, startMs, endMs);
+    if (cut > startMs && cut < endMs) cuts.add(cut);
+  }
+
+  let intervals = [{ startMs, endMs }];
+  for (const cut of [...cuts].sort((a, b) => a - b)) {
+    const last = intervals[intervals.length - 1];
+    if (cut > last.startMs && cut < last.endMs) {
+      last.endMs = cut;
+      intervals.push({ startMs: cut, endMs });
+    }
+  }
+
+  // 归一化：只保留同时满足左右最短长度的切分（从起点贪心）。
+  // 示例：52s 视频在 12/23.36/31.44/40.98s 都有切分时，直接合并会塌成 1 章；
+  // 这里保留 23.36s 这一刀 -> 两章（≥20s），其余邻接过短的切分丢弃。
+  const selectedIntervals = [];
+  let chapterCursor = startMs;
+  for (const cut of [...cuts].sort((a, b) => a - b)) {
+    if (cut - chapterCursor < minChapterMs) continue;
+    if (endMs - cut < minChapterMs) continue;
+    selectedIntervals.push({ startMs: chapterCursor, endMs: cut });
+    chapterCursor = cut;
+  }
+  selectedIntervals.push({ startMs: chapterCursor, endMs });
+  intervals = selectedIntervals;
+
+  // 拆分超长章节：优先用区间内的字幕段边界，否则按 maxChapterMs 硬切
+  const segmentStarts = segs.map((segment) => segment.t0Ms);
+  const splitIntervals = [];
+  for (const interval of intervals) {
+    let cursor = interval.startMs;
+    while (interval.endMs - cursor > maxChapterMs) {
+      const boundaryCandidates = segmentStarts.filter((t0) => t0 > cursor + minChapterMs && t0 <= cursor + maxChapterMs);
+      const cut = boundaryCandidates.length > 0 ? Math.max(...boundaryCandidates) : cursor + maxChapterMs;
+      splitIntervals.push({ startMs: cursor, endMs: cut });
+      cursor = cut;
+    }
+    if (interval.endMs > cursor) splitIntervals.push({ startMs: cursor, endMs: interval.endMs });
+  }
+  intervals = splitIntervals;
+  // 超长切分产生的过短尾章并回前一章
+  while (intervals.length > 1) {
+    const last = intervals[intervals.length - 1];
+    if (last.endMs - last.startMs >= minChapterMs) break;
+    intervals[intervals.length - 2].endMs = last.endMs;
+    intervals.splice(intervals.length - 1, 1);
+  }
+
+  // 最多 maxChapters：合并最短章节（优先与后一章合并）
+  while (intervals.length > maxChapters) {
+    let shortestIndex = 0;
+    let shortestLength = Number.POSITIVE_INFINITY;
+    for (let index = 0; index < intervals.length; index += 1) {
+      const length = intervals[index].endMs - intervals[index].startMs;
+      if (length < shortestLength) {
+        shortestLength = length;
+        shortestIndex = index;
+      }
+    }
+    if (shortestIndex + 1 < intervals.length) {
+      intervals[shortestIndex].endMs = intervals[shortestIndex + 1].endMs;
+      intervals.splice(shortestIndex + 1, 1);
+    } else {
+      intervals[shortestIndex - 1].endMs = intervals[shortestIndex].endMs;
+      intervals.splice(shortestIndex, 1);
+    }
+  }
+
+  return intervals.map((interval, index) => ({
+    index: index + 1,
+    startMs: interval.startMs,
+    endMs: interval.endMs,
+    title: chapterTitleFor(interval, index + 1, candidates, interval.startMs),
+  }));
+}
+
+/** 课程总览（kind:'outline'）Markdown：章节时间锚点列表 */
+export function buildCourseOverviewMarkdown({ video = {}, chapters = [], generatedAt = new Date() } = {}) {
+  const title = String(video?.title ?? video?.id ?? 'livedub 课程');
+  const stamp = generatedAt instanceof Date && !Number.isNaN(generatedAt.getTime()) ? generatedAt : new Date();
+  const dateText = `${stamp.getFullYear()}-${String(stamp.getMonth() + 1).padStart(2, '0')}-${String(stamp.getDate()).padStart(2, '0')} ${String(stamp.getHours()).padStart(2, '0')}:${String(stamp.getMinutes()).padStart(2, '0')}`;
+  const lines = [];
+  lines.push(`# ${title} · 课程总览`);
+  lines.push('');
+  lines.push(`> 视频：${video?.url ? String(video.url) : `\`${String(video?.id ?? '')}\``}`);
+  if (video?.durationMs) lines.push(`> 时长：${formatNoteTimestamp(video.durationMs)}`);
+  lines.push(`> 共 ${chapters.length} 章 · 生成于 ${dateText} · 每章一篇图文笔记（kind:visual）`);
+  lines.push('');
+  lines.push('## 章节');
+  lines.push('');
+  if (chapters.length === 0) {
+    lines.push('（还没有章节：先在工作台「图文笔记」里选择「按章节」生成）');
+    lines.push('');
+  }
+  for (const chapter of chapters) {
+    const startMs = Math.max(0, Math.round(Number(chapter?.startMs) || 0));
+    const endMs = Math.max(startMs, Math.round(Number(chapter?.endMs) || startMs));
+    lines.push(`- [${formatNoteTimestamp(startMs)}](?t=${startMs}) · 第 ${chapter?.index ?? 0} 章 ${String(chapter?.title ?? '').trim()}（至 ${formatNoteTimestamp(endMs)}）`);
+  }
+  lines.push('');
+  lines.push('> 点时间锚点可回到视频对应位置；每章图文笔记可在工作台笔记列表搜索「章节」，或在 `/studio/?notes=1` 打开笔记本。');
+  lines.push('');
+  return `${lines.join('\n').replace(/\n{3,}/g, '\n\n').trim()}\n`;
+}

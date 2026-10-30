@@ -4274,3 +4274,93 @@ html[data-theme="light"] .notes-kind.visual {
     flex-basis: auto;
   }
 }
+
+/* ================================================================
+   v0.6：Obsidian 同步状态行 / 画面上下文开关
+   ================================================================ */
+
+.notes-obsidian {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 12px;
+  border-bottom: 1px solid var(--border);
+  background: linear-gradient(90deg, rgba(129, 140, 248, 0.06), transparent 65%);
+  font-size: 10.5px;
+  color: var(--muted);
+}
+
+.notes-obsidian-text {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.notes-obsidian-text code {
+  font-size: 10px;
+}
+
+.notes-obsidian-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--muted-2);
+  flex: 0 0 auto;
+}
+
+.notes-obsidian-dot.on {
+  background: #34d399;
+  box-shadow: 0 0 8px rgba(52, 211, 153, 0.55);
+}
+
+.notes-obsidian-dot.off {
+  background: #f59e0b;
+}
+
+.notes-obsidian-dot.error {
+  background: #fb7185;
+}
+
+.notes-context {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 12px;
+  border-bottom: 1px solid var(--border);
+  font-size: 10.5px;
+  color: var(--muted);
+}
+
+.notes-context-toggle {
+  gap: 6px;
+  user-select: none;
+}
+
+.notes-context-toggle span {
+  font-size: 11px;
+}
+
+.notes-context-status {
+  font-size: 10.5px;
+  white-space: nowrap;
+}
+
+.notes-context-status.active {
+  color: #7ff0df;
+}
+
+html[data-theme="light"] .notes-obsidian {
+  background: linear-gradient(90deg, rgba(99, 102, 241, 0.05), transparent 65%);
+}
+
+html[data-theme="light"] .notes-context-status.active {
+  color: #0f766e;
+}
+
+@media (max-width: 900px) {
+  .notes-obsidian-text,
+  .notes-context-status {
+    max-width: 52vw;
+  }
+}

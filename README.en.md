@@ -34,7 +34,10 @@ Two surfaces:
   subtitles + SRT + replayable event stream.
 - **Learning notes** — time-stamped notes with bilingual quotes, screenshots and code
   blocks; capture from the workbench (`N`), the extension (`Alt+Shift+N`), the macOS
-  overlay (`⌥N`) or the CLI (`npm run note -- "..."`); export Markdown for Obsidian.
+  overlay (`⌥N`) or the CLI (`npm run note -- "..."`).
+- **Visual notes & chapters** — keyframe sampling + local macOS Vision OCR (+ optional VLM),
+  auto chapter segmentation with per-chapter notes and a course overview, Obsidian vault
+  auto-sync (Markdown + assets + index), and optional screen-OCR context for translation.
 
 Measured on this machine (Apple M2 / 16GB, 52.7s demo lecture, real providers):
 

@@ -12,6 +12,8 @@
 //   - v0.4 快捷笔记：quick note JSON/时间格式/离线队列/标题推导/截图降级
 //   - v0.5 画面文字（OCR）/画面理解：请求体、imageUrl 校验、文本清洗/代码块转义、
 //     降级决策（含旧引擎 404 无 /api/vision/*）、health 解析（全部纯函数，不联网）
+//   - v0.6 实时画面上下文：visual-context 事件 JSON/字段、OCR 文本清洗截断、同帧去重、
+//     默认关闭/未连接/暂停不发送的决策、间隔钳制、状态文案（不联网）
 //  退出码：0 全部通过；1 有失败（便于 CI 与 scripts/build-macos.sh --check）。
 //
 
@@ -71,6 +73,7 @@ enum SelfTest {
         checkSettings()
         checkNotes()
         checkVision()
+        checkVisualContext()
         checkSimulationData()
 
         if failures.isEmpty {
@@ -875,6 +878,153 @@ enum SelfTest {
               VisionPlanner.ocrMaxChars == 2_000
                   && VisionPlanner.captionMaxChars == 1_000
                   && VisionPlanner.maxImageBytes == 4 * 1024 * 1024)
+    }
+
+
+    // MARK: 实时画面上下文（v0.6）
+
+    private static func checkVisualContext() {
+        // 默认关闭 / 间隔默认与钳制（隔离 UserDefaults，只读，不污染真实设置）
+        let suite = UserDefaults(suiteName: "com.livedub.macos.selftest.visualcontext") ?? .standard
+        let isolatedSettings = Settings(defaults: suite)
+        check("画面上下文：默认关闭", isolatedSettings.visualContextEnabled == false)
+        check("画面上下文：默认间隔 10s", isolatedSettings.visualContextInterval == 10,
+              detail: "\(isolatedSettings.visualContextInterval)")
+        check("画面上下文：间隔钳制到 8–15s",
+              VisualContextPlanner.clampInterval(5) == 8
+                  && VisualContextPlanner.clampInterval(20) == 15
+                  && VisualContextPlanner.clampInterval(12) == 12
+                  && VisualContextPlanner.clampInterval(nil) == 10
+                  && VisualContextPlanner.clampInterval(Double.nan) == 10)
+
+        // 事件构造 / JSON 契约
+        let capturedAt = Date(timeIntervalSince1970: 1_790_000_000)
+        let event = VisualContextPlanner.makeEvent(
+            text: "  Gradient descent\n\nFollow the slope  ",
+            tMs: 12_345,
+            capturedAt: capturedAt
+        )
+        check("visual-context：事件字段 type/source/tMs",
+              event?.type == "visual-context" && event?.source == "macos" && event?.tMs == 12_345)
+        check("visual-context：capturedAtMs 为墙钟毫秒",
+              abs((event?.capturedAtMs ?? 0) - 1_790_000_000_000) < 1, detail: "\(event?.capturedAtMs ?? -1)")
+        check("visual-context：文本清洗（trim/去空行）",
+              event?.text == "Gradient descent\nFollow the slope", detail: event?.text ?? "nil")
+        check("visual-context：空文本 -> nil",
+              VisualContextPlanner.makeEvent(text: " \n\t ", tMs: 0, capturedAt: capturedAt) == nil)
+        check("visual-context：负 tMs 归零",
+              VisualContextPlanner.makeEvent(text: "x", tMs: -5, capturedAt: capturedAt)?.tMs == 0)
+        if let event {
+            let object = event.jsonObject
+            check("visual-context：JSON 恰好 5 个契约字段",
+                  Set(object.keys) == ["type", "text", "tMs", "source", "capturedAtMs"])
+            check("visual-context：JSON 字段值与类型",
+                  object["type"] as? String == "visual-context"
+                      && object["source"] as? String == "macos"
+                      && object["text"] as? String == "Gradient descent\nFollow the slope"
+                      && object["tMs"] as? Double == 12_345
+                      && object["capturedAtMs"] as? Double != nil)
+            do {
+                let json = try event.jsonText()
+                let parsed = try JSONSerialization.jsonObject(with: Data(json.utf8)) as? [String: Any]
+                check("visual-context：JSON 文本帧可解析",
+                      parsed?["type"] as? String == "visual-context"
+                          && parsed?["text"] as? String == event.text)
+                let decoded = try JSONDecoder().decode(VisualContextEvent.self, from: Data(json.utf8))
+                check("visual-context：Codable 往返", decoded == event)
+            } catch {
+                check("visual-context：JSON 文本帧可解析", false, detail: "\(error)")
+                check("visual-context：Codable 往返", false, detail: "\(error)")
+            }
+        } else {
+            check("visual-context：JSON 恰好 5 个契约字段", false)
+            check("visual-context：JSON 字段值与类型", false)
+            check("visual-context：JSON 文本帧可解析", false)
+            check("visual-context：Codable 往返", false)
+        }
+
+        // 文本清洗 / 截断
+        let longText = String(repeating: "字", count: 2_500)
+        check("画面上下文文本：截断 2000 字",
+              (VisualContextPlanner.cleanText(longText) ?? "").count == 2_000)
+        check("画面上下文文本：相邻重复行去重",
+              VisualContextPlanner.cleanText("same\nsame\nother") == "same\nother")
+        check("画面上下文文本：控制字符剔除",
+              VisualContextPlanner.cleanText("\u{0007}abc") == "abc")
+        check("画面上下文文本：空/全空白 -> nil",
+              VisualContextPlanner.cleanText("") == nil && VisualContextPlanner.cleanText(" \n\t") == nil)
+        check("画面上下文文本：纯标点/符号 -> nil（与引擎清洗对齐）",
+              VisualContextPlanner.cleanText("!!! 。。。 ") == nil
+                  && VisualContextPlanner.cleanText("🎉🎉") == nil
+                  && VisualContextPlanner.cleanText("OK 123") != nil
+                  && VisualContextPlanner.cleanText("梯度下降") != nil)
+
+        // 同帧去重
+        check("画面上下文去重：相同文本", VisualContextPlanner.isDuplicate("hello world", lastText: "hello world"))
+        check("画面上下文去重：空白/大小写差异",
+              VisualContextPlanner.isDuplicate("Hello   World\n", lastText: "hello world"))
+        check("画面上下文去重：不同文本不跳过",
+              !VisualContextPlanner.isDuplicate("hello", lastText: "world"))
+        check("画面上下文去重：首次不跳过",
+              !VisualContextPlanner.isDuplicate("hello", lastText: nil))
+        check("画面上下文去重：归一化",
+              VisualContextPlanner.normalizeForDedup(" a\tb\nc ") == "a b c")
+
+        // 发送决策：默认关 / 未连接 / 暂停 / 停止 都不发送
+        let connected: EngineConnectionState = .connected
+        check("画面上下文决策：默认关闭 -> skip(disabled)",
+              VisualContextPlanner.decide(enabled: false, isRunning: true, isPaused: false,
+                                         connection: connected, hasSession: true) == .skip(reason: "disabled"))
+        check("画面上下文决策：未连接不发送",
+              VisualContextPlanner.decide(enabled: true, isRunning: true, isPaused: false,
+                                         connection: .reconnecting, hasSession: true) == .skip(reason: "disconnected")
+                  && VisualContextPlanner.decide(enabled: true, isRunning: true, isPaused: false,
+                                                connection: .disconnected, hasSession: true) == .skip(reason: "disconnected"))
+        check("画面上下文决策：暂停不推送",
+              VisualContextPlanner.decide(enabled: true, isRunning: true, isPaused: true,
+                                         connection: connected, hasSession: true) == .skip(reason: "paused"))
+        check("画面上下文决策：停止/无会话不推送",
+              VisualContextPlanner.decide(enabled: true, isRunning: false, isPaused: false,
+                                         connection: connected, hasSession: true) == .skip(reason: "notRunning")
+                  && VisualContextPlanner.decide(enabled: true, isRunning: true, isPaused: false,
+                                                connection: connected, hasSession: false) == .skip(reason: "notRunning"))
+        check("画面上下文决策：直播+已连接 -> push",
+              VisualContextPlanner.decide(enabled: true, isRunning: true, isPaused: false,
+                                         connection: connected, hasSession: true) == .push)
+        check("画面上下文跳过原因文案非空",
+              ["disabled", "notRunning", "paused", "disconnected"]
+                  .allSatisfy { !VisualContextPlanner.skipReasonText($0).isEmpty })
+
+        // 菜单/浮层状态文案
+        let utc = TimeZone(identifier: "UTC") ?? .current
+        check("画面上下文状态：关闭",
+              VisualContextPlanner.formatStatus(enabled: false, lastPush: nil, lastTextChars: 0, timeZone: utc)
+                  == "画面上下文：关")
+        check("画面上下文状态：开启等待首帧",
+              VisualContextPlanner.formatStatus(enabled: true, lastPush: nil, lastTextChars: 0, timeZone: utc)
+                  == "画面上下文：开 · 等待首帧")
+        check("画面上下文状态：最近时间 + 上次 OCR 字数",
+              VisualContextPlanner.formatStatus(
+                  enabled: true,
+                  lastPush: Date(timeIntervalSince1970: 0),
+                  lastTextChars: 128,
+                  timeZone: utc
+              ) == "画面上下文：开 · 最近 00:00:00 · 上次 OCR 128 字")
+        let status = VisualContextStatus(
+            enabled: true,
+            lastPushedAt: Date(timeIntervalSince1970: 0),
+            lastTextChars: 64,
+            lastError: nil
+        )
+        check("画面上下文状态结构 menuTitle", status.menuTitle(timeZone: utc).contains("上次 OCR 64 字"))
+
+        // 契约常量
+        check("画面上下文契约常量（2000 字 / TTL 120s / 8–15s 间隔）",
+              VisualContextPlanner.maxTextChars == 2_000
+                  && VisualContextPlanner.engineTTLMs == 120_000
+                  && VisualContextPlanner.defaultIntervalSeconds == 10
+                  && VisualContextPlanner.minIntervalSeconds == 8
+                  && VisualContextPlanner.maxIntervalSeconds == 15)
     }
 
     // MARK: - 断言帮手

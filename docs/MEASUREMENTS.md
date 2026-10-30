@@ -155,3 +155,15 @@ npm run batch:fast                 # 快速档（small ASR）：demo-fast/
 
 > VLM 受网关/负载影响，偶发 ECONNRESET（engine 已对网络错误自动重试 1 次）；大图建议 ≤960px JPEG。
 > tesseract 仅 eng 兜底；CI（Linux）只跑 fake/静态测试，真机 OCR 由 `LIVEDUB_INTEGRATION=1` 门控。
+
+## v0.6 章节图文笔记 / Obsidian 同步 / 画面上下文（M2/16GB，macOS 14）
+
+| 环节 | 实测 | 说明 |
+|---|---|---|
+| **章节图文笔记（demo 52s 全片）** | **2 章 + 1 篇课程总览、7 张截图、约 42s** | 真实 macOS Vision OCR + 真实 DeepSeek 总结；章标题自动取 OCR 首行 |
+| 章节切分 | 字幕间隙 >2.5s 或画面变化点（±2s 吸附）；20s–180s；≤30 章 | demo 52s 切成 2 章（整段模式为 1 篇） |
+| Obsidian 自动同步 | 笔记保存后 debounce ~1s；导出 1 个 md + assets + index | 实测 POST 笔记后 vault 出现课程 md / livedub-assets/*.png / livedub-notes-index.md |
+| 翻译 prompt 增量（画面 OCR） | system **+58 字符**；88 字符 OCR 时整体 +205 字符 | 无 OCR 时 prompt 与 v0.5 逐字节一致 |
+| 画面上下文推送（macOS） | 首次 1141 字 / 10s 后 1132 字；OCR ~1s；默认关闭 | 真实引擎 WS 日志 `visual context updated`；同帧去重生效 |
+| 画面上下文推送（工作台） | 每 9s 采样；画面差异 ≥0.02；同文本 8s 节流；sim 仅本地 OCR | 真实 WS 仅在实时会话发送 |
+| 翻译收益 | 术语一致性略好（momentum 统一「动量」）；**TTFT 无稳定收益** | 同句 2 次样本：2631ms vs 803ms 为网络方差，不能归因 prompt |

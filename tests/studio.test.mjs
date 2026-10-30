@@ -44,6 +44,17 @@ import {
   visualNoteTags,
 } from '../studio/vision-kit.mjs';
 import {
+  buildCourseOverviewMarkdown,
+  computeChapters,
+} from '../studio/notes-kit.mjs';
+import {
+  buildVisualContextPayload,
+  describeVisualContext,
+  normalizeVisualContextText,
+  shouldSendVisualContext,
+  VISUAL_CONTEXT_DEFAULTS,
+} from '../studio/context-kit.mjs';
+import {
   buildNoteExportFilename,
   buildNotesMarkdown,
   buildOutlineMarkdown,
@@ -111,6 +122,8 @@ function startTestServer(options = {}) {
     ? {}
     : { visionFactory: options.visionFactory ?? (async () => { throw new Error('vision disabled in tests'); }) };
   return startServer({
+    // 测试永远用随机端口（不依赖本机 8787 是否被开发服务占用）
+    port: 0,
     log: () => {},
     dataDir,
     desktopAppPath: options.desktopAppPath ?? path.join(dataDir, 'no-desktop-app'),
@@ -419,6 +432,21 @@ test('HTTP 静态服务：/ -> /studio/、/studio/ 与 /replay/ 200、缺失 404
     assert.ok(studio.body.includes('图文笔记'));
     assert.ok(studio.body.includes('visualModal'));
     assert.ok(studio.body.includes('btnCaptureVisual'));
+    // v0.6：章节模式 / Obsidian 同步 / 画面上下文开关
+    assert.ok(studio.body.includes('visualMode'));
+    assert.ok(studio.body.includes('btnObsidianSync'));
+    assert.ok(studio.body.includes('toggleVisualContext'));
+    assert.ok(studio.body.includes('visualContextStatus'));
+    const appJs = await httpRequest(srv.port, '/studio/app.mjs');
+    assert.equal(appJs.status, 200);
+    assert.ok(appJs.body.includes('/api/vision/ocr'), '画面上下文应调用 OCR 端点');
+    assert.ok(appJs.body.includes('sendJson(message)'), '画面上下文应通过现有 WS 发送');
+    assert.ok(appJs.body.includes('/api/notes/obsidian/status'));
+    assert.ok(appJs.body.includes("target: 'obsidian'"));
+    const contextKit = await httpRequest(srv.port, '/studio/context-kit.mjs');
+    assert.equal(contextKit.status, 200);
+    assert.ok(contextKit.body.includes("type: 'visual-context'"), 'WS 消息 type 应为 visual-context');
+    assert.ok(contextKit.body.includes('capturedAtMs'));
 
     const app = await httpRequest(srv.port, '/studio/app.mjs');
     assert.equal(app.status, 200);
@@ -2066,3 +2094,408 @@ test('vision-kit 纯函数：关键帧差异/采样/拼图/图文 Markdown/健�
   assert.equal(healthDown.available, false);
   assert.match(healthDown.reason, /not ready/);
 });
+
+// ================================================ v0.6 章节图文 / Obsidian / 画面上下文
+
+/** 构造注释：关键帧候选 */
+function keyframe(tMs, changeRatio = 0, ocrText = '') {
+  return { tMs, changeRatio, ...(ocrText ? { ocrText } : {}) };
+}
+
+test('computeChapters：字幕间隙切分/最短合并/最长拆分/最多章节/候选吸附/无数据', () => {
+  // 1) 字幕间隙 > 2.5s 切分，覆盖完整
+  const segments = [
+    { t0Ms: 0, t1Ms: 5000, src: 'a', dst: '甲' },
+    { t0Ms: 5000, t1Ms: 20000, src: 'b', dst: '乙' },
+    { t0Ms: 30000, t1Ms: 40000, src: 'c', dst: '丙' }, // gap 10s -> 新章
+    { t0Ms: 40000, t1Ms: 60000, src: 'd', dst: '丁' },
+  ];
+  let chapters = computeChapters(segments, [], { minGapMs: 2500, minChapterMs: 15000, maxChapterMs: 180000 });
+  assert.equal(chapters.length, 2);
+  assert.deepEqual(chapters.map((chapter) => [chapter.startMs, chapter.endMs]), [
+    [0, 30000],
+    [30000, 60000],
+  ]);
+  assert.equal(chapters[0].index, 1);
+  assert.match(chapters[0].title, /^第 1 章 · 00:00:00$/);
+  assert.equal(chapters[1].title, '第 2 章 · 00:00:30');
+  // 覆盖完整、不重叠
+  assert.equal(chapters[0].startMs, 0);
+  assert.equal(chapters[chapters.length - 1].endMs, 60000);
+  for (let index = 1; index < chapters.length; index += 1) assert.equal(chapters[index].startMs, chapters[index - 1].endMs);
+
+  // 2) 过短章节合并（minChapterMs=20s）
+  const manyShort = [];
+  for (let index = 0; index < 6; index += 1) {
+    const start = index * 10000;
+    manyShort.push({ t0Ms: start, t1Ms: start + 3000, src: `s${index}`, dst: `t${index}` });
+  }
+  chapters = computeChapters(manyShort, [], { minGapMs: 2500, minChapterMs: 20000, maxChapterMs: 180000, maxChapters: 30 });
+  assert.ok(chapters.length < manyShort.length);
+  for (const chapter of chapters) {
+    if (chapters.length > 1) assert.ok(chapter.endMs - chapter.startMs >= 20000, `章节 ${chapter.index} 应 >= 20s`);
+  }
+  assert.equal(chapters[0].startMs, 0);
+  assert.equal(chapters[chapters.length - 1].endMs, 53000);
+
+  // 3) 超长章节按字幕边界拆分（maxChapterMs=60s）
+  const long = [];
+  for (let index = 0; index < 12; index += 1) {
+    const start = index * 15000;
+    long.push({ t0Ms: start, t1Ms: start + 14000, src: `s${index}`, dst: `t${index}` });
+  }
+  chapters = computeChapters(long, [], { minGapMs: 2500, minChapterMs: 20000, maxChapterMs: 60000, maxChapters: 30 });
+  assert.ok(chapters.length >= 3);
+  for (const chapter of chapters) assert.ok(chapter.endMs - chapter.startMs <= 65000, '章节不应明显超过最长限制');
+  assert.equal(chapters[0].startMs, 0);
+  assert.equal(chapters[chapters.length - 1].endMs, 179000);
+
+  // 4) maxChapters 上限
+  const fragmented = [];
+  for (let index = 0; index < 40; index += 1) {
+    const start = index * 30000;
+    fragmented.push({ t0Ms: start, t1Ms: start + 5000, src: `s${index}`, dst: `t${index}` });
+  }
+  chapters = computeChapters(fragmented, [], { minGapMs: 2500, minChapterMs: 1000, maxChapterMs: 180000, maxChapters: 5 });
+  assert.equal(chapters.length, 5);
+  assert.equal(chapters[0].startMs, 0);
+  assert.equal(chapters[4].endMs, 1175000);
+
+  // 5) 画面变化候选切分并吸附到 ±2s 内最近的段边界
+  const candidateSegments = [
+    { t0Ms: 0, t1Ms: 20000, src: 'one' },
+    { t0Ms: 20000, t1Ms: 40000, src: 'two' },
+    { t0Ms: 40000, t1Ms: 60000, src: 'three' },
+  ];
+  chapters = computeChapters(candidateSegments, [keyframe(41000, 0.08, 'THIRD SLIDE\n第三张')], {
+    minGapMs: 100000,
+    minChapterMs: 10000,
+    maxChapterMs: 180000,
+    changeThreshold: 0.035,
+    snapMs: 2000,
+  });
+  assert.equal(chapters.length, 2);
+  assert.equal(chapters[0].endMs, 40000, '应吸附到最近段边界 40s');
+  assert.equal(chapters[1].title, 'THIRD SLIDE', '章标题取候选 OCR 首行');
+  // changeRatio 低于阈值不切
+  chapters = computeChapters(candidateSegments, [keyframe(41000, 0.01)], { minGapMs: 100000, changeThreshold: 0.035 });
+  assert.equal(chapters.length, 1);
+
+  // 6) 只有关键帧候选 / 完全无数据
+  chapters = computeChapters([], [keyframe(0, 0), keyframe(30000, 0.09, 'A'), keyframe(60000, 0.09, 'B')], {
+    minGapMs: 2500,
+    minChapterMs: 10000,
+    maxChapterMs: 180000,
+    changeThreshold: 0.035,
+  });
+  assert.ok(chapters.length >= 2);
+  assert.equal(chapters[0].startMs, 0);
+  assert.equal(chapters[chapters.length - 1].endMs, 60000);
+  assert.deepEqual(computeChapters([], [], {}), []);
+
+  // 7) 覆盖/排序保证
+  chapters = computeChapters(segments, [keyframe(32000, 0.1)], { minGapMs: 2500, minChapterMs: 10000, maxChapterMs: 180000 });
+  for (let index = 0; index < chapters.length; index += 1) {
+    assert.ok(chapters[index].endMs > chapters[index].startMs);
+    if (index > 0) assert.equal(chapters[index].startMs, chapters[index - 1].endMs);
+  }
+});
+
+test('章节图文 Markdown / 课程总览 Markdown', () => {
+  const chapterMarkdown = buildVisualNoteMarkdown({
+    title: '梯度下降',
+    summary: '本章介绍学习率。',
+    keyPoints: ['学习率控制步长'],
+    frames: [{ tMs: 21000, imageUrl: '/api/notes/assets/a.png', ocrText: 'The Learning Rate', caption: '幻灯片' }],
+    segments: [{ t0Ms: 20000, t1Ms: 30000, text: 'Learning rate', translation: '学习率' }],
+    range: { startMs: 20000, endMs: 50000 },
+    chapter: { index: 2, total: 4 },
+    generatedAt: new Date('2026-01-02T03:04:05'),
+    vlm: true,
+  });
+  assert.match(chapterMarkdown, /^# 梯度下降 · 图文笔记/);
+  assert.match(chapterMarkdown, /第 2\/4 章 · 范围 00:00:20 – 00:00:50/);
+  assert.match(chapterMarkdown, /## 本节总结/);
+  assert.match(chapterMarkdown, /### \[00:00:21\]\(\?t=21000\) · 画面/);
+
+  const overview = buildCourseOverviewMarkdown({
+    video: { id: 'v1', title: '梯度下降', url: 'https://example.com/v', durationMs: 120000 },
+    chapters: [
+      { index: 1, startMs: 0, endMs: 40000, title: 'Core Idea' },
+      { index: 2, startMs: 40000, endMs: 79000, title: '第 2 章 · 00:00:40' },
+    ],
+    generatedAt: new Date('2026-01-02T03:04:05'),
+  });
+  assert.match(overview, /^# 梯度下降 · 课程总览/);
+  assert.match(overview, /> 视频：https:\/\/example\.com\/v/);
+  assert.match(overview, /## 章节/);
+  assert.match(overview, /- \[00:00:00\]\(\?t=0\) · 第 1 章 Core Idea（至 00:00:40）/);
+  assert.match(overview, /- \[00:00:40\]\(\?t=40000\) · 第 2 章/);
+  assert.match(overview, /\/studio\/\?notes=1/);
+  assert.doesNotMatch(overview, /^---\n/);
+});
+
+test('画面上下文纯函数：默认关闭/清洗/去重/节流/WS 消息', () => {
+  assert.equal(VISUAL_CONTEXT_DEFAULTS.enabled, false);
+  assert.equal(normalizeVisualContextText('  Hello\n\n\nWorld  '), 'Hello\n\nWorld');
+  assert.equal(normalizeVisualContextText('a\u0000b\tc'), 'ab c');
+  const longText = 'x'.repeat(2500);
+  assert.equal(normalizeVisualContextText(longText).length, 2000);
+  assert.equal(normalizeVisualContextText(' \n\t '), '');
+
+  const now = 1_000_000;
+  assert.deepEqual(shouldSendVisualContext({ enabled: false, text: 'hello', nowMs: now }), { send: false, reason: 'disabled' });
+  assert.equal(shouldSendVisualContext({ enabled: true, text: '  ', nowMs: now }).send, false);
+  assert.equal(shouldSendVisualContext({ enabled: true, text: 'same', lastText: 'same', nowMs: now, lastSentAt: 0 }).reason, 'duplicate');
+  assert.equal(shouldSendVisualContext({ enabled: true, text: 'new', changeRatio: 0.01, nowMs: now }).reason, 'unchanged');
+  assert.equal(shouldSendVisualContext({ enabled: true, text: 'new', changeRatio: 0.5, nowMs: now, lastSentAt: now - 3000 }).reason, 'throttled');
+  const send = shouldSendVisualContext({ enabled: true, text: '  new words  ', changeRatio: 0.5, nowMs: now, lastSentAt: now - 9000 });
+  assert.equal(send.send, true);
+  assert.equal(send.text, 'new words');
+
+  const payload = buildVisualContextPayload({ text: 'hello\nworld', tMs: 1234.6, capturedAtMs: 5000.2 });
+  assert.deepEqual(payload, { type: 'visual-context', text: 'hello\nworld', tMs: 1235, source: 'studio', capturedAtMs: 5000 });
+  assert.equal(buildVisualContextPayload({ text: '' }), null);
+  assert.match(describeVisualContext({ enabled: false }), /已关闭/);
+  assert.match(describeVisualContext({ enabled: true, lastTMs: 83000, lastChars: 128 }), /已开启 · 最近 01:23 · 128 字/);
+  assert.match(describeVisualContext({ enabled: true }), /等待播放/);
+});
+
+function obsidianConfig(vaultDir, { enabled = true, dir = vaultDir, assetsSubdir = 'livedub-assets', autoExport = true } = {}) {
+  return testConfig({ notes: { obsidian: { enabled, dir, assetsSubdir, autoExport } } });
+}
+
+test('Obsidian：默认未配置 status 200 / target 409 / 默认导出向后兼容', async () => {
+  const srv = await startTestServer({ config: testConfig() });
+  try {
+    let result = await notesApi(srv, 'GET', '/api/notes/obsidian/status');
+    assert.equal(result.status, 200);
+    assert.equal(result.data.ok, true);
+    assert.equal(result.data.enabled, false);
+    assert.equal(result.data.configured, false);
+    assert.equal(result.data.dir, '');
+    assert.equal(result.data.exists, false);
+    assert.match(result.data.reason, /enabled=false/);
+
+    result = await notesApi(srv, 'POST', '/api/notes/export', { videoId: 'v', target: 'obsidian' });
+    assert.equal(result.status, 409);
+    assert.equal(result.data.error, 'obsidian_not_configured');
+    assert.match(result.data.message, /notes\.obsidian/);
+
+    // 不传 target 等价 default，仍写 data/exports
+    result = await notesApi(srv, 'POST', '/api/notes/export', { videoId: 'v' });
+    assert.equal(result.status, 200);
+    assert.equal(result.data.target, 'default');
+    assert.ok(fs.existsSync(path.isAbsolute(result.data.path) ? result.data.path : path.join(PROJECT_ROOT, result.data.path)));
+  } finally {
+    await srv.close();
+  }
+});
+
+test('Obsidian：enabled vault 导出（front matter/assets 复制/index/lastPath）+ target 校验', async () => {
+  const dataDir = makeTempDir('livedub-obs-export-');
+  const vault = makeTempDir('livedub-obs-vault-');
+  const srv = await startTestServer({ dataDir, config: obsidianConfig(vault) });
+  try {
+    const video = { id: 'local-obs-export', title: 'Obsidian Demo / 课程: 2', url: 'https://example.com/lecture.mp4', durationMs: 90000 };
+    const png = tinyPng('obsidian-shot');
+    const asset = await notesApi(srv, 'POST', '/api/notes/assets', png, { 'Content-Type': 'image/png' });
+    assert.equal(asset.status, 200);
+    const assetUrl = asset.data.url;
+    let created = await notesApi(srv, 'POST', '/api/notes', {
+      video,
+      tMs: 12000,
+      body: `# 第一章\n\n![截图](${assetUrl})\n\n学习率控制步长。`,
+      kind: 'visual',
+      tags: ['图文笔记', '章节'],
+      imageUrl: assetUrl,
+    });
+    assert.equal(created.status, 200);
+
+    let result = await notesApi(srv, 'POST', '/api/notes/export', { videoId: video.id, target: 'obsidian' });
+    assert.equal(result.status, 200);
+    assert.equal(result.data.ok, true);
+    assert.equal(result.data.target, 'obsidian');
+    assert.equal(result.data.assetsCopied, 1);
+    assert.ok(fs.existsSync(result.data.path), 'vault markdown 应存在');
+    assert.ok(result.data.path.startsWith(vault + path.sep));
+    assert.ok(fs.existsSync(result.data.indexPath));
+    const markdown = fs.readFileSync(result.data.path, 'utf8');
+    assert.match(markdown, /^---\n/);
+    assert.match(markdown, /title: "Obsidian Demo \/ 课程: 2"/);
+    assert.match(markdown, /videoId: "local-obs-export"/);
+    assert.match(markdown, /source: "livedub"/);
+    assert.match(markdown, /tags: \[livedub, video-notes\]/);
+    assert.doesNotMatch(markdown, /\/api\/notes\/assets\//, '图片引用应改写为 vault 相对路径');
+    assert.match(markdown, /!\[[^\]]*\]\(livedub-assets\/[A-Za-z0-9._-]+\.png\)/);
+    const assetName = assetUrl.split('/').pop();
+    assert.ok(fs.existsSync(path.join(vault, 'livedub-assets', assetName)));
+    assert.equal(path.dirname(result.data.path), vault);
+    const base = path.basename(result.data.path);
+    assert.ok(base.endsWith(`-${localDateStringForTest()}.md`), `文件名应含日期：${base}`);
+    assert.ok(!base.includes('/'), '文件名不能包含路径分隔符');
+
+    const index = fs.readFileSync(result.data.indexPath, 'utf8');
+    assert.match(index, /^# livedub 笔记索引/);
+    assert.match(index, /Obsidian Demo - 课程/);
+    assert.match(index, new RegExp(base.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
+    assert.match(index, /1 条笔记/);
+    assert.match(index, /https:\/\/example\.com\/lecture\.mp4/);
+
+    const status = await notesApi(srv, 'GET', '/api/notes/obsidian/status');
+    assert.equal(status.status, 200);
+    assert.equal(status.data.enabled, true);
+    assert.equal(status.data.configured, true);
+    assert.equal(status.data.dir, vault);
+    assert.equal(status.data.exists, true);
+    assert.equal(status.data.autoExport, true);
+    assert.equal(status.data.lastPath, result.data.path);
+    assert.equal(status.data.indexPath, result.data.indexPath);
+    assert.ok(status.data.lastSyncedAt);
+
+    // 重复导出同名覆盖
+    created = await notesApi(srv, 'PUT', `/api/notes/${created.data.note.id}`, { body: '更新后的正文' });
+    assert.equal(created.status, 200);
+    result = await notesApi(srv, 'POST', '/api/notes/export', { videoId: video.id, target: 'obsidian' });
+    assert.equal(result.status, 200);
+    assert.ok(fs.readFileSync(result.data.path, 'utf8').includes('更新后的正文'));
+
+    // target 校验
+    result = await notesApi(srv, 'POST', '/api/notes/export', { videoId: video.id, target: 'nope' });
+    assert.equal(result.status, 400);
+    assert.equal(result.data.error, 'invalid_target');
+
+    // 默认 target 仍可写 data/exports
+    result = await notesApi(srv, 'POST', '/api/notes/export', { videoId: video.id });
+    assert.equal(result.status, 200);
+    assert.equal(result.data.target, 'default');
+  } finally {
+    await srv.close();
+    fs.rmSync(dataDir, { recursive: true, force: true });
+    fs.rmSync(vault, { recursive: true, force: true });
+  }
+});
+
+test('Obsidian：自动导出 debounce（POST/PUT/DELETE/quick）+ 失败不影响笔记保存', async () => {
+  const dataDir = makeTempDir('livedub-obs-auto-');
+  const vault = makeTempDir('livedub-obs-auto-vault-');
+  const srv = await startTestServer({ dataDir, config: obsidianConfig(vault), obsidianDebounceMs: 0 });
+  try {
+    const video = { id: 'local-obs-auto', title: 'Auto Sync Demo', url: 'https://example.com/auto.mp4' };
+    let created = await notesApi(srv, 'POST', '/api/notes', { video, tMs: 1000, body: '自动同步第一条' });
+    assert.equal(created.status, 200);
+    assert.equal(created.data.obsidian?.scheduled, true);
+    await waitFor(async () => {
+      const status = await notesApi(srv, 'GET', '/api/notes/obsidian/status');
+      return Boolean(status.data.lastSyncedAt);
+    }, 4000, 'Obsidian 自动导出');
+    const status = await notesApi(srv, 'GET', '/api/notes/obsidian/status');
+    assert.ok(status.data.lastPath);
+    assert.match(fs.readFileSync(status.data.lastPath, 'utf8'), /自动同步第一条/);
+    assert.match(fs.readFileSync(status.data.indexPath, 'utf8'), /Auto Sync Demo/);
+
+    // quick 也会自动导出
+    const quick = await notesApi(srv, 'POST', '/api/notes/quick', { video, tMs: 3000, text: '快捷摘录自动同步', source: 'extension' });
+    assert.equal(quick.status, 200);
+    assert.equal(quick.data.obsidian?.scheduled, true);
+    await waitFor(() => fs.readFileSync(status.data.lastPath, 'utf8').includes('快捷摘录自动同步'), 4000, 'quick 自动导出');
+
+    // PUT 自动导出
+    const updated = await notesApi(srv, 'PUT', `/api/notes/${created.data.note.id}`, { body: '更新后的自动同步内容' });
+    assert.equal(updated.status, 200);
+    assert.equal(updated.data.obsidian?.scheduled, true);
+    await waitFor(() => fs.readFileSync(status.data.lastPath, 'utf8').includes('更新后的自动同步内容'), 4000, 'PUT 自动导出');
+
+    // DELETE 自动导出：保留原文件名（videoHint），最后一条删完后正文变「还没有笔记」
+    const fileName = path.basename(status.data.lastPath);
+    const deleted = await notesApi(srv, 'DELETE', `/api/notes/${created.data.note.id}`);
+    assert.equal(deleted.status, 200);
+    assert.equal(deleted.data.obsidian?.scheduled, true);
+    await waitFor(() => fs.readFileSync(path.join(vault, fileName), 'utf8').includes('快捷摘录自动同步'), 4000, 'DELETE 后保留 quick 笔记');
+    const quickDeleted = await notesApi(srv, 'DELETE', `/api/notes/${quick.data.note.id}`);
+    assert.equal(quickDeleted.status, 200);
+    assert.equal(quickDeleted.data.obsidian?.scheduled, true);
+    await waitFor(() => fs.readFileSync(path.join(vault, fileName), 'utf8').includes('还没有笔记'), 4000, 'DELETE 自动导出清空');
+    assert.ok(fs.existsSync(path.join(vault, fileName)), 'DELETE 后仍应覆盖原文件而不是新建另一篇');
+    assert.ok(!fs.readdirSync(vault).some((name) => name.startsWith('local-obs-auto-')), '不应生成以 videoId 为标题的新文件');
+  } finally {
+    await srv.close();
+    fs.rmSync(dataDir, { recursive: true, force: true });
+    fs.rmSync(vault, { recursive: true, force: true });
+  }
+
+  // 目录不可写（dir 是普通文件）-> 手动导出 500、自动导出失败但笔记保存成功
+  const dataDir2 = makeTempDir('livedub-obs-fail-');
+  const vaultFile = path.join(makeTempDir('livedub-obs-file-'), 'not-a-dir');
+  fs.writeFileSync(vaultFile, 'file');
+  const srv2 = await startTestServer({ dataDir: dataDir2, config: obsidianConfig(vaultFile), obsidianDebounceMs: 0 });
+  try {
+    const created = await notesApi(srv2, 'POST', '/api/notes', { video: { id: 'v-fail', title: 'Fail Demo' }, tMs: 0, body: '即使同步失败也要保存' });
+    assert.equal(created.status, 200);
+    const manual = await notesApi(srv2, 'POST', '/api/notes/export', { videoId: 'v-fail', target: 'obsidian' });
+    assert.equal(manual.status, 500);
+    assert.equal(manual.data.error, 'obsidian_write_failed');
+    await waitFor(async () => {
+      const status = await notesApi(srv2, 'GET', '/api/notes/obsidian/status');
+      return Boolean(status.data.lastError);
+    }, 4000, '自动导出失败记录');
+    const saved = await notesApi(srv2, 'GET', '/api/notes?videoId=v-fail');
+    assert.equal(saved.status, 200);
+    assert.equal(saved.data.notes.length, 1, '导出失败不能影响笔记保存');
+  } finally {
+    await srv2.close();
+    fs.rmSync(dataDir2, { recursive: true, force: true });
+    fs.rmSync(path.dirname(vaultFile), { recursive: true, force: true });
+  }
+});
+
+test('Obsidian：防穿越 / assetsSubdir 非法 / 标题文件名安全化', async () => {
+  const dataDir = makeTempDir('livedub-obs-sec-');
+  const vault = makeTempDir('livedub-obs-sec-vault-');
+  const outside = makeTempDir('livedub-obs-sec-outside-');
+  fs.writeFileSync(path.join(outside, 'evil.png'), tinyPng('evil'));
+  const srv = await startTestServer({ dataDir, config: obsidianConfig(vault) });
+  try {
+    const video = { id: 'v-sec', title: '../../escape: title?' };
+    const note = await notesApi(srv, 'POST', '/api/notes', {
+      video,
+      tMs: 0,
+      body: '![evil](/api/notes/assets/../../evil.png)\n![missing](/api/notes/assets/missing.png)',
+    });
+    assert.equal(note.status, 200);
+    const result = await notesApi(srv, 'POST', '/api/notes/export', { videoId: video.id, target: 'obsidian' });
+    assert.equal(result.status, 200);
+    const base = path.basename(result.data.path);
+    assert.ok(!base.includes('/') && !base.includes('..') && base.includes('escape'), `文件名安全化：${base}`);
+    assert.equal(path.dirname(result.data.path), vault);
+    const assetsDir = path.join(vault, 'livedub-assets');
+    assert.deepEqual(fs.existsSync(assetsDir) ? fs.readdirSync(assetsDir) : [], [], '不存在的/穿越的 assets 不应被复制');
+    assert.ok(!fs.existsSync(path.join(outside, 'evil.png')) === false); // outside 文件本身存在，但不应被复制进 vault
+    assert.ok(fs.readFileSync(path.join(outside, 'evil.png'), 'utf8').includes('evil'));
+    assert.ok(fs.readdirSync(vault).includes('livedub-notes-index.md'));
+    assert.ok(!fs.readdirSync(outside).some((name) => name.startsWith('livedub-notes-index')));
+  } finally {
+    await srv.close();
+    fs.rmSync(dataDir, { recursive: true, force: true });
+    fs.rmSync(vault, { recursive: true, force: true });
+    fs.rmSync(outside, { recursive: true, force: true });
+  }
+
+  // assetsSubdir 含 .. -> configured=false -> 导出 409
+  const srv2 = await startTestServer({ config: obsidianConfig(vault, { assetsSubdir: '../evil' }) });
+  try {
+    const status = await notesApi(srv2, 'GET', '/api/notes/obsidian/status');
+    assert.equal(status.data.enabled, true);
+    assert.equal(status.data.configured, false);
+    const result = await notesApi(srv2, 'POST', '/api/notes/export', { videoId: 'v', target: 'obsidian' });
+    assert.equal(result.status, 409);
+    assert.equal(result.data.error, 'obsidian_not_configured');
+  } finally {
+    await srv2.close();
+  }
+});
+
+function localDateStringForTest() {
+  const date = new Date();
+  return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`;
+}

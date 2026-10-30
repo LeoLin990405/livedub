@@ -184,6 +184,7 @@ export function buildVisualNoteMarkdown({
   langTo = 'zh',
   generatedAt = new Date(),
   vlm = false,
+  chapter = null,
 } = {}) {
   const heading = String(title ?? '').trim() || '视频图文笔记';
   const framesList = [...(frames ?? [])]
@@ -202,6 +203,9 @@ export function buildVisualNoteMarkdown({
     `> 时间范围 ${formatNoteTimestamp(startMs)} – ${formatNoteTimestamp(endMs)} · ${framesList.length} 个关键帧 · ${langFrom} → ${langTo} · 生成于 ${dateText}`,
   );
   lines.push('> 由 livedub 本地工作台生成：音频字幕 + 画面 OCR' + (vlm ? ' + VLM 画面理解' : '') + '，原文与截图均保存在本机。');
+  if (chapter && Number.isFinite(Number(chapter.index))) {
+    lines.push(`> 第 ${Math.max(1, Math.round(Number(chapter.index)))}/${Math.max(1, Math.round(Number(chapter.total) || Number(chapter.index)))} 章 · 范围 ${formatNoteTimestamp(startMs)} – ${formatNoteTimestamp(endMs)}`);
+  }
   lines.push('');
 
   lines.push('## 本节总结');

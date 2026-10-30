@@ -129,10 +129,19 @@ final class EngineClient: NSObject {
         }
     }
 
-    func sendJSON(_ object: [String: Any]) {
-        guard JSONSerialization.isValidJSONObject(object),
+    /// 是否处于已连接状态（线程安全；仅供发送前快速判断，不做网络 I/O）
+    var isConnected: Bool {
+        queue.sync { !stopped && stateValue == .connected }
+    }
+
+    /// 发送一条 JSON 文本帧；返回 false 表示当前无法发送（JSON 非法 / 未连接）。
+    /// 返回 true 只代表已交给后台发送队列，真正写 socket 异步完成；不阻塞主线程。
+    @discardableResult
+    func sendJSON(_ object: [String: Any]) -> Bool {
+        guard isConnected,
+              JSONSerialization.isValidJSONObject(object),
               let data = try? JSONSerialization.data(withJSONObject: object),
-              let text = String(data: data, encoding: .utf8) else { return }
+              let text = String(data: data, encoding: .utf8) else { return false }
         queue.async {
             guard !self.stopped, self.stateValue == .connected, let task = self.task else { return }
             task.send(.string(text)) { [weak self] error in
@@ -140,11 +149,12 @@ final class EngineClient: NSObject {
                 self.queue.async { self.handleSocketErrorLocked(error) }
             }
         }
+        return true
     }
 
     /// 发送 control 消息（pause / resume / stop / seek / flush）
     func sendControl(_ action: String) {
-        sendJSON(["type": "control", "action": action])
+        _ = sendJSON(["type": "control", "action": action])
     }
 
     // MARK: - 连接管理（以下方法都在 queue 上执行，命名后缀 Locked）

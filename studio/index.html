@@ -62,6 +62,7 @@
     <symbol id="i-list" viewBox="0 0 24 24"><path d="M8.5 6.5h12M8.5 12h12M8.5 17.5h12M4 6.5h.5M4 12h.5M4 17.5h.5"/></symbol>
     <symbol id="i-close" viewBox="0 0 24 24"><path d="m6 6 12 12M18 6 6 18"/></symbol>
     <symbol id="i-search" viewBox="0 0 24 24"><circle cx="11" cy="11" r="6.5"/><path d="m16 16 4.5 4.5"/></symbol>
+    <symbol id="i-sync" viewBox="0 0 24 24"><path d="M20 7v5h-5"/><path d="M4 17v-5h5"/><path d="M6.2 9a7 7 0 0 1 11.6-2L20 9"/><path d="M17.8 15a7 7 0 0 1-11.6 2L4 15"/></symbol>
     <symbol id="i-image" viewBox="0 0 24 24"><rect x="3" y="4.5" width="18" height="15" rx="2.5"/><circle cx="8.5" cy="9.5" r="1.6"/><path d="m4.5 17 5-5 3.5 3.5 2.5-2.5 4 4"/></symbol>
     <symbol id="i-sparkles" viewBox="0 0 24 24"><path d="M12 3.5 13.7 9l5.3 1.7-5.3 1.8L12 17.5l-1.7-5-5.3-1.8L10.3 9 12 3.5Z"/><path d="M18.5 15.5 19.2 18l2.3.7-2.3.8-.7 2.2-.7-2.2-2.3-.8 2.3-.7.7-2.5Z"/></symbol>
   </svg>
@@ -442,6 +443,13 @@
           → 可选 VLM 画面理解（慢、可能产生模型费用）→ 结合字幕生成总结与时间线，保存为 <code class="inline-code">kind:visual</code> 笔记。
         </p>
         <div class="visual-row">
+          <span>模式</span>
+          <div class="segmented segmented-sm" id="visualMode" role="group" aria-label="图文笔记模式">
+            <button type="button" data-mode="single" aria-pressed="true" data-active="true">整段</button>
+            <button type="button" data-mode="chapters" aria-pressed="false" data-active="false">按章节</button>
+          </div>
+        </div>
+        <div class="visual-row">
           <span>范围</span>
           <div class="segmented segmented-sm" id="visualRange" role="group" aria-label="图文笔记范围">
             <button type="button" data-range="rest" aria-pressed="true" data-active="true">当前时间 → 结尾</button>
@@ -499,6 +507,7 @@
           <button type="button" data-export="copy" role="menuitem">复制 Markdown</button>
           <button type="button" data-export="download" role="menuitem">下载 .md</button>
           <button type="button" data-export="write" role="menuitem">写入 data/exports</button>
+          <button type="button" data-export="obsidian" role="menuitem">同步到 Obsidian</button>
         </div>
       </details>
       <button id="btnNotesClose" class="icon-btn" type="button" title="关闭笔记面板（Esc）" aria-label="关闭学习笔记">
@@ -517,6 +526,22 @@
       </div>
       <span class="spacer"></span>
       <span id="notesSaveStatus" class="notes-status" aria-live="polite">—</span>
+    </div>
+    <div class="notes-obsidian" id="notesObsidianBar">
+      <span class="notes-obsidian-dot" id="obsidianDot" aria-hidden="true"></span>
+      <span id="obsidianStatusText" class="notes-obsidian-text">Obsidian：检测中…</span>
+      <span class="spacer"></span>
+      <button id="btnObsidianSync" class="btn btn-ghost btn-sm" type="button" title="把当前视频笔记同步到 Obsidian 目录（含截图与索引）" disabled>
+        <svg class="icon"><use href="#i-sync"/></svg><span>同步 Obsidian</span>
+      </button>
+    </div>
+    <div class="notes-context">
+      <label class="toggle notes-context-toggle" title="每 8-10s 取当前画面做 OCR，作为翻译的术语/语境参考（画面文字不会被翻译）；默认关闭">
+        <input id="toggleVisualContext" type="checkbox" />
+        <span>翻译参考画面文字（OCR）</span>
+      </label>
+      <span class="spacer"></span>
+      <span id="visualContextStatus" class="notes-context-status muted">画面上下文：已关闭</span>
     </div>
     <div class="notes-body">
       <section class="notes-editor-pane" aria-label="笔记编辑器">

@@ -184,7 +184,7 @@ test('manifest：合法的 MV3 清单，background 为 module service worker + a
   assert.equal(typeof manifest.name, 'string');
   assert.ok(manifest.name.length > 0);
   assert.match(manifest.version, /^\d+\.\d+\.\d+$/);
-  assert.match(manifest.version, /^0\.5\./, 'v0.5 迭代应把扩展版本提升到 0.5.x');
+  assert.match(manifest.version, /^0\.6\./, 'v0.6 迭代应把扩展版本提升到 0.6.x');
   assert.equal(manifest.background.service_worker, 'background.js');
   assert.equal(manifest.background.type, 'module', 'service worker 必须是 type: module，background.js 里用了 ESM import');
   assert.equal(manifest.action.default_popup, 'popup.html');

@@ -3,6 +3,23 @@
 All notable changes to livedub are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/), versioning: [SemVer](https://semver.org/).
 
+## [0.6.0] - 2026-10-30
+
+章节化图文笔记、画面 OCR 辅助翻译、Obsidian 自动同步。
+
+### Added
+
+- **章节图文笔记**：按字幕停顿 + 画面变化自动分章，逐章生成 OCR/画面理解/总结的 `kind:'visual'` 笔记，
+  并生成 `kind:'outline'` 课程总览（章节时间锚点）。实测 demo 52s → 2 章 + 总览、7 张截图、约 42s。
+- **画面 OCR 作为翻译上下文**：客户端可通过 WS `visual-context` 推送最近画面文字（TTL 120s、去重、仅参考），
+  翻译 prompt 注入术语/公式语境；工作台/Mac App 可选开启（默认关闭）。
+- **Obsidian 自动同步**：`notes.obsidian` 配置 vault 目录，导出 Markdown + 截图资产（相对路径）+ 索引文件；
+  笔记保存后 debounce ~1s 自动同步（可关），工作台显示同步状态与路径。
+
+### Changed
+
+- 版本 0.6.0；Notes/Vision/WS 契约文档同步（§7.6/§7.8）。
+
 ## [0.5.0] - 2026-10-30
 
 视频画面理解 → 音频 + 画面双重内容的图文笔记。

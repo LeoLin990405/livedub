@@ -93,6 +93,41 @@ npm run note -- "用 npm script 也可以"
 - 本地 OCR 构建：`npm run build:ocr`（Swift + macOS Vision，产物 `data/bin/ocr-macos`）；没有时回退 `tesseract`（仅 eng）。
 - VLM 走 OpenAI 兼容视觉接口（默认 ark-plan / doubao，可换任意兼容 provider）；未配置 Key 时只有 OCR，不影响笔记保存。
 
+## 按章节自动生成（v0.6）
+
+长课程不用手动切分：工作台「图文笔记」弹窗选 **按章节**，会按「字幕停顿 + 画面变化」自动分章（20s–180s，最多 30 章），
+逐章生成图文笔记；全部完成后自动创建/更新一篇 **课程总览**（带 `hh:mm:ss` 锚点），方便复习时跳转。
+
+- 实测（demo 52s 全片）：**2 章图文笔记 + 1 篇课程总览**、7 张截图、约 42s（真实 OCR + 真实 DeepSeek 总结）；
+- 每章关键帧上限 6，VLM 默认关闭；章内 OCR 串行，进度「章节 i/M · 识别中 j/K」可取消（已保存章节保留）。
+
+| 章节图文笔记 | 课程总览 |
+|---|---|
+| ![chapter](assets/studio-chapter-note.png) | ![overview](assets/studio-course-overview.png) |
+
+## Obsidian 自动同步（v0.6）
+
+```json
+// config/livedub.config.json
+"notes": {
+  "obsidian": { "enabled": true, "dir": "~/Obsidian/课程笔记", "assetsSubdir": "livedub-assets", "autoExport": true }
+}
+```
+
+- 导出内容：每门课一个 Markdown（YAML front matter 含 title/url/date/lang/source/tags、时间锚点、截图/OCR/双语引用）；
+  截图复制到 `<vault>/livedub-assets/` 并改写为 vault 相对路径；维护 `<vault>/livedub-notes-index.md` 索引；
+- **自动同步**：笔记新增/修改/删除（含扩展/macOS/CLI 快捷笔记）后 debounce ~1s 自动导出；失败不影响笔记保存；
+- 工作台笔记抽屉显示「已启用 → 路径 · 最近同步」+「同步 Obsidian」手动按钮；
+- 实测：POST 笔记后 ~1s 生成 `Obsidian 测试课程-2026-10-30.md` + `livedub-assets/…png` + 索引；手动导出返回 `path/indexPath/assetsCopied`。
+
+## 画面 OCR 作为翻译上下文（v0.6）
+
+- 工作台笔记抽屉开关「翻译参考画面文字（OCR）」（默认关）：每 9s 取当前帧→画面差异过滤→本地 OCR→WS `visual-context` 推给引擎；
+- macOS App 菜单开关「翻译参考画面文字（OCR，每 10s）」（默认关）：屏幕截图→OCR→WS 推送（隐私/CPU 提示见 README）；
+- 引擎保存最近一条（TTL 120s、去重、seek 清空），翻译时只作「术语/公式/代码语境参考」，**不翻译画面文字、不覆盖字幕**；
+- 实测：翻译 prompt system 仅 +58 字符；同一句带 OCR 时 momentum 术语更一致（学习率/梯度下降/动量均命中）；
+  TTFT 受网络方差影响，**未观测到稳定延迟收益**（真实数据：2631ms vs 803ms 为网络方差，不能归因 prompt）。
+
 ## 数据与隐私
 
 ```

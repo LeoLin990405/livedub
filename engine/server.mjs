@@ -18,6 +18,7 @@
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import http from 'node:http';
+import os from 'node:os';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { pathToFileURL } from 'node:url';
@@ -1250,7 +1251,7 @@ function buildNoteMarkdown(note) {
   return lines.join('\n');
 }
 
-function buildVideoHeader(video, noteCount, { forExport = false } = {}) {
+function buildVideoHeader(video, noteCount, { forExport = false, forObsidian = false } = {}) {
   const date = localDateString();
   const lines = [
     '---',
@@ -1262,6 +1263,7 @@ function buildVideoHeader(video, noteCount, { forExport = false } = {}) {
     `langTo: ${JSON.stringify('zh')}`,
     `notes: ${noteCount}`,
     `generatedBy: ${JSON.stringify('livedub')}`,
+    ...(forObsidian ? [`source: ${JSON.stringify('livedub')}`, 'tags: [livedub, video-notes]'] : []),
     '---',
     '',
     `# ${String(video?.title ?? video?.id ?? 'livedub 笔记')}`,
@@ -1277,14 +1279,14 @@ function buildVideoHeader(video, noteCount, { forExport = false } = {}) {
   return lines;
 }
 
-function buildVideoNotesMarkdown(state, videoId) {
+function buildVideoNotesMarkdown(state, videoId, { forObsidian = false, videoHint = null } = {}) {
   const id = String(videoId ?? '');
   const notes = readAllNoteEntries(state)
     .map((entry) => entry.note)
     .filter((note) => note.video?.id === id)
     .sort((a, b) => (Number(a.tMs) || 0) - (Number(b.tMs) || 0));
-  const video = notes[0]?.video ?? { id, title: id };
-  const lines = buildVideoHeader(video, notes.length, { forExport: true });
+  const video = notes[0]?.video ?? (videoHint && typeof videoHint === 'object' ? videoHint : { id, title: id });
+  const lines = buildVideoHeader(video, notes.length, { forExport: true, forObsidian });
   for (const note of notes) lines.push(buildNoteMarkdown(note));
   return `${lines.join('\n').replace(/\n{3,}/g, '\n\n')}\n`;
 }
@@ -1410,6 +1412,287 @@ function readRawBodyForNotes(req, limit = NOTES_ASSET_MAX_BYTES) {
   });
 }
 
+// ---------------------------------------------------- Obsidian 目录同步（v0.6）
+// 配置：state.config.notes.obsidian = { enabled, dir, assetsSubdir, autoExport }
+// 只写配置指定目录（及 assetsSubdir）；原子写；不写密钥；不跟随 ..
+
+const OBSIDIAN_INDEX_FILE = 'livedub-notes-index.md';
+const OBSIDIAN_DEFAULTS = Object.freeze({
+  enabled: false,
+  dir: '',
+  assetsSubdir: 'livedub-assets',
+  autoExport: true,
+});
+const OBSIDIAN_ASSET_NAME_RE = /^[A-Za-z0-9._-]+\.png$/;
+const OBSIDIAN_SUBDIR_SEGMENT_RE = /^[A-Za-z0-9._-]+$/;
+const OBSIDIAN_DEBOUNCE_MS = 1000;
+
+function expandHomePath(rawDir) {
+  const value = String(rawDir ?? '').trim();
+  if (!value) return '';
+  if (value === '~') return os.homedir();
+  if (value.startsWith('~/') || value.startsWith('~\\')) return path.join(os.homedir(), value.slice(2));
+  return value;
+}
+
+function isSafeObsidianSubdir(subdir) {
+  const normalized = String(subdir ?? '').replace(/\\/g, '/').replace(/^\/+/, '').replace(/\/+$/, '');
+  if (!normalized) return false;
+  return normalized.split('/').every((segment) => OBSIDIAN_SUBDIR_SEGMENT_RE.test(segment) && segment !== '.' && segment !== '..');
+}
+
+function resolveObsidianConfig(state) {
+  const raw = state.config?.notes?.obsidian ?? {};
+  const enabled = raw.enabled === true;
+  const dirRaw = typeof raw.dir === 'string' ? raw.dir.trim() : '';
+  const dir = expandHomePath(dirRaw);
+  const assetsSubdirRaw = typeof raw.assetsSubdir === 'string' && raw.assetsSubdir.trim() ? raw.assetsSubdir.trim() : OBSIDIAN_DEFAULTS.assetsSubdir;
+  const assetsSubdir = String(assetsSubdirRaw).replace(/\\/g, '/').replace(/^\/+/, '').replace(/\/+$/, '');
+  const autoExport = raw.autoExport !== false;
+  const dirValid = Boolean(dir) && path.isAbsolute(dir);
+  const subdirValid = isSafeObsidianSubdir(assetsSubdir);
+  let reason = '';
+  if (!enabled) reason = 'obsidian.enabled=false';
+  else if (!dir) reason = 'notes.obsidian.dir 未配置';
+  else if (!dirValid) reason = `notes.obsidian.dir 必须是绝对路径（支持 ~）：${dir}`;
+  else if (!subdirValid) reason = `notes.obsidian.assetsSubdir 非法：${assetsSubdir}`;
+  return {
+    enabled,
+    configured: Boolean(enabled && dirValid && subdirValid),
+    dir,
+    dirRaw,
+    assetsSubdir,
+    autoExport,
+    reason,
+  };
+}
+
+function obsidianUnavailableError(cfg) {
+  const error = new Error(
+    `Obsidian 未启用/未正确配置（notes.obsidian：${cfg?.reason || '未配置'}）：在 config/livedub.config.json 设置 ` +
+      '"notes": {"obsidian": {"enabled": true, "dir": "~/Obsidian/课程", "assetsSubdir": "livedub-assets", "autoExport": true}}，然后重启引擎。',
+  );
+  error.status = 409;
+  error.code = 'obsidian_not_configured';
+  return error;
+}
+
+function obsidianWriteError(message, cause) {
+  const error = new Error(`${message}${cause ? `：${cause?.message ?? cause}` : ''}`);
+  error.status = 500;
+  error.code = 'obsidian_write_failed';
+  return error;
+}
+
+function getObsidianStatus(state) {
+  const cfg = resolveObsidianConfig(state);
+  let exists = false;
+  try {
+    exists = Boolean(cfg.dir) && fs.statSync(cfg.dir).isDirectory();
+  } catch {
+    exists = false;
+  }
+  return {
+    ok: true,
+    enabled: cfg.enabled,
+    configured: cfg.configured,
+    dir: cfg.dir || '',
+    dirRaw: cfg.dirRaw,
+    exists,
+    autoExport: cfg.autoExport,
+    assetsSubdir: cfg.assetsSubdir,
+    indexPath: state.obsidianIndexPath ?? (cfg.dir ? path.join(cfg.dir, OBSIDIAN_INDEX_FILE) : null),
+    lastSyncedAt: state.obsidianLastSyncedAt ?? null,
+    lastPath: state.obsidianLastPath ?? null,
+    lastError: state.obsidianLastError ?? null,
+    reason: cfg.reason,
+  };
+}
+
+function sanitizeVaultTitle(title, fallback) {
+  const cleaned = String(title ?? '')
+    .replace(/[\\/:*?"<>|\u0000-\u001f]/g, '-')
+    .replace(/\s+/g, ' ')
+    .replace(/^[.\s-]+/, '')
+    .trim()
+    .slice(0, 80)
+    .trim();
+  if (cleaned) return cleaned;
+  const fallbackTitle = String(fallback ?? 'video')
+    .replace(/[\\/:*?"<>|\u0000-\u001f]/g, '-')
+    .trim()
+    .slice(0, 60);
+  return fallbackTitle || 'video';
+}
+
+/** 生成 Obsidian 文件名：<安全标题>-<YYYY-MM-DD>.md（同名覆盖） */
+function obsidianFilename(video) {
+  return `${sanitizeVaultTitle(video?.title, video?.id)}-${localDateString()}.md`;
+}
+
+function videoForNotesExport(state, videoId, videoHint = null) {
+  const id = String(videoId ?? '');
+  const notes = readAllNoteEntries(state)
+    .map((entry) => entry.note)
+    .filter((note) => note.video?.id === id);
+  return notes[0]?.video ?? (videoHint && typeof videoHint === 'object' ? videoHint : { id, title: id });
+}
+
+function ensureObsidianDirs(cfg) {
+  try {
+    fs.mkdirSync(cfg.dir, { recursive: true });
+    fs.mkdirSync(path.join(cfg.dir, cfg.assetsSubdir), { recursive: true });
+  } catch (err) {
+    throw obsidianWriteError(`创建 Obsidian 目录失败（${cfg.dir}）`, err);
+  }
+}
+
+/** 复制正文引用的 data/notes/assets PNG 到 vault assetsSubdir，并把 Markdown 引用改为 vault 相对路径 */
+function copyObsidianAssets(state, cfg, markdown) {
+  const { assetsDir } = notesPaths(state);
+  const destDir = path.join(cfg.dir, cfg.assetsSubdir);
+  const names = [...new Set([...String(markdown).matchAll(/\/api\/notes\/assets\/([A-Za-z0-9._-]+\.png)/g)].map((match) => match[1]))];
+  let assetsCopied = 0;
+  let output = String(markdown);
+  for (const name of names) {
+    if (!OBSIDIAN_ASSET_NAME_RE.test(name) || name.includes('..')) continue;
+    const source = path.resolve(assetsDir, name);
+    if (!source.startsWith(path.resolve(assetsDir) + path.sep)) continue;
+    let stat;
+    try {
+      stat = fs.statSync(source);
+    } catch {
+      continue;
+    }
+    if (!stat.isFile()) continue;
+    try {
+      fs.copyFileSync(source, path.join(destDir, name));
+      assetsCopied += 1;
+    } catch {
+      continue;
+    }
+    output = output.split(`/api/notes/assets/${name}`).join(`${cfg.assetsSubdir}/${name}`);
+  }
+  return { markdown: output, assetsCopied };
+}
+
+function formatObsidianTimestamp(iso) {
+  const date = iso ? new Date(iso) : null;
+  if (!date || Number.isNaN(date.getTime())) return '—';
+  const pad = (value) => String(value).padStart(2, '0');
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}`;
+}
+
+function buildObsidianIndexMarkdown(state) {
+  const entries = readAllNoteEntries(state);
+  const courses = new Map();
+  for (const entry of entries) {
+    const video = entry.note.video;
+    const id = String(video.id);
+    const current = courses.get(id) ?? { video, count: 0, updatedAt: '' };
+    current.count += 1;
+    if (String(entry.note.updatedAt ?? '') > current.updatedAt) current.updatedAt = String(entry.note.updatedAt ?? '');
+    if (!current.video.title && video.title) current.video = { ...current.video, ...video };
+    courses.set(id, current);
+  }
+  const list = [...courses.values()].sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+  const lines = [];
+  lines.push('# livedub 笔记索引');
+  lines.push('');
+  lines.push(`> 最后同步：${formatObsidianTimestamp(new Date().toISOString())} · 由 livedub 自动生成（笔记只在本机）`);
+  lines.push('');
+  lines.push('## 课程');
+  lines.push('');
+  if (list.length === 0) lines.push('（还没有课程笔记）');
+  for (const course of list) {
+    const title = sanitizeVaultTitle(course.video.title, course.video.id);
+    const filename = obsidianFilename(course.video);
+    lines.push(`- [${title}](<${filename}>) · ${course.count} 条笔记`);
+    lines.push(`  - 视频：${course.video.url ? String(course.video.url) : '（本地文件）'}`);
+    lines.push(`  - 最后更新：${formatObsidianTimestamp(course.updatedAt)}`);
+  }
+  lines.push('');
+  lines.push('---');
+  lines.push('由 `livedub` 工作台导出；每篇课程笔记含 front matter（source: livedub）。');
+  lines.push('');
+  return lines.join('\n');
+}
+
+function buildObsidianMarkdown(state, videoId, videoHint = null) {
+  return buildVideoNotesMarkdown(state, videoId, { forObsidian: true, videoHint });
+}
+
+/** 执行 Obsidian 导出（手动/自动共用；调用方负责串行化） */
+async function exportToObsidian(state, videoId, videoHint = null) {
+  const cfg = resolveObsidianConfig(state);
+  if (!cfg.configured) throw obsidianUnavailableError(cfg);
+  ensureObsidianDirs(cfg);
+  const video = videoForNotesExport(state, videoId, videoHint);
+  let markdown = buildObsidianMarkdown(state, videoId, videoHint);
+  const copied = copyObsidianAssets(state, cfg, markdown);
+  markdown = copied.markdown;
+  const filename = obsidianFilename(video);
+  const file = path.join(cfg.dir, filename);
+  const indexPath = path.join(cfg.dir, OBSIDIAN_INDEX_FILE);
+  try {
+    atomicWriteFileSync(file, markdown);
+    atomicWriteFileSync(indexPath, buildObsidianIndexMarkdown(state));
+  } catch (err) {
+    state.obsidianLastError = String(err?.message ?? err);
+    throw obsidianWriteError(`写入 Obsidian 目录失败（${cfg.dir}）`, err);
+  }
+  state.obsidianLastSyncedAt = new Date().toISOString();
+  state.obsidianLastPath = file;
+  state.obsidianIndexPath = indexPath;
+  state.obsidianLastError = '';
+  state.log(`Obsidian 同步 -> ${file}（${copied.assetsCopied} 个截图）`);
+  return {
+    ok: true,
+    target: 'obsidian',
+    path: file,
+    indexPath,
+    assetsCopied: copied.assetsCopied,
+    bytes: Buffer.byteLength(markdown, 'utf8'),
+  };
+}
+
+/** 所有 Obsidian 导出串行（避免 index.md 并发覆盖） */
+function runObsidianExportSerialized(state, videoId, videoHint = null) {
+  const run = state.obsidianQueue.then(() => exportToObsidian(state, videoId, videoHint));
+  state.obsidianQueue = run.then(
+    () => undefined,
+    () => undefined,
+  );
+  return run;
+}
+
+/** notes CRUD/quick 成功后按 videoId debounce 自动导出；失败只记日志，不影响保存 */
+function scheduleObsidianAutoExport(state, videoId, videoHint = null) {
+  const cfg = resolveObsidianConfig(state);
+  if (!videoId || !cfg.enabled || !cfg.configured || !cfg.autoExport) return null;
+  const existing = state.obsidianTimers.get(videoId);
+  if (existing) clearTimeout(existing);
+  const timer = setTimeout(() => {
+    state.obsidianTimers.delete(videoId);
+    runObsidianExportSerialized(state, videoId, videoHint)
+      .then((result) => {
+        state.log(`Obsidian 自动同步 ${videoId} -> ${result.path}`);
+      })
+      .catch((err) => {
+        state.obsidianLastError = String(err?.message ?? err);
+        state.log(`Obsidian 自动同步失败（不影响笔记保存）：${err?.message ?? err}`);
+      });
+  }, Math.max(0, Number(state.obsidianDebounceMs) || 0));
+  timer.unref?.();
+  state.obsidianTimers.set(videoId, timer);
+  return { scheduled: true, debounceMs: Math.max(0, Number(state.obsidianDebounceMs) || 0) };
+}
+
+function clearObsidianTimers(state) {
+  for (const timer of state.obsidianTimers.values()) clearTimeout(timer);
+  state.obsidianTimers.clear();
+}
+
 // ---- 请求处理 ----
 
 async function handleNotesRequest(state, req, res, { method, pathname, url }) {
@@ -1452,7 +1735,8 @@ async function handleNotesRequest(state, req, res, { method, pathname, url }) {
       return note;
     });
     state.log(`笔记创建 ${result.id}（${toProjectRelative(file)}，${result.body.length} 字符）`);
-    return sendJson(res, 200, { ok: true, note: result });
+    const obsidian = scheduleObsidianAutoExport(state, result.video?.id);
+    return sendJson(res, 200, { ok: true, note: result, ...(obsidian ? { obsidian } : {}) });
   }
 
   if (pathname === '/api/notes/quick') {
@@ -1529,7 +1813,8 @@ async function handleNotesRequest(state, req, res, { method, pathname, url }) {
       fs.appendFileSync(file, `${prefix}${markdown}`);
     });
     state.log(`快速摘录 ${created.id}（${toProjectRelative(noteFile)} + ${toProjectRelative(file)}）`);
-    return sendJson(res, 200, { ok: true, path: toProjectRelative(file), markdown, note: created });
+    const obsidian = scheduleObsidianAutoExport(state, created.video?.id);
+    return sendJson(res, 200, { ok: true, path: toProjectRelative(file), markdown, note: created, ...(obsidian ? { obsidian } : {}) });
   }
 
   if (pathname === '/api/notes/assets') {
@@ -1585,6 +1870,11 @@ async function handleNotesRequest(state, req, res, { method, pathname, url }) {
     return stream.pipe(res);
   }
 
+  if (pathname === '/api/notes/obsidian/status') {
+    if (method === 'GET' || method === 'HEAD') return sendJson(res, 200, getObsidianStatus(state), { head });
+    return sendJson(res, 405, { ok: false, error: 'method_not_allowed', message: 'Obsidian 状态只支持 GET' });
+  }
+
   if (pathname === '/api/notes/export.md') {
     const videoId = String(url.searchParams.get('videoId') ?? '').trim();
     if (!videoId) return sendJson(res, 400, { ok: false, error: 'missing_video_id', message: '需要 ?videoId=' });
@@ -1600,6 +1890,22 @@ async function handleNotesRequest(state, req, res, { method, pathname, url }) {
     const videoId = typeof parsed.value?.videoId === 'string' ? parsed.value.videoId.trim() : '';
     if (!videoId) return sendJson(res, 400, { ok: false, error: 'missing_video_id', message: '需要 videoId' });
     if (videoId.length > 200) return sendJson(res, 400, { ok: false, error: 'invalid_video_id', message: 'videoId 过长' });
+    const target = parsed.value?.target === undefined ? 'default' : parsed.value.target;
+    if (target !== 'default' && target !== 'obsidian') {
+      return sendJson(res, 400, { ok: false, error: 'invalid_target', message: "target 只能是 'default' 或 'obsidian'" });
+    }
+    if (target === 'obsidian') {
+      try {
+        const result = await runObsidianExportSerialized(state, videoId);
+        return sendJson(res, 200, result);
+      } catch (err) {
+        return sendJson(res, err?.status ?? 500, {
+          ok: false,
+          error: err?.code ?? 'obsidian_write_failed',
+          message: String(err?.message ?? err),
+        });
+      }
+    }
     const markdown = buildVideoNotesMarkdown(state, videoId);
     const { exportsDir } = notesPaths(state);
     const filename = `${notesSlugForVideoId(videoId)}-${localDateString()}.md`;
@@ -1611,7 +1917,7 @@ async function handleNotesRequest(state, req, res, { method, pathname, url }) {
       return sendJson(res, 500, { ok: false, error: 'persist_failed', message: `导出失败：${err?.message ?? err}` });
     }
     state.log(`笔记导出 -> ${toProjectRelative(file)}（${markdown.length} 字符）`);
-    return sendJson(res, 200, { ok: true, path: toProjectRelative(file), bytes: Buffer.byteLength(markdown, 'utf8') });
+    return sendJson(res, 200, { ok: true, target: 'default', path: toProjectRelative(file), bytes: Buffer.byteLength(markdown, 'utf8') });
   }
 
   // /api/notes/:id —— PUT / DELETE
@@ -1655,7 +1961,8 @@ async function handleNotesRequest(state, req, res, { method, pathname, url }) {
         return note;
       });
       if (!updated) return sendJson(res, 404, { ok: false, error: 'not_found', message: '笔记不存在' });
-      return sendJson(res, 200, { ok: true, note: updated });
+      const obsidian = scheduleObsidianAutoExport(state, updated.video?.id);
+      return sendJson(res, 200, { ok: true, note: updated, ...(obsidian ? { obsidian } : {}) });
     }
     if (method === 'DELETE') {
       const found = findNoteEntry(state, id);
@@ -1677,7 +1984,8 @@ async function handleNotesRequest(state, req, res, { method, pathname, url }) {
         }
       });
       state.log(`笔记删除 ${id}`);
-      return sendJson(res, 200, { ok: true, deleted: true });
+      const obsidian = scheduleObsidianAutoExport(state, found.note?.video?.id ?? found.store?.video?.id, found.note?.video ?? found.store?.video ?? null);
+      return sendJson(res, 200, { ok: true, deleted: true, ...(obsidian ? { obsidian } : {}) });
     }
   }
 
@@ -1693,6 +2001,7 @@ function allowedMethodsForPath(pathname) {
   if (pathname.startsWith('/api/notes/assets/')) return ['GET', 'HEAD'];
   if (pathname === '/api/notes/export') return ['POST'];
   if (pathname === '/api/notes/export.md') return ['GET', 'HEAD'];
+  if (pathname === '/api/notes/obsidian/status') return ['GET', 'HEAD'];
   if (pathname.startsWith('/api/notes/')) return ['PUT', 'DELETE'];
   if (pathname.startsWith('/api/vision/')) {
     if (pathname === '/api/vision/health') return ['GET', 'HEAD'];
@@ -2902,6 +3211,14 @@ export async function startServer(options = {}) {
     visionUnavailableError: null,
     visionUnavailableAt: 0,
     visionHealthCache: null,
+    // v0.6：Obsidian 目录同步（按 videoId debounce 自动导出；导出串行）
+    obsidianDebounceMs: Number.isFinite(options.obsidianDebounceMs) && options.obsidianDebounceMs >= 0 ? options.obsidianDebounceMs : OBSIDIAN_DEBOUNCE_MS,
+    obsidianTimers: new Map(),
+    obsidianQueue: Promise.resolve(),
+    obsidianLastSyncedAt: null,
+    obsidianLastPath: null,
+    obsidianIndexPath: null,
+    obsidianLastError: null,
     env,
   };
 
@@ -3013,6 +3330,8 @@ export async function startServer(options = {}) {
     } catch (err) {
       log(`释放视觉服务失败（不影响退出）：${err?.message ?? err}`);
     }
+    clearObsidianTimers(state);
+    await state.obsidianQueue.catch(() => {});
     log('livedub 引擎已关闭');
   }
 

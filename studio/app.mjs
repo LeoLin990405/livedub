@@ -9,6 +9,16 @@
  * 用会话 JSONL 驱动同一套 UI，用于离线演示与无头截图。
  */
 import {
+  buildCourseOverviewMarkdown,
+  computeChapters,
+} from './notes-kit.mjs';
+import {
+  buildVisualContextPayload,
+  describeVisualContext,
+  normalizeVisualContextText,
+  shouldSendVisualContext,
+} from './context-kit.mjs';
+import {
   buildVisualNoteMarkdown,
   collectTranscript,
   contactSheetLayout,
@@ -100,6 +110,7 @@ const els = {
   visualModal: $('visualModal'),
   visualVideoTitle: $('visualVideoTitle'),
   visualVisionBadge: $('visualVisionBadge'),
+  visualMode: $('visualMode'),
   visualRange: $('visualRange'),
   visualVlm: $('visualVlm'),
   visualPlan: $('visualPlan'),
@@ -111,6 +122,11 @@ const els = {
   btnVisualCancel: $('btnVisualCancel'),
   btnVisualStart: $('btnVisualStart'),
   visualFootHint: $('visualFootHint'),
+  obsidianDot: $('obsidianDot'),
+  obsidianStatusText: $('obsidianStatusText'),
+  btnObsidianSync: $('btnObsidianSync'),
+  toggleVisualContext: $('toggleVisualContext'),
+  visualContextStatus: $('visualContextStatus'),
   btnNotesClose: $('btnNotesClose'),
   notesExportMenu: $('notesExportMenu'),
   notesOfflineBanner: $('notesOfflineBanner'),
@@ -296,7 +312,36 @@ const state = {
   // v0.4：当前视频身份（Notes API 的 VideoRef 基础）+ 学习笔记状态
   video: null,
   vision: { available: null, health: null, checkedAt: null, checking: false },
-  visual: { open: false, running: false, cancelled: false, sampling: false, phase: 'idle', debug: {}, range: 'rest', vlm: false, abort: null, lastError: null },
+  visual: { open: false, running: false, cancelled: false, sampling: false, phase: 'idle', debug: {}, mode: 'single', range: 'rest', vlm: false, abort: null, lastError: null },
+  obsidian: {
+    loaded: false,
+    loading: false,
+    enabled: false,
+    configured: false,
+    dir: '',
+    dirRaw: '',
+    exists: false,
+    autoExport: true,
+    assetsSubdir: 'livedub-assets',
+    lastSyncedAt: null,
+    lastPath: null,
+    indexPath: null,
+    lastError: null,
+    syncing: false,
+    statusTimer: null,
+  },
+  visualContext: {
+    enabled: false,
+    timer: null,
+    sending: false,
+    lastText: '',
+    lastGray: null,
+    lastTMs: null,
+    lastChars: 0,
+    lastSentAt: 0,
+    noSocketLogged: false,
+    errorsLogged: 0,
+  },
   notes: {
     open: false,
     loadedFor: null,
@@ -925,6 +970,7 @@ function stopSession({ silent = false } = {}) {
   state.sessionProviders = null;
   renderAsrEngine();
   hideSubtitle();
+  if (state.visualContext.enabled || state.visualContext.timer) stopVisualContextLoop({ clearState: true });
   if (!silent) toast('已停止同传会话', 'info');
   logEvent('session', '停止同传', 'warn');
 }
@@ -987,6 +1033,7 @@ function setMedia(src, label, { isFile = false, objectUrl = null, size = null } 
   els.emptyUrl.value = isFile ? '' : src;
   resetMediaState();
   onVideoChanged();
+  if (state.visualContext.enabled || state.visualContext.timer) stopVisualContextLoop({ clearState: true });
   updatePlayButton();
   logEvent('player', `载入媒体：${state.media.name}`, 'ok');
   toast(`已载入：${state.media.name}`, 'ok');
@@ -2361,6 +2408,7 @@ async function refreshNotes({ silent = false } = {}) {
   } finally {
     state.notes.loading = false;
     renderNotesAll();
+    scheduleObsidianStatusRefresh();
   }
 }
 
@@ -2590,6 +2638,7 @@ async function flushNotesSave() {
     if (payload?.note) Object.assign(note, payload.note);
     state.notes.lastSavedAt = Date.now();
     setNotesStatus(`已保存 ${new Date().toLocaleTimeString('zh-CN', { hour12: false })}`, 'saved');
+    scheduleObsidianStatusRefresh();
   } catch (error) {
     markNotesOffline(error, { toastOnce: false });
     persistLocalNote(note);
@@ -2813,6 +2862,11 @@ async function exportNotes(kind) {
     toast('请先载入视频', 'warn');
     return;
   }
+  if (kind === 'obsidian') {
+    els.notesExportMenu.open = false;
+    await syncCurrentVideoToObsidian();
+    return;
+  }
   await flushNotesSave();
   try {
     if (kind === 'write') {
@@ -2942,6 +2996,22 @@ function computeVisualRange() {
   return { startMs, endMs: durationMs };
 }
 
+function setVisualMode(mode) {
+  state.visual.mode = mode === 'chapters' ? 'chapters' : 'single';
+  for (const button of els.visualMode.querySelectorAll('button[data-mode]')) {
+    const active = button.dataset.mode === state.visual.mode;
+    button.setAttribute('aria-pressed', String(active));
+    button.dataset.active = String(active);
+  }
+  renderVisualPlan();
+}
+
+function estimateChapterCount(range) {
+  const segments = getSessionSegments().filter((segment) => segment.t1Ms >= range.startMs && segment.t0Ms <= range.endMs);
+  const chapters = computeChapters(segments, [], { minGapMs: 2500, minChapterMs: 20000, maxChapterMs: 180000, maxChapters: 30 });
+  return Math.max(1, chapters.length);
+}
+
 function setVisualRange(range) {
   state.visual.range = range === 'all' ? 'all' : 'rest';
   for (const button of els.visualRange.querySelectorAll('button[data-range]')) {
@@ -2966,9 +3036,16 @@ function renderVisualPlan() {
   const parts = [
     `范围 ${formatNoteTimestamp(range.startMs)} – ${formatNoteTimestamp(range.endMs)}（${((range.endMs - range.startMs) / 1000).toFixed(1)}s）`,
     `每 ${(options.intervalMs / 1000).toFixed(0)}s 采样 ${candidates} 个候选点`,
-    `差异阈值 ${(options.minChange * 100).toFixed(1)}%，最多 ${options.maxFrames} 个关键帧`,
+    `差异阈值 ${(options.minChange * 100).toFixed(1)}%`,
     vlm ? `VLM 画面理解（每 ${options.sheetSize} 帧一批，较慢）` : '仅 OCR（快、离线、免费）',
   ];
+  if (state.visual.mode === 'chapters') {
+    const estimated = estimateChapterCount(range);
+    parts.splice(1, 0, `按章节 · 预计 ${estimated} 章 · 每章最多 6 帧`);
+    parts.push(`全部章节完成后自动生成课程总览（kind:outline）`);
+  } else {
+    parts.splice(2, 0, `最多 ${options.maxFrames} 个关键帧`);
+  }
   els.visualPlan.textContent = parts.join(' · ');
 }
 
@@ -2989,6 +3066,11 @@ function openVisualModal() {
   els.visualVideoTitle.textContent = state.video.title;
   els.visualError.hidden = true;
   els.visualVlm.checked = Boolean(state.visual.vlm && state.vision.health?.visionAvailable);
+  for (const button of els.visualMode.querySelectorAll('button[data-mode]')) {
+    const active = button.dataset.mode === state.visual.mode;
+    button.setAttribute('aria-pressed', String(active));
+    button.dataset.active = String(active);
+  }
   setVisualRange(state.visual.range);
   if (state.vision.checkedAt == null || Date.now() - state.vision.checkedAt > 30_000) void loadVisionHealth({ silent: false });
   else renderVisionAvailability();
@@ -3208,6 +3290,7 @@ async function visionSummarize(payload, signal = null) {
 
 async function runVisualPipeline() {
   if (state.visual.running) return;
+  if (state.visual.mode === 'chapters') return await runChaptersPipeline();
   if (!state.video) {
     toast('请先载入视频', 'warn');
     return;
@@ -3383,6 +3466,7 @@ async function runVisualPipeline() {
     );
     logEvent('vision', `图文笔记 ${payload.note.id}：${frames.length} 帧 · ${markdown.length} 字符`, 'ok');
     if (degraded.length) logEvent('vision', degraded.join('；'), 'warn');
+    notifyObsidianAutoSync();
     setTimeout(() => closeVisualModal({ force: true }), 700);
   } catch (error) {
     state.visual.phase = state.visual.cancelled ? 'cancelled' : 'error';
@@ -3417,6 +3501,549 @@ async function runVisualPipeline() {
       els.video.play().catch(() => {});
     }
   }
+}
+
+/** 章节图文笔记：采样候选 -> computeChapters -> 逐章 OCR/总结/保存 -> 课程总览 */
+async function runChaptersPipeline() {
+  if (state.visual.running) return;
+  if (!state.video) {
+    toast('请先载入视频', 'warn');
+    return;
+  }
+  if (state.vision.available !== true) {
+    toast('视觉引擎未就绪：/api/vision 返回 503（需要 engine/vision/index.mjs 与本地 OCR 依赖）', 'warn', 6000);
+    return;
+  }
+  const range = computeVisualRange();
+  if (range.endMs - range.startMs < 1000) {
+    toast('范围太短（至少 1 秒），请切换范围或稍后再试', 'warn');
+    return;
+  }
+  const options = resolveKeyframeOptions(state.config);
+  const perChapterMaxFrames = 6;
+  state.visual.running = true;
+  state.visual.cancelled = false;
+  state.visual.lastError = null;
+  state.visual.phase = 'sampling';
+  state.visual.debug = { times: [], grabbed: 0, accepted: 0, chapters: 0, chapterNotes: 0, ocrDone: 0, ocrFailed: 0, vlmDone: 0, overview: false };
+  state.visual.abort = new AbortController();
+  const signal = state.visual.abort.signal;
+  els.btnVisualStart.disabled = true;
+  els.btnVisualStart.textContent = '生成中…';
+  els.btnVisualCancel.hidden = false;
+  els.visualError.hidden = true;
+  els.visualProgress.hidden = false;
+  const wasPaused = els.video.paused;
+  const originalTime = Number(els.video.currentTime) || 0;
+  let ocrFailure = '';
+  try {
+    if (!wasPaused) els.video.pause();
+    state.visual.sampling = true;
+    setVisualProgress('采样关键帧（章节模式）…', 2);
+    const times = sampleTimes({
+      startMs: range.startMs,
+      endMs: range.endMs,
+      intervalMs: options.intervalMs,
+      maxCandidates: options.maxFrames * 6,
+    });
+    state.visual.debug.times = times;
+    const frames = [];
+    const candidates = [];
+    let previousGray = null;
+    for (let index = 0; index < times.length; index += 1) {
+      checkVisualCancel();
+      setVisualProgress(`采样中 ${index + 1}/${times.length}（候选 ${candidates.length}）`, 2 + ((index + 1) / times.length) * 14);
+      const grab = await grabFrameAt(times[index]);
+      state.visual.debug.grabbed += 1;
+      const meanDiff = previousGray ? frameChangeRatio(previousGray, grab.gray) : 1;
+      const structuralDiff = previousGray ? changedPixelRatio(previousGray, grab.gray) : 1;
+      candidates.push({ tMs: times[index], changeRatio: Math.max(meanDiff, structuralDiff) });
+      if (frames.length === 0 || shouldAcceptFrame(previousGray, grab.gray, options.minChange)) {
+        frames.push({ tMs: times[index], index: frames.length + 1, blob: grab.blob, gray: grab.gray, imageUrl: '', ocrText: '', caption: '' });
+        previousGray = grab.gray;
+        state.visual.debug.accepted = frames.length;
+      }
+    }
+    state.visual.sampling = false;
+    const segments = getSessionSegments();
+    const inRangeSegments = segments.filter((segment) => segment.t1Ms >= range.startMs && segment.t0Ms <= range.endMs);
+    let chapters = computeChapters(inRangeSegments, candidates, {
+      minGapMs: 2500,
+      minChapterMs: 20000,
+      maxChapterMs: 180000,
+      maxChapters: 30,
+      changeThreshold: 0.035,
+      snapMs: 2000,
+    })
+      .map((chapter) => ({
+        ...chapter,
+        startMs: Math.max(range.startMs, chapter.startMs),
+        endMs: Math.min(range.endMs, chapter.endMs),
+      }))
+      .filter((chapter) => chapter.endMs > chapter.startMs)
+      .map((chapter, index) => ({ ...chapter, index: index + 1 }));
+    if (chapters.length === 0) {
+      chapters = [{ index: 1, startMs: range.startMs, endMs: range.endMs, title: `第 1 章 · ${formatNoteTimestamp(range.startMs)}` }];
+    }
+    state.visual.debug.chapters = chapters.length;
+    const useVlm = Boolean(state.visual.vlm && state.vision.health?.visionAvailable);
+    const chapterNotes = [];
+    const total = chapters.length;
+
+    for (let chapterIndex = 0; chapterIndex < total; chapterIndex += 1) {
+      checkVisualCancel();
+      const chapter = chapters[chapterIndex];
+      const chapterRange = { startMs: chapter.startMs, endMs: chapter.endMs };
+      const prefix = `章节 ${chapterIndex + 1}/${total}`;
+      let chapterFrames = frames.filter((frame) => frame.tMs >= chapter.startMs && frame.tMs <= chapter.endMs);
+      if (chapterFrames.length === 0) {
+        const targetMs = Math.min(chapter.endMs, chapter.startMs + Math.max(1000, (chapter.endMs - chapter.startMs) / 2));
+        const grab = await grabFrameAt(targetMs);
+        chapterFrames = [{ tMs: targetMs, index: 1, blob: grab.blob, gray: grab.gray, imageUrl: '', ocrText: '', caption: '' }];
+      }
+      if (chapterFrames.length > perChapterMaxFrames) {
+        const picked = [];
+        for (let slot = 0; slot < perChapterMaxFrames; slot += 1) {
+          const index = Math.round((slot * (chapterFrames.length - 1)) / (perChapterMaxFrames - 1));
+          picked.push(chapterFrames[index]);
+        }
+        chapterFrames = [...new Set(picked)];
+      }
+
+      for (let frameIndex = 0; frameIndex < chapterFrames.length; frameIndex += 1) {
+        checkVisualCancel();
+        setVisualProgress(
+          `${prefix} · 识别中 ${frameIndex + 1}/${chapterFrames.length}`,
+          16 + (chapterIndex / total) * 64 + (frameIndex / chapterFrames.length) * (64 / total),
+        );
+        const frame = chapterFrames[frameIndex];
+        try {
+          frame.imageUrl = await timeoutAfter(uploadVisualAsset(frame.blob, signal), 20_000, '上传截图');
+          const result = await timeoutAfter(visionOcrAsset(frame.imageUrl, signal), 15_000, 'OCR 识别');
+          frame.ocrText = String(result?.text ?? '');
+          state.visual.debug.ocrDone += 1;
+        } catch (error) {
+          if (state.visual.cancelled || error?.name === 'AbortError') throw error;
+          state.visual.debug.ocrFailed += 1;
+          ocrFailure = ocrFailure || error.message;
+        }
+      }
+
+      const firstOcrLine = chapterFrames
+        .map((frame) => String(frame.ocrText ?? '').split('\n').map((line) => line.trim()).find(Boolean))
+        .find(Boolean);
+      if (firstOcrLine && /^第 \d+ 章/.test(String(chapter.title ?? ''))) {
+        chapter.title = firstOcrLine.replace(/^#+\s*/, '').slice(0, 48);
+      }
+
+      if (useVlm) {
+        const batches = [];
+        for (let index = 0; index < chapterFrames.length; index += options.sheetSize) batches.push(chapterFrames.slice(index, index + options.sheetSize));
+        for (let batchIndex = 0; batchIndex < batches.length; batchIndex += 1) {
+          checkVisualCancel();
+          setVisualProgress(`${prefix} · 画面理解（批次 ${batchIndex + 1}/${batches.length}）…`, 16 + (chapterIndex / total) * 64 + 50 / total);
+          try {
+            const sheet = await buildContactSheet(batches[batchIndex]);
+            const analysis = await visionAnalyzeSheet(sheet, signal);
+            const caption = String(analysis?.caption?.text ?? analysis?.caption?.summary ?? '').trim();
+            if (caption) for (const frame of batches[batchIndex]) frame.caption = caption;
+            state.visual.debug.vlmDone += 1;
+          } catch (error) {
+            if (state.visual.cancelled || error?.name === 'AbortError') throw error;
+            state.visual.lastError = `画面理解部分失败：${error.message}`;
+          }
+        }
+      }
+
+      setVisualProgress(`${prefix} · 总结中…`, 80 + (chapterIndex / total) * 10);
+      const transcript = collectTranscript(segments, { startMs: chapter.startMs, endMs: chapter.endMs, limit: 200 });
+      const visuals = chapterFrames.map((frame) => ({
+        tMs: frame.tMs,
+        ocrText: frame.ocrText,
+        ...(frame.caption ? { caption: frame.caption } : {}),
+      }));
+      let summary = '';
+      let keyPoints = [];
+      try {
+        const result = await visionSummarize(
+          { title: `${state.video.title} · ${prefix} ${chapter.title}`, transcript, visuals, lang: 'zh' },
+          signal,
+        );
+        summary = String(result?.summary ?? '');
+        keyPoints = Array.isArray(result?.keyPoints) ? result.keyPoints : [];
+      } catch (error) {
+        if (state.visual.cancelled || error?.name === 'AbortError') throw error;
+        state.visual.lastError = state.visual.lastError ?? `第 ${chapterIndex + 1} 章总结失败（保留 OCR 时间线）：${error.message}`;
+      }
+
+      const markdown = buildVisualNoteMarkdown({
+        title: state.video.title,
+        summary,
+        keyPoints,
+        frames: chapterFrames,
+        segments,
+        range: chapterRange,
+        chapter: { index: chapterIndex + 1, total },
+        langFrom: 'en',
+        langTo: 'zh',
+        generatedAt: new Date(),
+        vlm: useVlm,
+      });
+      const payload = await notesFetch('/api/notes', {
+        method: 'POST',
+        signal,
+        body: {
+          video: currentVideoRef(),
+          tMs: chapter.startMs,
+          body: markdown,
+          kind: 'visual',
+          tags: visualNoteTags({ vlm: useVlm, extra: ['章节', 'OCR'] }),
+          source: 'studio',
+          ...(chapterFrames[0]?.imageUrl ? { imageUrl: chapterFrames[0].imageUrl } : {}),
+        },
+      });
+      if (!payload?.note) throw new Error(`第 ${chapterIndex + 1} 章保存失败（响应缺少 note）`);
+      chapterNotes.push({ ...chapter, noteId: payload.note.id });
+      state.visual.debug.chapterNotes = chapterNotes.length;
+      logEvent('vision', `第 ${chapterIndex + 1}/${total} 章已保存 ${payload.note.id}`, 'ok');
+    }
+
+    // 课程总览：已有课程总览则更新，否则新建
+    state.visual.phase = 'overview';
+    setVisualProgress('生成课程总览…', 92);
+    await refreshNotes({ silent: true });
+    const overviewBody = buildCourseOverviewMarkdown({ video: currentVideoRef(), chapters: chapterNotes, generatedAt: new Date() });
+    const existingOverview = state.notes.items.find(
+      (note) => note?.kind === 'outline' && Array.isArray(note.tags) && note.tags.includes('课程总览') && note.video?.id === state.video.id,
+    );
+    let overviewId = null;
+    if (existingOverview) {
+      const payload = await notesFetch(`/api/notes/${encodeURIComponent(existingOverview.id)}`, {
+        method: 'PUT',
+        signal,
+        body: { body: overviewBody, tags: ['课程总览'] },
+      });
+      overviewId = payload?.note?.id ?? existingOverview.id;
+      logEvent('vision', `课程总览已更新 ${overviewId}`, 'ok');
+    } else {
+      const payload = await notesFetch('/api/notes', {
+        method: 'POST',
+        signal,
+        body: { video: currentVideoRef(), tMs: range.startMs, body: overviewBody, kind: 'outline', tags: ['课程总览'], source: 'studio' },
+      });
+      overviewId = payload?.note?.id;
+      if (!overviewId) throw new Error('课程总览保存失败（响应缺少 note）');
+      logEvent('vision', `课程总览已创建 ${overviewId}`, 'ok');
+    }
+    state.visual.debug.overview = true;
+    await refreshNotes({ silent: true });
+    selectNote(overviewId);
+    await openNotesDrawer();
+    setVisualProgress('完成 ✓', 100);
+    const degraded = [ocrFailure ? `OCR 失败：${ocrFailure}` : '', state.visual.lastError ?? ''].filter(Boolean);
+    toast(
+      `已生成 ${total} 章图文笔记 + 课程总览${useVlm ? '（含 VLM 画面理解）' : ''}${degraded.length ? '（部分降级）' : ''}`,
+      degraded.length ? 'warn' : 'ok',
+      7500,
+    );
+    logEvent('vision', `章节图文笔记完成：${total} 章 + 总览（${chapterNotes.length} 篇）`, 'ok');
+    notifyObsidianAutoSync();
+    setTimeout(() => closeVisualModal({ force: true }), 900);
+  } catch (error) {
+    state.visual.phase = state.visual.cancelled ? 'cancelled' : 'error';
+    if (state.visual.cancelled || error?.name === 'AbortError') {
+      setVisualProgress('已取消', 0);
+      toast('已取消章节图文笔记生成（已完成的章节笔记会保留）', 'info');
+    } else {
+      state.visual.lastError = error.message;
+      els.visualError.hidden = false;
+      els.visualError.textContent = `生成失败：${error.message}`;
+      setVisualProgress(`失败：${error.message}`, 0);
+      toast(`章节图文笔记生成失败：${error.message}`, 'err', 7000);
+      logEvent('vision', `章节图文笔记失败：${error.message}`, 'err');
+    }
+  } finally {
+    if (state.visual.phase !== 'error' && state.visual.phase !== 'cancelled') state.visual.phase = 'done';
+    state.visual.running = false;
+    state.visual.sampling = false;
+    state.visual.abort = null;
+    els.btnVisualStart.disabled = state.vision.available !== true;
+    els.btnVisualStart.textContent = '开始生成';
+    els.btnVisualCancel.hidden = true;
+    try {
+      els.video.currentTime = Math.min(Number.isFinite(els.video.duration) ? els.video.duration : originalTime, originalTime);
+    } catch {
+      /* ignore */
+    }
+    if (state.sim.active && state.sim.frozen) {
+      state.sim.clock = Math.round(originalTime * 1000);
+      applySimAt(state.sim.clock);
+    } else if (!wasPaused) {
+      els.video.play().catch(() => {});
+    }
+  }
+}
+
+/** 图文笔记生成后：若启用了 Obsidian 自动同步，刷新状态并提示最终路径 */
+function notifyObsidianAutoSync() {
+  if (!state.obsidian.enabled || !state.obsidian.autoExport) return;
+  setTimeout(async () => {
+    await loadObsidianStatus({ silent: true });
+    if (state.obsidian.lastPath) toast(`已自动同步到 Obsidian：${state.obsidian.lastPath}`, 'ok', 6500);
+  }, 1400);
+}
+
+// ==================================================== v0.6 Obsidian 同步
+
+function shortObsidianDir(status) {
+  const raw = String(status?.dirRaw ?? '').trim();
+  if (raw) return raw;
+  const dir = String(status?.dir ?? '');
+  return dir.length > 52 ? `…${dir.slice(-50)}` : dir;
+}
+
+function formatObsidianSyncAt(iso) {
+  const date = iso ? new Date(iso) : null;
+  if (!date || Number.isNaN(date.getTime())) return '—';
+  const pad = (value) => String(value).padStart(2, '0');
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}`;
+}
+
+function renderObsidianStatus() {
+  if (!els.obsidianStatusText) return;
+  const obsidian = state.obsidian;
+  const enabled = obsidian.loaded && obsidian.enabled && obsidian.configured;
+  els.btnObsidianSync.disabled = !enabled || !state.video || obsidian.syncing;
+  els.btnObsidianSync.title = enabled
+    ? '把当前视频笔记同步到 Obsidian 目录（含截图与索引）'
+    : 'Obsidian 未启用：在 config/livedub.config.json 的 notes.obsidian 中配置 enabled 与 dir';
+  els.obsidianDot.className = 'notes-obsidian-dot';
+  if (!obsidian.loaded) {
+    els.obsidianStatusText.textContent = 'Obsidian：检测中…';
+    return;
+  }
+  if (!obsidian.enabled) {
+    els.obsidianDot.classList.add('off');
+    els.obsidianStatusText.textContent = 'Obsidian：未启用（notes.obsidian.enabled=false）';
+    return;
+  }
+  if (!obsidian.configured) {
+    els.obsidianDot.classList.add('error');
+    els.obsidianStatusText.textContent = `Obsidian：配置无效 · ${obsidian.reason || '检查 notes.obsidian.dir'}`;
+    return;
+  }
+  els.obsidianDot.classList.add('on');
+  const syncText = obsidian.syncing
+    ? '同步中…'
+    : obsidian.lastError
+      ? `上次失败：${obsidian.lastError}`
+      : obsidian.lastSyncedAt
+        ? `最近同步 ${formatObsidianSyncAt(obsidian.lastSyncedAt)}`
+        : '尚未同步';
+  els.obsidianStatusText.textContent = `Obsidian：已启用 → ${shortObsidianDir(obsidian)} · ${syncText}${obsidian.autoExport ? ' · 自动同步开' : ''}`;
+  els.obsidianStatusText.title = obsidian.lastPath ? `最近文件：${obsidian.lastPath}` : '';
+}
+
+async function loadObsidianStatus({ silent = true } = {}) {
+  if (state.obsidian.loading) return;
+  state.obsidian.loading = true;
+  try {
+    const payload = await notesFetch('/api/notes/obsidian/status');
+    Object.assign(state.obsidian, payload, { loaded: true, loading: false });
+  } catch (error) {
+    Object.assign(state.obsidian, {
+      loaded: true,
+      loading: false,
+      enabled: false,
+      configured: false,
+      lastError: error.message,
+    });
+    if (!silent) logEvent('notes', `Obsidian 状态读取失败：${error.message}`, 'warn');
+  }
+  renderObsidianStatus();
+}
+
+function scheduleObsidianStatusRefresh() {
+  if (!state.notes.open) return;
+  clearTimeout(state.obsidian.statusTimer);
+  state.obsidian.statusTimer = setTimeout(() => void loadObsidianStatus({ silent: true }), 450);
+}
+
+async function syncCurrentVideoToObsidian() {
+  const video = currentVideoRef();
+  if (!video) {
+    toast('请先载入视频', 'warn');
+    return;
+  }
+  await flushNotesSave();
+  state.obsidian.syncing = true;
+  renderObsidianStatus();
+  try {
+    const payload = await notesFetch('/api/notes/export', { method: 'POST', body: { videoId: video.id, target: 'obsidian' } });
+    toast(`已同步到 Obsidian：${payload.path}（${payload.assetsCopied ?? 0} 张截图）`, 'ok', 8000);
+    logEvent('notes', `Obsidian 同步 ${payload.path}`, 'ok');
+  } catch (error) {
+    if (error.status === 409) toast(`Obsidian 未配置：${error.message}`, 'warn', 9000);
+    else toast(`同步 Obsidian 失败：${error.message}`, 'err', 7000);
+    logEvent('notes', `Obsidian 同步失败：${error.message}`, 'warn');
+  } finally {
+    state.obsidian.syncing = false;
+    await loadObsidianStatus({ silent: true });
+  }
+}
+
+// ============================================ v0.6 翻译参考画面文字（WS）
+
+function renderVisualContextStatus() {
+  if (!els.visualContextStatus) return;
+  const context = state.visualContext;
+  let text = describeVisualContext({
+    enabled: context.enabled,
+    lastTMs: context.lastTMs,
+    lastChars: context.lastChars,
+    pending: context.sending,
+  });
+  if (context.enabled && state.sim.active) text += ' · 回放模式仅本地识别';
+  else if (context.enabled && state.sessionActive && !state.sessionReady) text += ' · 等待会话';
+  els.visualContextStatus.textContent = text;
+  els.visualContextStatus.classList.toggle('active', context.enabled);
+  els.toggleVisualContext.checked = context.enabled;
+}
+
+/** 取当前画面（不 seek，直接读 video 当前帧） */
+async function captureContextFrame() {
+  const width = els.video.videoWidth;
+  const height = els.video.videoHeight;
+  if (!width || !height) return null;
+  const canvas = document.createElement('canvas');
+  canvas.width = width;
+  canvas.height = height;
+  const context = canvas.getContext('2d');
+  context.drawImage(els.video, 0, 0, width, height);
+  const blob = await new Promise((resolve, reject) => {
+    try {
+      canvas.toBlob((value) => (value ? resolve(value) : reject(new Error('画面导出失败'))), 'image/png');
+    } catch (error) {
+      reject(error);
+    }
+  });
+  const small = document.createElement('canvas');
+  small.width = 64;
+  small.height = 36;
+  const smallContext = small.getContext('2d');
+  smallContext.drawImage(canvas, 0, 0, 64, 36);
+  const gray = toGrayscale(smallContext.getImageData(0, 0, 64, 36).data, 64, 36);
+  return { blob, gray };
+}
+
+async function tickVisualContext() {
+  const context = state.visualContext;
+  if (!context.enabled || context.sending) return;
+  if (document.visibilityState === 'hidden') return;
+  const simPlaying = state.sim.active && !state.sim.frozen && !(state.sim.maxMs > 0 && (state.sim.clock || 0) >= state.sim.maxMs);
+  const realPlaying = !state.sim.active && state.sessionActive && state.sessionReady && !els.video.paused;
+  if (!simPlaying && !realPlaying) return;
+  context.sending = true;
+  renderVisualContextStatus();
+  try {
+    const frame = await captureContextFrame();
+    if (!frame) return;
+    const diff = context.lastGray ? frameChangeRatio(context.lastGray, frame.gray) : 1;
+    context.lastGray = frame.gray;
+    if (diff < 0.02) return; // 轻量去重：画面几乎没变，不 OCR
+    const response = await fetch('/api/vision/ocr', {
+      method: 'POST',
+      headers: { 'Content-Type': 'image/png' },
+      body: frame.blob,
+      signal: AbortSignal.timeout?.(15000) ?? undefined,
+    });
+    if (!response.ok) {
+      const payload = await response.json().catch(() => ({}));
+      throw new Error(payload.message ?? payload.error ?? `HTTP ${response.status}`);
+    }
+    const payload = await response.json();
+    const text = normalizeVisualContextText(payload.text);
+    if (!text) return;
+    const tMs = state.sim.active ? Math.round(state.sim.clock || 0) : Math.round((els.video.currentTime || 0) * 1000);
+    const decision = shouldSendVisualContext({
+      enabled: true,
+      text,
+      lastText: context.lastText,
+      changeRatio: diff,
+      nowMs: Date.now(),
+      lastSentAt: context.lastSentAt,
+      minSendIntervalMs: 8000,
+    });
+    if (!decision.send) {
+      if (decision.reason === 'duplicate' && !context.noSocketLogged) {
+        context.noSocketLogged = true;
+        logEvent('vision', '画面上下文：文字未变化，已去重', 'mt');
+      }
+      return;
+    }
+    const message = buildVisualContextPayload({ text: decision.text, tMs, capturedAtMs: Date.now() });
+    if (!message) return;
+    const sent = sendJson(message);
+    context.lastText = decision.text;
+    context.lastSentAt = Date.now();
+    context.lastTMs = tMs;
+    context.lastChars = decision.text.length;
+    if (sent) {
+      logEvent('vision', `画面上下文已发送 ${decision.text.length} 字 @ ${formatNoteTimestamp(tMs)}`, 'mt');
+    } else if (!context.noSocketLogged) {
+      context.noSocketLogged = true;
+      logEvent('vision', '画面上下文：当前没有引擎连接（回放模式仅本地识别，不发送）', 'warn');
+    }
+    renderVisualContextStatus();
+  } catch (error) {
+    if (context.errorsLogged < 3) {
+      context.errorsLogged += 1;
+      logEvent('vision', `画面上下文失败（静默）：${error.message}`, 'warn');
+    }
+  } finally {
+    context.sending = false;
+    renderVisualContextStatus();
+  }
+}
+
+function startVisualContextLoop() {
+  const context = state.visualContext;
+  if (!context.enabled) return;
+  clearInterval(context.timer);
+  context.timer = setInterval(() => void tickVisualContext(), 9000);
+  context.timer.unref?.();
+  renderVisualContextStatus();
+}
+
+function stopVisualContextLoop({ clearState = false } = {}) {
+  const context = state.visualContext;
+  clearInterval(context.timer);
+  context.timer = null;
+  if (clearState) {
+    context.lastText = '';
+    context.lastGray = null;
+    context.lastTMs = null;
+    context.lastChars = 0;
+    context.lastSentAt = 0;
+  }
+  renderVisualContextStatus();
+}
+
+function setVisualContextEnabled(enabled) {
+  const context = state.visualContext;
+  context.enabled = Boolean(enabled);
+  context.noSocketLogged = false;
+  context.errorsLogged = 0;
+  if (context.enabled) {
+    startVisualContextLoop();
+    toast('翻译参考画面文字已开启：每 8-10s 取画面 OCR 作为翻译语境（画面文字不会被翻译）', 'info', 6500);
+    logEvent('vision', '画面上下文已开启', 'ok');
+  } else {
+    stopVisualContextLoop({ clearState: true });
+    toast('翻译参考画面文字已关闭', 'info');
+    logEvent('vision', '画面上下文已关闭', 'mt');
+  }
+  renderVisualContextStatus();
 }
 
 /** 调试用：只采样关键帧并返回帧间差异（不 OCR/不保存） */
@@ -3942,10 +4569,16 @@ function bindEvents() {
   els.btnVisualClose.addEventListener('click', () => closeVisualModal());
   els.btnVisualStart.addEventListener('click', () => void runVisualPipeline());
   els.btnVisualCancel.addEventListener('click', cancelVisualRun);
+  els.visualMode.addEventListener('click', (event) => {
+    const button = event.target.closest('button[data-mode]');
+    if (button) setVisualMode(button.dataset.mode);
+  });
   els.visualRange.addEventListener('click', (event) => {
     const button = event.target.closest('button[data-range]');
     if (button) setVisualRange(button.dataset.range);
   });
+  els.btnObsidianSync.addEventListener('click', () => void syncCurrentVideoToObsidian());
+  els.toggleVisualContext.addEventListener('change', () => setVisualContextEnabled(els.toggleVisualContext.checked));
   els.visualVlm.addEventListener('change', () => {
     state.visual.vlm = Boolean(els.visualVlm.checked);
     renderVisualPlan();
@@ -3992,6 +4625,15 @@ function bindEvents() {
     button.addEventListener('click', () => void exportNotes(button.dataset.export));
   }
   els.btnPip.addEventListener('click', () => void togglePip());
+  els.video.addEventListener('play', () => {
+    if (state.visualContext.enabled) startVisualContextLoop();
+  });
+  els.video.addEventListener('pause', () => {
+    if (state.visualContext.timer) stopVisualContextLoop({ clearState: false });
+  });
+  els.video.addEventListener('ended', () => {
+    if (state.visualContext.enabled) stopVisualContextLoop({ clearState: true });
+  });
   els.video.addEventListener('enterpictureinpicture', () => {
     els.btnPip.setAttribute('aria-pressed', 'true');
     els.btnPip.title = '退出画中画';
@@ -4078,6 +4720,16 @@ async function bootstrap() {
       syncLocal: syncLocalNotes,
       delete: deleteNoteById,
     },
+    obsidian: {
+      state: state.obsidian,
+      load: loadObsidianStatus,
+      sync: syncCurrentVideoToObsidian,
+    },
+    visualContext: {
+      state: state.visualContext,
+      setEnabled: setVisualContextEnabled,
+      tick: tickVisualContext,
+    },
     vision: {
       state: state.vision,
       visual: state.visual,
@@ -4089,6 +4741,8 @@ async function bootstrap() {
       captureCurrent: captureCurrentVisual,
       debugSample: debugSampleFrames,
       setRange: setVisualRange,
+      setMode: setVisualMode,
+      runChapters: runChaptersPipeline,
       setVlm: (value) => {
         state.visual.vlm = Boolean(value);
         els.visualVlm.checked = state.visual.vlm;
@@ -4116,6 +4770,8 @@ async function bootstrap() {
   }
 
   void loadVisionHealth({ silent: true });
+  void loadObsidianStatus({ silent: true });
+  renderVisualContextStatus();
 
   // 扩展 / macOS App 的「打开笔记本」会链到 /studio/?notes=1
   if (params.get('notes') === '1') {

@@ -31,6 +31,8 @@ final class Settings {
         static let notesWhenPaused = prefix + "notesWhenPaused"
         static let notesOCR = prefix + "notesOCR"
         static let notesVision = prefix + "notesVision"
+        static let visualContextEnabled = prefix + "visualContextEnabled"
+        static let visualContextInterval = prefix + "visualContextInterval"
     }
 
     init(defaults: UserDefaults = .standard) {
@@ -178,6 +180,25 @@ final class Settings {
     var langTo: String {
         get { string(forKey: Key.langTo, default: "zh") }
         set { defaults.set(newValue, forKey: Key.langTo) }
+    }
+
+    // MARK: - 实时画面上下文（v0.6）
+
+    /// 翻译参考画面文字（OCR，每 10s 推送 WS visual-context）——默认关闭（CPU/耗电/隐私）
+    var visualContextEnabled: Bool {
+        get { bool(forKey: Key.visualContextEnabled, default: false) }
+        set { defaults.set(newValue, forKey: Key.visualContextEnabled) }
+    }
+
+    /// 推送间隔（秒）：可配置，钳制 8...15，默认 10
+    var visualContextInterval: TimeInterval {
+        get {
+            guard defaults.object(forKey: Key.visualContextInterval) != nil else {
+                return VisualContextPlanner.defaultIntervalSeconds
+            }
+            return VisualContextPlanner.clampInterval(defaults.double(forKey: Key.visualContextInterval))
+        }
+        set { defaults.set(VisualContextPlanner.clampInterval(newValue), forKey: Key.visualContextInterval) }
     }
 
     // MARK: - 私有

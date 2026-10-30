@@ -8,6 +8,8 @@
 - **v0.5 新能力**：⌥N 笔记加入**画面文字（OCR）**——截图上传后调用引擎 `/api/vision/ocr`，
   把幻灯片/代码/字幕里的文字写进笔记；可选 **画面理解（VLM，默认关，慢约 20–30s）**。
   视觉不可用（旧引擎 / 未安装 vision 模块）时静默降级，笔记照常保存。
+- **v0.6 新能力**：可选**实时画面上下文**——直播时每 10s 截屏 OCR，经 WS `visual-context`
+  推给引擎作为实时翻译参考（默认**关闭**，注意 CPU/耗电与画面隐私；异步、不阻塞音频/字幕）。
 - 和 Chrome 扩展（只抓网页标签页）、本地工作台（只处理本地文件）互补，三端共用同一套线协议：
   [`docs/CONTRACTS.md`](../../docs/CONTRACTS.md) §3 / [`engine/protocol.mjs`](../../engine/protocol.mjs)。
 - 原生 Swift，零第三方依赖：只用系统框架 `ScreenCaptureKit` / `AVFoundation` / `AppKit` / `Foundation`。
@@ -29,6 +31,7 @@ apps/macos/
 │   ├── NotesClient.swift          # Notes API 客户端 + 离线队列（≤50 条）+ 笔记文本/视频标题纯函数
 │   ├── Screenshot.swift           # SCScreenshotManager 截图（PNG ≤4MB）+ 截图降级决策
 │   ├── Vision.swift               # v0.5 视觉纯逻辑：OCR/analyze 请求、文本清洗/代码块转义、降级决策、health 解析
+│   ├── VisualContext.swift        # v0.6 实时画面上下文：visual-context 事件、清洗/去重/发送决策/状态文案
 │   ├── HotKey.swift               # Carbon RegisterEventHotKey 全局 ⌥N（无第三方依赖）
 │   └── SelfTest.swift             # --self-test headless 自检 + --simulate 演示语料
 ├── Info.plist                     # LSUIElement=true（菜单栏 App）、NSScreenCaptureUsageDescription 等
@@ -70,7 +73,7 @@ bash scripts/build-macos.sh --clean
 - 脚本只显式链接系统框架：`AppKit` / `AVFoundation` / `CoreMedia` / `CoreGraphics` / `ScreenCaptureKit`。
 - 构建末尾会做 **ad-hoc 签名**（`codesign --force --sign -`），便于 `open` 正常启动；App 未公证。
 - 本机实测（Swift 5.10 / macOS 14.8.9，Apple Silicon）：增量编译约 **6–15s**（clean 全量约 36s）、
-  可执行文件 **788 KB**、bundle **800 KB**（v0.5 增加视觉/OCR 模块）。
+  可执行文件 **862 KB**、bundle **876 KB**（v0.6 增加实时画面上下文）。
 
 ## 运行
 
@@ -110,6 +113,7 @@ BIN=apps/macos/build/livedub.app/Contents/MacOS/livedub
 | `--autostart` | 启动后自动点一次「开始同传」（适合登录项 / 自动化冒烟） |
 | `--note-once` | 启动 2.5s 后自动记一条测试笔记（截图/OCR/VLM 全链路）；未显式给 `--duration` 时记录完自动退出（冒烟用） |
 | `--notes-vision` | 调试用：本次运行开启「画面理解（VLM，慢）」开关（不写用户设置） |
+| `--visual-context` | 调试用：本次运行开启「实时画面上下文（OCR，每 10s 推送）」开关（不写用户设置） |
 | `--duration <秒>` | N 秒后自动退出（调试用） |
 | `--engine-url <url>` | 覆盖引擎地址并持久化 |
 | `--self-test` | headless 自检：协议字节布局 / hello / 事件解析 / 字幕排版 / 重采样 / 分帧 |
@@ -134,6 +138,8 @@ BIN=apps/macos/build/livedub.app/Contents/MacOS/livedub
 | **识别画面文字（OCR，快）** | v0.5 开关（默认开）：截图上传后调用 `/api/vision/ocr`，把文字写进笔记 |
 | **画面理解（VLM，慢，约 20–30s）** | v0.5 开关（默认关）：调用 `/api/vision/analyze?mode=both` 生成画面描述；失败降级为仅 OCR |
 | **视觉：…** | 视觉能力状态（只读）：OCR/VLM 是否可用（来自 `/api/vision/health`） |
+| **翻译参考画面文字（OCR，每 10s）** | v0.6 开关（默认**关**）：直播时每 10s 截屏 OCR 并 WS 推送 `visual-context` |
+| **画面上下文：…** | 状态（只读）：开/关 · 最近 HH:MM:SS · 上次 OCR n 字 |
 | 笔记队列：… | 离线待同步条数（引擎重连后自动补发） |
 | 设置引擎地址… | 修改 WS 地址，保存后自动重连 |
 | 打开屏幕录制权限设置… | 直达 系统设置 → 隐私与安全性 → 屏幕录制 |
@@ -297,10 +303,46 @@ sleep 6 && node /tmp/mock-notes-engine.mjs
 系统设置里不需要给 livedub 辅助功能权限）。若没反应：先用菜单「记笔记」确认链路，再检查日志中的
 「全局快捷键 ⌥N 已就绪 / 注册失败」。
 
+## 可选：实时画面上下文（供翻译参考，v0.6）
+
+同传时除了声音，画面里的文字（PPT/代码/板书/会议共享屏）也能帮助翻译更准确。开启后 App 会**每 10 秒**
+截取一次屏幕 → OCR → 把画面文字通过 WS 文本帧推给引擎，引擎把它作为最近 120s 的翻译参考上下文。
+
+```text
+每 10s（可配 8–15s）：
+  SCScreenshotManager 截屏（排除 livedub 自身浮层）
+    -> POST /api/notes/assets（PNG 存本地笔记资产）
+    -> POST /api/vision/ocr（本地 OCR）
+    -> 清洗/去重/截断 2000 字
+    -> WS 文本帧 {"type":"visual-context","text":"…","tMs":…,"source":"macos","capturedAtMs":…}
+       （引擎 TTL 120s；同内容重复忽略；断开不排队）
+```
+
+- **默认关闭**：每 10s 一次截屏 + OCR + 上传会带来额外 CPU/耗电，且画面内容涉及隐私，所以默认不推送。
+  菜单「翻译参考画面文字（OCR，每 10s）」随时开关；关闭时立即停止并清空状态。
+- **只在直播 + 已连接会话时推送**：同传暂停（引擎 status=paused）、停止、引擎断线/重连期间都不推送，
+  也不排队补发（画面上下文过期无意义）；会话就绪时先推一次，之后按间隔推送。
+- **去重**：同一画面 OCR 文本（归一化空白/大小写后）与上次相同则跳过，不浪费 WS 与引擎处理。
+- **不阻塞主链路**：截图/上传/OCR 全部后台异步，音频帧与字幕事件不受影响；失败只记一行日志，下一轮继续
+  （例如 OCR 服务暂不可用、屏幕录制权限被撤销、引擎断线）。
+- **状态展示**：菜单「画面上下文：开 · 最近 15:23:45 · 上次 OCR 128 字」；开启后首次推送成功会在浮层
+  顶部弹一次 toast「画面上下文：已开始推送 · N 字 · HH:MM:SS」；诊断信息里也有最近状态/错误。
+- **间隔可配**（8–15s，默认 10s，命令行设置后重启 App 生效）：
+
+  ```bash
+  defaults write io.github.leolin990405.livedub.macos livedub.macos.visualContextInterval -float 12
+  defaults delete io.github.leolin990405.livedub.macos livedub.macos.visualContextInterval  # 恢复默认 10s
+  ```
+
+- **隐私与费用**：截图只上传给**本机引擎**，OCR 在本地（macOS Vision）；但识别出的**画面文字会作为翻译
+  上下文发给翻译 provider（如 deepseek，云端）**——屏幕上有敏感信息（密码/聊天/合同）时请不要开启。
+  资产文件会落在引擎的 `data/notes/assets/`（可定期清理）。
+- **权限**：复用「屏幕录制」权限（与音频捕获/⌥N 截图同一 TCC 授权，无需额外授权）。
+
 ## 自检 / 测试
 
 ```bash
-# 1) 编译 + 自检（194 项，退出码 0/1）
+# 1) 编译 + 自检（228 项，退出码 0/1）
 bash scripts/build-macos.sh --check
 
 # 2) 静态契约测试（默认跨平台、离线、不跑 swiftc —— CI 在 ubuntu 也能跑）
@@ -328,7 +370,10 @@ LIVEDUB_MACOS_BUILD=1 node --test tests/macos.test.mjs
 - **v0.5 画面文字/画面理解**：OCR/analyze 请求体 JSON、`/api/vision/*` URL 与 `mode` 归一化、imageUrl 相对路径校验；
   OCR 文本清洗（trim/去空行/去重/去控制字符/80 行/2000 字截断）、代码块反引号转义、`**画面文字**（OCR）`/
   `**画面理解**` 段落格式；降级决策（关闭/无截图/旧引擎 404/服务未就绪 503/health 未配置）、健康 JSON 解析
-  （bool 与对象两种能力形态）、analyze 响应 string/object 兼容、图文笔记正文顺序与 4000 字上限。
+  （bool 与对象两种能力形态）、analyze 响应 string/object 兼容、图文笔记正文顺序与 4000 字上限；
+- **v0.6 实时画面上下文**：`visual-context` 事件字段/JSON 契约（恰好 5 字段、source=macos、capturedAtMs 墙钟毫秒）、
+  OCR 文本清洗/截断 2000 字、同帧去重（相同/空白大小写差异/不同/首次）、发送决策（默认关闭/未连接/暂停/停止/无会话
+  均跳过，直播+已连接才 push）、间隔 8–15s 钳制、菜单状态文案与契约常量（TTL 120s）。
 
 ## 手动测试清单
 
@@ -360,6 +405,11 @@ LIVEDUB_MACOS_BUILD=1 node --test tests/macos.test.mjs
 - [ ] **OCR 关闭开关**：菜单关闭「识别画面文字（OCR）」→ 再按 ⌥N，笔记只有字幕+截图；重新打开恢复
 - [ ] **画面理解 VLM（可选）**：菜单开「画面理解（VLM）」→ ⌥N → 浮层提示「画面理解中…」→ 笔记出现
       `**画面理解**：` 段（未配置 VLM/超时则自动降级为仅 OCR）；之后关掉开关避免每次都慢 20–30s
+- [ ] **实时画面上下文（默认关）**：菜单开启「翻译参考画面文字（OCR，每 10s）」→ 浮层 toast「已开始推送」；
+      菜单状态变「画面上下文：开 · 最近 HH:MM:SS · 上次 OCR n 字」；引擎日志/事件里出现 `visual-context`
+- [ ] **画面上下文去重**：画面 10s 不变时，App 日志出现「内容与上次相同，跳过」，不再重复发 WS
+- [ ] **暂停/停止不推送**：暂停同传 → 定时器到点日志「跳过：同传已暂停」；停止后不再截屏/OCR；
+      关闭开关后应立即停止并清空菜单状态
 - [ ] **旧引擎降级**：引擎不升级（无 `/api/vision/*`）→ 菜单「视觉：不可用（引擎 < v0.5）」，
       ⌥N 笔记仍正常保存（字幕+截图，无 OCR 段），日志提示跳过
 - [ ] **退出**：菜单退出后 `pgrep -fl livedub` 无残留；无 Dock 图标（菜单栏 App 正常形态）
@@ -409,6 +459,19 @@ LIVEDUB_MACOS_BUILD=1 node --test tests/macos.test.mjs
   ⌥N 笔记照常保存（字幕+截图，无 OCR），`画面 OCR 跳过：引擎无视觉端点（需 v0.5）`，exit 0。
 - 自动化：`node --test tests/macos.test.mjs` 全绿（含 v0.5 静态契约断言）。
 
+### v0.6 验收记录（2026-10-30，Swift 5.10 / macOS 14.8.9 / Apple Silicon）
+
+- `bash scripts/build-macos.sh --check`：**self-test 228/228 通过**，退出码 0，0 warning；
+  可执行文件 862 KB，bundle 876 KB。
+- **实时画面上下文端到端**（严格契约假引擎 18788：Notes + Vision + WS 接收校验，全部本机）：
+  `--autostart --visual-context --duration 25` → 会话就绪立即推送 1 条（41 字，`tMs=0`），
+  10s 后同画面文本重复 → 客户端日志「内容与上次相同，跳过」（未发 WS），
+  20s 后画面文字变化 → 推送第 2 条（50 字，`tMs=21000`）；
+  假引擎校验两条事件字段全部合法（type/text 1..2000/source=macos/tMs≥0/capturedAtMs 为墙钟毫秒、
+  **无非法事件**）；每条 685KB 截屏经 assets 上传 + `/api/vision/ocr` 后推送；
+  App exit 0、主链路无阻塞；首次推送浮层 toast + 菜单状态 `画面上下文：开 · 最近 … · 上次 OCR 41 字`。
+- 自动化：`node --test tests/macos.test.mjs` 全绿（含 v0.6 静态契约断言）。
+
 ## 已知限制
 
 1. **系统音频不会自动静音 → 原声与中文配音同时存在。**
@@ -444,6 +507,11 @@ LIVEDUB_MACOS_BUILD=1 node --test tests/macos.test.mjs
 17. **画面理解（VLM）默认关闭**：单次约 20–30s，且可能调用云端 provider（截图会上传、可能产生费用）。
     开启后每次 ⌥N 都会等待 VLM；失败/超时会自动降级为仅 OCR，笔记不会丢。
 18. 视觉调用失败只写日志、不弹错误框（避免打扰同传）；需要排障时看菜单「视觉：…」与诊断信息。
+19. **实时画面上下文默认关闭**：开启后每 10s 一次截屏 + OCR + 上传，会增加 CPU/耗电（尤其视频播放时）；
+    关闭开关后立即停止，不产生任何截屏/网络请求。
+20. **隐私**：画面文字会作为翻译上下文发给翻译 provider（通常是云端 LLM），屏幕上的敏感信息（密码/聊天/合同）
+    可能因此离开本机；涉及敏感内容请保持关闭。截图本身只存本机引擎 `data/notes/assets/`（会累积，可清理）。
+21. 画面上下文不排队：暂停/停止/断线期间的画面不会补发（引擎 TTL 120s，过期无意义）；恢复直播后从下一轮开始。
 
 ## 故障排查
 
@@ -462,6 +530,9 @@ LIVEDUB_MACOS_BUILD=1 node --test tests/macos.test.mjs
 | 笔记没有画面文字（OCR） | 菜单「视觉：…」是否显示 OCR 可用；引擎是否 v0.5 + vision 模块；OCR 开关是否开；看日志 `[vision]` |
 | VLM 一直没结果 | 默认关；开启后每条约 20–30s，超时（45s）会自动降级仅 OCR；未配置 VLM 时菜单显示未配置 |
 | 菜单「视觉：不可用（引擎 < v0.5）」 | 引擎是 v0.4 或未安装 vision 模块：升级引擎/安装依赖；不影响笔记（截图+字幕照常） |
+| 画面上下文不推送 | 菜单开关是否开；是否正在直播且引擎已连接；暂停/停止时不推送；看日志 `[visual-context]` 跳过原因 |
+| 画面上下文提示重复跳过 | 正常：画面 10s 没变化时客户端去重，等画面变化后自动恢复推送 |
+| 开启后 CPU/耗电升高 | 每 10s 截屏+OCR 是预期成本；不需要时关闭开关，或把间隔调大（`defaults write` 8–15s） |
 | 笔记时间/标题怪 | `tMs` 是会话音频轴；标题由前台媒体 App/会话推导，可在工作台里改名/编辑 |
 | 编译报 SDK/availability 错 | 需要 macOS 14+ SDK；`swiftc --version` 应为 5.10+，`MACOS_TARGET` 默认 `<arch>-apple-macos14.0` |
 
@@ -471,7 +542,9 @@ LIVEDUB_MACOS_BUILD=1 node --test tests/macos.test.mjs
 - 快捷笔记：文本/截图只发给**本机引擎**（`127.0.0.1`），落在本地 `data/notes/`；默认不截屏，
   只有开启「记笔记时附截图」并按 ⌥N 时才截当前屏幕作为该条笔记附件（不含 livedub 浮层）。
 - 画面文字（OCR）：默认由引擎侧**本地 macOS Vision** 识别，图片不出本机；
-- 画面理解（VLM，默认关）：按引擎配置调用 provider，**截图可能上传云端**并产生费用——介意隐私请保持关闭。
+- 画面理解（VLM，默认关）：按引擎配置调用 provider，**截图可能上传云端**并产生费用——介意隐私请保持关闭；
+- 实时画面上下文（v0.6，默认关）：截图/OCR 都在本机，但识别出的**画面文字**会作为翻译上下文发给翻译
+  provider（通常是云端 LLM）；涉及敏感画面请勿开启。
 - 引擎会把**文本**发给配置的云翻译 / TTS provider（与其他端一致，取决于用户配置）。
 - 日志只打印状态与计数，不打印 API Key；`--simulate` / `--self-test` 完全离线。
 
@@ -482,5 +555,7 @@ LIVEDUB_MACOS_BUILD=1 node --test tests/macos.test.mjs
 - Notes API 契约与工作台笔记面板（T4）：`engine/server.mjs` 的 `/api/notes/*`、`studio/`（v0.4）
 - 视觉端点（T4 契约）：`POST /api/vision/ocr`、`POST /api/vision/analyze?mode=ocr|vision|both`、
   `GET /api/vision/health`（v0.5，见 `engine/server.mjs` 与 `engine/vision/`）
+- 画面上下文 WS 事件（v0.6，Lead 契约）：`{"type":"visual-context","text","tMs","source":"macos","capturedAtMs"}`
+  （客户端 -> 引擎 JSON 文本帧，引擎 TTL 120s；见 `engine/pipeline.mjs` / `engine/ws.mjs`）
 - 路线图：[`docs/ROADMAP.md`](../../docs/ROADMAP.md)（v0.3 桌面悬浮窗 / v0.4 边看边写笔记）
 - 构建脚本：[`scripts/build-macos.sh`](../../scripts/build-macos.sh)；静态测试：[`tests/macos.test.mjs`](../../tests/macos.test.mjs)

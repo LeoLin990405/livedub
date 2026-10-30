@@ -10,6 +10,8 @@
 //        记进本地引擎 Notes API（失败进离线队列，重连后自动补发）。
 //  v0.5：截图上传后调用引擎视觉端点，把「画面文字（OCR）」写进笔记；
 //        可选开「画面理解（VLM，慢）」；失败静默降级，不影响笔记保存。
+//  v0.6：可选「实时画面上下文」——每 N 秒（默认 10s）截屏 OCR，经 WS 文本帧
+//        visual-context 推给引擎供实时翻译参考（默认关闭；异步、不阻塞主链路）。
 //
 //  入口参数：
 //    --self-test             headless 自检（不建窗口、不请求权限、不联网），退出码 0/1
@@ -34,6 +36,8 @@ struct LaunchOptions {
     var noteOnce = false
     /// 调试用：本次运行强制开启「画面理解（VLM）」，不写用户设置
     var notesVision = false
+    /// 调试用：本次运行强制开启「实时画面上下文推送」，不写用户设置
+    var visualContext = false
     var help = false
 
     static let helpText = """
@@ -46,6 +50,7 @@ struct LaunchOptions {
       --note-once           调试/冒烟：启动 2.5s 后自动记一条笔记（截图/OCR/离线队列全链路），
                             记录完成后退出（配合 --engine-url 指向测试引擎）
       --notes-vision        调试用：本次运行开启「画面理解（VLM，慢）」开关（不写用户设置）
+      --visual-context      调试用：本次运行开启「实时画面上下文（OCR，每 10s 推送）」开关
       --duration <秒>       调试用：N 秒后自动退出（配合 --simulate 可做冒烟）
       --engine-url <url>    覆盖引擎地址（默认 ws://127.0.0.1:8787/ws）
       --self-test           headless 自检（协议字节布局 / hello / 事件解析 / 字幕排版），退出码 0/1
@@ -71,6 +76,8 @@ struct LaunchOptions {
                 options.noteOnce = true
             case "--notes-vision":
                 options.notesVision = true
+            case "--visual-context":
+                options.visualContext = true
             case "-h", "--help":
                 options.help = true
             case "--duration":
@@ -206,6 +213,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var exitAfterNote = false
     private var lastNoteClock = ""
 
+    // v0.6 实时画面上下文
+    private var visualContextMenuItem: NSMenuItem?
+    private var visualContextStatusMenuItem: NSMenuItem?
+    private var visualContextStatus = VisualContextStatus()
+    private var visualContextTimer: Timer?
+    private var visualContextInFlight = false
+    private var lastVisualContextText: String?
+    private var visualContextStartToastShown = false
+    private var engineConnectionState: EngineConnectionState = .disconnected
+
     init(options: LaunchOptions) {
         self.options = options
         super.init()
@@ -226,6 +243,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         setupNotes()
+        setupVisualContext()
         setupAutoQuit()
 
         if options.noteOnce {
@@ -252,6 +270,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         notesFlushTimer?.invalidate()
         noteOnceTimer?.invalidate()
         visionHealthTimer?.invalidate()
+        visualContextTimer?.invalidate()
         GlobalHotKey.shared.unregister()
         capture?.stop()
         engine?.stop()
@@ -316,6 +335,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         notesVisionMenuItem?.toolTip = "用 VLM 生成画面描述；较慢、可能产生云端费用，失败自动降级为仅 OCR（默认关）"
         notesQueueMenuItem = addMenuItem(to: menu, title: "笔记队列：空", action: nil)
         visionStatusMenuItem = addMenuItem(to: menu, title: "视觉：检测中…", action: nil)
+        visualContextMenuItem = addMenuItem(
+            to: menu,
+            title: "翻译参考画面文字（OCR，每 10s）",
+            action: #selector(toggleVisualContext)
+        )
+        visualContextMenuItem?.toolTip = "直播时每 10s 截屏 OCR 并把画面文字推送给引擎，供实时翻译参考（默认关闭，注意 CPU/隐私）"
+        visualContextStatusMenuItem = addMenuItem(to: menu, title: "画面上下文：关", action: nil)
         menu.addItem(.separator())
 
         _ = addMenuItem(to: menu, title: "设置引擎地址…", action: #selector(editEngineURL))
@@ -365,6 +391,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         notesOCRMenuItem?.state = settings.notesOCR ? .on : .off
         notesVisionMenuItem?.state = (options.notesVision || settings.notesVision) ? .on : .off
         visionStatusMenuItem?.title = visionStatus?.summaryText ?? "视觉：检测中…"
+        visualContextMenuItem?.state = visualContextEnabledForRun ? .on : .off
+        visualContextStatusMenuItem?.title = VisualContextPlanner.formatStatus(
+            enabled: visualContextEnabledForRun,
+            lastPush: visualContextStatus.lastPushedAt,
+            lastTextChars: visualContextStatus.lastTextChars
+        )
         refreshNotesQueueMenu()
     }
 
@@ -389,6 +421,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         currentLatencyMs = nil
         currentTranslation = ""
         currentSource = ""
+        lastVisualContextText = nil
+        visualContextStatus.lastPushedAt = nil
+        visualContextStatus.lastTextChars = 0
+        visualContextStatus.lastError = nil
         overlay?.show()
         overlay?.setPlaceholder("正在连接引擎…")
         overlay?.setStatus("连接引擎…", latencyMs: nil)
@@ -516,6 +552,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // MARK: 引擎事件
 
     private func handleConnectionState(_ state: EngineConnectionState) {
+        engineConnectionState = state
         guard !isSimulating else { return }
         switch state {
         case .connecting:
@@ -555,6 +592,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             currentStatus = "聆听中"
             let voiceLabel = voiceMode == "clone" ? "克隆音色" : "预设音色"
             overlay?.setStatus("已连接 · \(voiceLabel)", latencyMs: currentLatencyMs)
+            if visualContextEnabledForRun {
+                pushVisualContextTick(reason: "会话就绪")
+            }
         case let .status(state, detail, _):
             if state == "error" {
                 currentStatus = "引擎错误"
@@ -788,7 +828,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     @objc private func showDiagnostics() {
         NSApp.activate(ignoringOtherApps: true)
         var lines: [String] = []
-        lines.append("livedub macOS app（v0.5）")
+        lines.append("livedub macOS app（v0.6）")
         lines.append("状态：\(currentStatus)")
         lines.append("引擎地址：\(settings.engineURL)")
         if let engine {
@@ -824,6 +864,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             if let error = notesClient.lastErrorText { lines.append("笔记最近错误：\(error)") }
         }
         if !lastNoteClock.isEmpty { lines.append("最近一条笔记：\(lastNoteClock)") }
+        var visualContextLine = "画面上下文：\(visualContextEnabledForRun ? "开" : "关")"
+        if visualContextEnabledForRun {
+            visualContextLine += "（每 \(Int(settings.visualContextInterval))s）"
+                + (visualContextStatus.lastPushedAt.map { " · 最近 \(VisualContextPlanner.formatClock($0))" } ?? "")
+                + " · 上次 OCR \(visualContextStatus.lastTextChars) 字"
+        }
+        if let error = visualContextStatus.lastError { visualContextLine += " · 最近错误：\(error)" }
+        lines.append(visualContextLine)
         lines.append("")
         lines.append("最近日志：")
         lines.append(contentsOf: logLines.suffix(12))
@@ -1182,6 +1230,157 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         settings.notesVision.toggle()
         log("[vision] 画面理解（VLM）= \(settings.notesVision ? "开（慢，约 20–30s）" : "关")")
         if settings.notesVision { refreshVisionHealth(reason: "开启 VLM") }
+        refreshMenu()
+    }
+
+    // MARK: - 实时画面上下文（v0.6）
+
+    private var visualContextEnabledForRun: Bool {
+        options.visualContext || settings.visualContextEnabled
+    }
+
+    private func setupVisualContext() {
+        visualContextStatus.enabled = visualContextEnabledForRun
+        if options.visualContext {
+            log("[visual-context] --visual-context：本次运行强制开启画面上下文推送（不写用户设置）")
+        }
+        if visualContextEnabledForRun {
+            startVisualContextTimer()
+            log(
+                "[visual-context] 已开启：每 \(Int(settings.visualContextInterval))s 截屏 OCR 推送给引擎"
+                    + "（默认关闭；注意 CPU/耗电与画面隐私）"
+            )
+        }
+        refreshMenu()
+    }
+
+    private func startVisualContextTimer() {
+        visualContextTimer?.invalidate()
+        let interval = settings.visualContextInterval
+        let timer = Timer.scheduledTimer(withTimeInterval: interval, repeats: true) { [weak self] _ in
+            self?.pushVisualContextTick(reason: "定时器")
+        }
+        timer.tolerance = min(2, interval * 0.2)
+        visualContextTimer = timer
+    }
+
+    private func stopVisualContextTimer() {
+        visualContextTimer?.invalidate()
+        visualContextTimer = nil
+    }
+
+    @objc private func toggleVisualContext() {
+        settings.visualContextEnabled.toggle()
+        if settings.visualContextEnabled {
+            visualContextStartToastShown = false
+            startVisualContextTimer()
+            log("[visual-context] 翻译参考画面文字 = 开（每 \(Int(settings.visualContextInterval))s）")
+            overlay?.showToast("画面上下文：开（每 \(Int(settings.visualContextInterval))s 推送 OCR）")
+            pushVisualContextTick(reason: "手动开启")
+        } else {
+            stopVisualContextTimer()
+            visualContextStatus = VisualContextStatus(enabled: false)
+            lastVisualContextText = nil
+            visualContextStartToastShown = false
+            log("[visual-context] 翻译参考画面文字 = 关")
+            overlay?.showToast("画面上下文：关")
+        }
+        refreshMenu()
+    }
+
+    /// 一轮推送：截图/上传/OCR 全在后台 Task；主线程只做「是否推送」决策与发送/状态更新。
+    /// 不阻塞音频与字幕主链路；失败只记一行日志，下一轮继续。
+    private func pushVisualContextTick(reason: String) {
+        let enabled = visualContextEnabledForRun
+        visualContextStatus.enabled = enabled
+        guard enabled else {
+            refreshMenu()
+            return
+        }
+        let decision = VisualContextPlanner.decide(
+            enabled: enabled,
+            isRunning: isRunning,
+            isPaused: isEnginePaused,
+            connection: engineConnectionState,
+            hasSession: lastEngineSessionId != nil
+        )
+        switch decision {
+        case .skip(let why):
+            if why != "disabled" {
+                log("[visual-context] 跳过（\(reason)）：\(VisualContextPlanner.skipReasonText(why))")
+            }
+            return
+        case .push:
+            break
+        }
+        guard !visualContextInFlight, let notesClient else { return }
+        visualContextInFlight = true
+        let tMs = lastAudioTMs.get()
+        let capturedAt = Date()
+
+        Task { [weak self, notesClient] in
+            var cleaned: String?
+            var errorText: String?
+            do {
+                let png = try await ScreenshotService.captureDisplayPNG()
+                let asset = try await notesClient.uploadPNG(png)
+                let ocr = try await notesClient.recognizeImage(imagePath: asset.relativePath)
+                cleaned = VisualContextPlanner.cleanText(ocr.text)
+                if cleaned == nil { errorText = "OCR 无可读文字" }
+            } catch {
+                errorText = "\(error)"
+            }
+            let finalCleaned = cleaned
+            let finalErrorText = errorText
+            let owner = self
+            DispatchQueue.main.async {
+                guard let owner else { return }
+                owner.visualContextInFlight = false
+                owner.handleVisualContextResult(
+                    cleaned: finalCleaned,
+                    errorText: finalErrorText,
+                    tMs: tMs,
+                    capturedAt: capturedAt,
+                    reason: reason
+                )
+            }
+        }
+    }
+
+    private func handleVisualContextResult(
+        cleaned: String?,
+        errorText: String?,
+        tMs: Double,
+        capturedAt: Date,
+        reason: String
+    ) {
+        if let cleaned {
+            if VisualContextPlanner.isDuplicate(cleaned, lastText: lastVisualContextText) {
+                // 同帧相同内容：引擎也会忽略重复；客户端省一次 WS 发送
+                log("[visual-context] 内容与上次相同，跳过（\(cleaned.count) 字）")
+            } else if let event = VisualContextPlanner.makeEvent(text: cleaned, tMs: tMs, capturedAt: capturedAt) {
+                if let engine, engine.sendJSON(event.jsonObject) {
+                    lastVisualContextText = cleaned
+                    visualContextStatus.lastPushedAt = Date()
+                    visualContextStatus.lastTextChars = cleaned.count
+                    visualContextStatus.lastError = nil
+                    log("[visual-context] 已推送（\(reason)）：\(cleaned.count) 字 · tMs=\(Int(tMs))")
+                    if !visualContextStartToastShown {
+                        visualContextStartToastShown = true
+                        let clock = VisualContextPlanner.formatClock(Date())
+                        overlay?.showToast("画面上下文：已开始推送 · \(cleaned.count) 字 · \(clock)")
+                    }
+                } else {
+                    visualContextStatus.lastError = "引擎未连接（画面上下文不排队）"
+                    log("[visual-context] 发送失败：引擎未连接（画面上下文不排队）")
+                }
+            } else {
+                visualContextStatus.lastError = "文本为空或超长"
+            }
+        } else if let errorText {
+            visualContextStatus.lastError = errorText
+            log("[visual-context] 本轮跳过（\(reason)）：\(errorText)")
+        }
         refreshMenu()
     }
 

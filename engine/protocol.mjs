@@ -30,6 +30,7 @@ export const MSG = Object.freeze({
   CONTROL: 'control',
   CONFIG: 'config',
   GLOSSARY: 'glossary',
+  VISUAL_CONTEXT: 'visual-context', // v0.6 客户端推送最近画面 OCR 文本（供翻译参考）
   PING: 'ping',
   BYE: 'bye',
   // server -> client
@@ -47,6 +48,35 @@ export const MSG = Object.freeze({
 });
 
 export const CONTROL_ACTIONS = Object.freeze(['pause', 'resume', 'stop', 'seek', 'flush']);
+
+/** 画面上下文文本上限（客户端/服务端共同约束；只作翻译参考） */
+export const VISUAL_CONTEXT_MAX_CHARS = 2000;
+/** 画面上下文默认有效期（毫秒）；过期后不再参与翻译 */
+export const VISUAL_CONTEXT_TTL_MS = 120000;
+
+/**
+ * 清洗客户端推送的画面 OCR 文本：
+ * - 去控制字符（保留换行/制表转空格）、压缩连续空行、trim、截断 maxChars；
+ * - 纯空白/纯标点 -> 返回 ''（调用方应忽略）。
+ * 返回 string（不做任何指令解释，调用方需把它当纯文本参考）。
+ */
+export function sanitizeVisualContext(text, maxChars = VISUAL_CONTEXT_MAX_CHARS) {
+  if (typeof text !== 'string') return '';
+  const cleaned = text
+    .replace(/\r\n?/g, '\n')
+    .replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/g, '')
+    .split('\n')
+    .map((line) => line.replace(/\s+/g, ' ').trim())
+    .filter(Boolean)
+    .join('\n')
+    .trim();
+  if (!cleaned) return '';
+  if (!/[\p{L}\p{N}]/u.test(cleaned.replace(/\s+/g, ''))) return '';
+  const limit = Number.isFinite(Number(maxChars)) ? Math.max(0, Math.floor(Number(maxChars))) : VISUAL_CONTEXT_MAX_CHARS;
+  // 按 Unicode code point 截断，避免切坏 emoji/代理对
+  const chars = Array.from(cleaned);
+  return chars.length > limit ? chars.slice(0, limit).join('') : cleaned;
+}
 
 export const DEFAULT_SESSION_OPTIONS = Object.freeze({
   source: 'studio', // extension | studio | batch | test

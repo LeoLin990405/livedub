@@ -221,5 +221,18 @@
       "maxFrames": 24,
       "sheetSize": 6
     }
+  },
+  "visual": {
+    "contextTtlMs": 120000,
+    "contextMaxChars": 2000
+  },
+  "notes": {
+    "exportDir": "data/exports",
+    "obsidian": {
+      "enabled": false,
+      "dir": "",
+      "assetsSubdir": "livedub-assets",
+      "autoExport": true
+    }
   }
 }

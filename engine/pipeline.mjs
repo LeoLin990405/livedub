@@ -16,6 +16,8 @@ import {
   errorEvent,
   statusEvent,
   sanitizeGlossary,
+  sanitizeVisualContext,
+  VISUAL_CONTEXT_TTL_MS,
 } from './protocol.mjs';
 import { base64Pcm, concatPcm, pcmDurationMs, msToSamples } from './audio.mjs';
 import { createMetrics, now } from './metrics.mjs';
@@ -169,6 +171,9 @@ export class Session {
     this._lastAudioWallAt = null;
     this._context = [];
     this._glossary = [];
+    // v0.6 画面上下文：客户端通过 WS 推送最近画面 OCR，供翻译参考（TTL 内有效）
+    this._visualContext = null; // {text, tMs, at}
+    this._visualContextStats = { received: 0, ignored: 0, used: 0 };
     this._voiceInfo = null;
     this._splitForTts = null;
     this._clauseExtractorFactory = null;
@@ -283,6 +288,22 @@ export class Session {
         this._glossary = sanitizeGlossary(msg.terms ?? []);
         this._send(statusEvent(this._status ?? 'listening', `术语表已更新（${this._glossary.length} 条）`, this._currentSessionMs()));
         return;
+      case MSG.VISUAL_CONTEXT: {
+        const text = sanitizeVisualContext(msg.text, Number(this.config?.visual?.contextMaxChars) || undefined);
+        if (!text) {
+          this._visualContextStats.ignored += 1;
+          return;
+        }
+        if (this._visualContext?.text === text) {
+          this._visualContextStats.ignored += 1;
+          return;
+        }
+        const tMs = Number.isFinite(Number(msg.tMs)) ? Math.max(0, Number(msg.tMs)) : this._currentSessionMs();
+        this._visualContext = { text, tMs, at: now() };
+        this._visualContextStats.received += 1;
+        this.log(`visual context updated（${text.length} 字，t=${Math.round(tMs)}ms，source=${msg.source ?? '?'}）`);
+        return;
+      }
       case MSG.PING:
         this._send({ type: MSG.PONG, t: msg.t ?? null, tsMs: this._currentSessionMs() });
         return;
@@ -313,6 +334,7 @@ export class Session {
       return;
     }
     if (action === 'seek') {
+      this._visualContext = null; // 画面位置已变化，旧上下文作废
       this._audioTimeline.reset();
       try {
         await this.asr?.flush?.();
@@ -325,6 +347,16 @@ export class Session {
     if (action === 'stop') {
       await this.close('client stop');
     }
+  }
+
+  /** 取 TTL 内有效的画面上下文（用于翻译参考）；过期/未设置返回 null */
+  _visualContextForTranslate() {
+    const vc = this._visualContext;
+    if (!vc) return null;
+    const ttl = Number(this.config?.visual?.contextTtlMs ?? VISUAL_CONTEXT_TTL_MS);
+    if (!Number.isFinite(ttl) || ttl <= 0) return null;
+    if (now() - vc.at > ttl) return null;
+    return vc;
   }
 
   _onConfigPatch(patch) {
@@ -469,11 +501,14 @@ export class Session {
     try {
       this._send(statusEvent('translating', '', t1Ms));
       let firstWall = null;
+      const visual = this._visualContextForTranslate();
+      if (visual) this._visualContextStats.used += 1;
       const result = await this.translator.translate({
         text,
         context: this._context.slice(-(Number(this.config?.translate?.contextSegments) || 3)),
         glossary: this._glossary,
         signal: this._abort.signal,
+        ...(visual ? { visualContext: visual.text, visualContextAtMs: visual.tMs } : {}),
         onPartial: (partial) => {
           const p = String(partial ?? '');
           if (!p) return;
@@ -727,6 +762,7 @@ export class Session {
       partials: this._partialCounter,
       pendingSegments: this._pendingSegments,
       glossaryTerms: this._glossary.length,
+      visualContext: { ...this._visualContextStats, hasContext: Boolean(this._visualContextForTranslate()) },
       voice: this._voiceInfo,
       lastAudioTMs: this._lastAudioTMs,
     };
