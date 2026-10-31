@@ -53,8 +53,10 @@ const DEFAULT_SHEET_PROMPT = [
 const DEFAULT_SUMMARY_SYSTEM_PROMPT = [
   '你是课程笔记助手，擅长把教学视频的字幕和画面信息整理成可复习的中文结构化总结。',
   '必须只输出一个严格 JSON 对象，不要 markdown 代码围栏、不要额外解释：',
-  '{"summary":"150-300 字的中文总结","keyPoints":["要点1","要点2","要点3"]}',
+  '{"summary":"150-300 字的中文总结","keyPoints":["要点1","要点2","要点3"],"links":[{"relation":"visual_prompts_speech","evidence":"输入里的原词","cause":"因的原句片段","effect":"果的原句片段"}]}',
   'keyPoints 要 3-6 条、每条 15-60 字，包含关键术语/公式/代码名/数字，具体可复习；不要空泛套话，不要编造输入里没有的内容。',
+  'links 是口播和画面的因果关系，0-6 条。relation 只能是 visual_prompts_speech（画面先出现，随后口播才讲）、speech_prompts_visual（口播先讲，随后画面才出现）、speech_explains_visual（口播在解释画面）、speech_derives_visual（口播推出画面上的结论）、speech_refers_visual（口播明确指向画面）。',
+  'evidence、cause、effect 必须是输入里的原词或原句片段，不能改写。只是时间靠近但内容对不上时，links 用空数组。',
 ].join('\n');
 
 export const DEFAULT_VISION_CONFIG = Object.freeze({
@@ -388,8 +390,8 @@ export function buildSummaryInput({
     visualFit.lines.join('\n') || '（无画面信息）',
     '',
     chinese
-      ? '请根据以上材料输出严格 JSON：summary（150-300 字中文总结）+ keyPoints（3-6 条中文要点）。'
-      : 'Please output strict JSON: summary (150-300 words) + keyPoints (3-6 items) based on the material above.',
+      ? '请根据以上材料输出严格 JSON：summary（150-300 字中文总结）+ keyPoints（3-6 条中文要点）+ links（0-6 条口播与画面的因果关系；没有把握就给空数组）。'
+      : 'Please output strict JSON: summary (150-300 words) + keyPoints (3-6 items) + links (0-6 causal relations between speech and visuals; use an empty array when unsure).',
   ].join('\n');
 
   const stats = {
@@ -414,7 +416,7 @@ export function buildSummaryInput({
 /** 从 summarize 的输出中解析 {summary, keyPoints}（容忍代码围栏/前后解释/非 JSON） */
 export function parseSummaryOutput(text) {
   const raw = typeof text === 'string' ? text.trim() : '';
-  if (!raw) return { summary: '', keyPoints: [] };
+  if (!raw) return { summary: '', keyPoints: [], links: [] };
 
   const withoutFence = raw
     .replace(/^```(?:json|JSON)?\s*/, '')
@@ -424,7 +426,7 @@ export function parseSummaryOutput(text) {
   if (candidate && typeof candidate.summary === 'string') {
     const summary = candidate.summary.trim();
     const keyPoints = normalizeKeyPoints(candidate.keyPoints);
-    if (summary) return { summary, keyPoints };
+    if (summary) return { summary, keyPoints, links: normalizeCausalLinks(candidate.links) };
   }
 
   // 兜底：非 JSON 时把整段当 summary，把行首为 -/*/数字的短行当要点
@@ -439,7 +441,41 @@ export function parseSummaryOutput(text) {
   }
   let summary = summaryLines.join('\n').trim();
   summary = summary.replace(/^(总结|摘要|summary)\s*[:：]\s*/i, '').trim();
-  return { summary, keyPoints: normalizeKeyPoints(bulletLines) };
+  return { summary, keyPoints: normalizeKeyPoints(bulletLines), links: [] };
+}
+
+const CAUSAL_RELATION_IDS = new Set([
+  'visual_prompts_speech',
+  'speech_prompts_visual',
+  'speech_explains_visual',
+  'speech_derives_visual',
+  'speech_refers_visual',
+]);
+
+function normalizeCausalLinks(input) {
+  if (!Array.isArray(input)) return [];
+  const links = [];
+  const seen = new Set();
+  for (const item of input) {
+    if (!item || typeof item !== 'object') continue;
+    const relation = String(item.relation ?? '').trim();
+    if (!CAUSAL_RELATION_IDS.has(relation)) continue;
+    const evidence = String(item.evidence ?? '').trim().replace(/\s+/g, ' ');
+    const cause = String(item.cause ?? '').trim().replace(/\s+/g, ' ');
+    const effect = String(item.effect ?? '').trim().replace(/\s+/g, ' ');
+    if (!evidence || !cause || !effect) continue;
+    const key = `${relation}|${evidence.toLowerCase()}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    links.push({
+      relation,
+      evidence: evidence.length > 80 ? `${evidence.slice(0, 79)}…` : evidence,
+      cause: cause.length > 180 ? `${cause.slice(0, 179)}…` : cause,
+      effect: effect.length > 180 ? `${effect.slice(0, 179)}…` : effect,
+    });
+    if (links.length >= 6) break;
+  }
+  return links;
 }
 
 function normalizeKeyPoints(input) {
@@ -1266,21 +1302,26 @@ export function createVisionService({ config = {}, log = () => {}, fetchImpl = g
 
   /* ---------------- 文本总结 ---------------- */
 
-  async function summarize({ title = '', transcript = [], visuals = [], lang = 'zh', signal } = {}) {
+  async function summarize({ title = '', transcript = [], visuals = [], lang = 'zh', provider, signal } = {}) {
     assertUsable();
     stats.summaryCalls += 1;
     const startedAt = Date.now();
+    const requested = typeof provider === 'string' ? provider.trim() : '';
+    const providerName = requested || summaryConfig.provider;
     let providerConf;
     try {
-      providerConf = resolveProvider(config, summaryConfig.provider, env);
+      providerConf = resolveProvider(config, providerName, env);
     } catch (err) {
-      throw readableError(`总结 provider "${summaryConfig.provider}" 解析失败：${err.message}；检查 ~/.sayless/config.json 或 config/livedub.config.json`, err);
+      throw readableError(`总结 provider "${providerName}" 解析失败：${err.message}；检查 ~/.sayless/config.json 或 config/livedub.config.json`, err);
     }
     if (!providerConf.apiKey) {
-      throw readableError(`总结 provider "${summaryConfig.provider}" 缺少 apiKey：检查 ~/.sayless/config.json 的 providers.${summaryConfig.provider}.apiKey`);
+      throw readableError(`总结 provider "${providerName}" 缺少 apiKey：检查 ~/.sayless/config.json 的 providers.${providerName}.apiKey`);
     }
-    const model = summaryConfig.model || providerConf.model;
-    if (!model) throw readableError('总结模型缺少 model：请在 config.vision.summary.model 或 provider 配置里指定');
+    // 换一家模型时用那一家自己的 model，不用总结配置里的 deepseek-flash。
+    const model = !requested || requested === summaryConfig.provider
+      ? (summaryConfig.model || providerConf.model)
+      : providerConf.model;
+    if (!model) throw readableError(`总结模型 "${providerName}" 缺少 model：请在 provider 配置里指定`);
 
     const { messages, stats: inputStats } = buildSummaryInput({
       title,
@@ -1299,7 +1340,7 @@ export function createVisionService({ config = {}, log = () => {}, fetchImpl = g
       stream: false,
     };
     logSafe(
-      `vision: 总结调用 ${summaryConfig.provider}/${model}（字幕 ${inputStats.transcriptKept}/${inputStats.transcriptItems} 句，画面 ${inputStats.visualKept}/${inputStats.visualItems} 条，输入 ${inputStats.chars} 字${inputStats.truncated ? '，已裁剪' : ''}）`,
+      `vision: 总结调用 ${providerName}/${model}（字幕 ${inputStats.transcriptKept}/${inputStats.transcriptItems} 句，画面 ${inputStats.visualKept}/${inputStats.visualItems} 条，输入 ${inputStats.chars} 字${inputStats.truncated ? '，已裁剪' : ''}）`,
     );
 
     const url = chatEndpoint(providerConf);
@@ -1328,11 +1369,12 @@ export function createVisionService({ config = {}, log = () => {}, fetchImpl = g
         .slice(0, 4);
     }
     const elapsed = Date.now() - startedAt;
-    logSafe(`vision: 总结完成 ${summaryConfig.provider}/${model}（${elapsed}ms，${parsed.summary.length} 字 + ${parsed.keyPoints.length} 要点）`);
+    logSafe(`vision: 总结完成 ${providerName}/${model}（${elapsed}ms，${parsed.summary.length} 字 + ${parsed.keyPoints.length} 要点）`);
     return {
       summary: parsed.summary,
       keyPoints: parsed.keyPoints,
-      provider: summaryConfig.provider,
+      links: parsed.links,
+      provider: providerName,
       model,
       ms: elapsed,
       input: inputStats,

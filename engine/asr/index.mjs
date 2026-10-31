@@ -14,6 +14,7 @@
  *       - 会话 close() 只释放自己，不杀共享 server；测试/引擎收尾用 closeSharedServer()
  *   - 'minimax-cloud'：MiniMax 云端 ASR（asr-1.0，HTTP 上传 WAV；失败自动降级 asr.fallback 本地 provider，
  *       连续失败熔断；见 ./minimax-cloud.mjs）
+ *   - 'stream-cloud'：一条流式识别（边收 PCM 边出 partial；断线后同一会话降级 asr.fallback，见 ./stream-cloud.mjs）
  *   - 'mock'：复用 engine/mock.mjs 的 createMockAsr（契约完全一致）
  *   - 其它名称：抛 `unknown provider: ...`（不静默回退）
  *
@@ -25,6 +26,7 @@ import { resolveWhisperModel } from '../config.mjs';
 import { createMockAsr } from '../mock.mjs';
 import { createSegmenter } from '../segmenter.mjs';
 import { createMinimaxCloudAsr } from './minimax-cloud.mjs';
+import { createStreamCloudAsr } from './stream-cloud.mjs';
 import { cleanAsrText, truncate } from './text.mjs';
 import { closeSharedServer, getSharedWhisperServer, listSharedServers } from './whisper-server.mjs';
 
@@ -641,11 +643,11 @@ function createWhisperAsrSession({ config = {}, log = () => {}, onEvent = () => 
  * minimax-cloud 的本地兜底工厂：按 `asr.fallback` 懒创建本地 provider
  * （默认 whisper-local；测试里可用 `mock`）。避免 minimax-cloud → minimax-cloud 递归。
  */
-function makeCloudFallbackFactory({ config, log, fetchImpl, spawnImpl, onError }) {
+function makeCloudFallbackFactory({ config, log, fetchImpl, spawnImpl, onError, providerName = 'minimax-cloud' }) {
   return async ({ onEvent }) => {
     const fallbackProvider = config?.asr?.fallback;
-    if (!fallbackProvider || fallbackProvider === 'minimax-cloud') {
-      throw new Error(`minimax-cloud: asr.fallback 配置无效（${fallbackProvider ?? '空'}，不能是 minimax-cloud）`);
+    if (!fallbackProvider || fallbackProvider === providerName) {
+      throw new Error(`${providerName}: asr.fallback 配置无效（${fallbackProvider ?? '空'}，不能是 ${providerName}）`);
     }
     const fallbackConfig = {
       ...config,
@@ -686,7 +688,23 @@ export async function createAsr({ config = {}, log = () => {}, onEvent = () => {
       fallbackFactory: makeCloudFallbackFactory({ config, log, fetchImpl, spawnImpl, onError }),
     });
   }
+  if (provider === 'stream-cloud') {
+    return createStreamCloudAsr({
+      config,
+      log,
+      onEvent,
+      onError,
+      fallbackFactory: makeCloudFallbackFactory({
+        config,
+        log,
+        fetchImpl,
+        spawnImpl,
+        onError,
+        providerName: 'stream-cloud',
+      }),
+    });
+  }
   throw new Error(
-    `unknown provider: ${provider}（asr 支持 whisper-local | minimax-cloud | mock；请检查 config.asr.provider）`,
+    `unknown provider: ${provider}（asr 支持 whisper-local | minimax-cloud | stream-cloud | mock；请检查 config.asr.provider）`,
   );
 }

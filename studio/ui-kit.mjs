@@ -145,6 +145,20 @@ export const ASR_ENGINE_OPTIONS = Object.freeze([
   },
 ]);
 
+/** 直播播放要等会话和 ASR 都就绪。ASR 还在预热时不能把视频当成已经可以同传。 */
+export function canStartPlayback({ sessionReady = false, asrReady = false } = {}) {
+  return Boolean(sessionReady) && Boolean(asrReady);
+}
+
+/**
+ * 克隆真正成功才不标默认音色；预设、降级、空 voiceId 都显示「讲师男声」。
+ * 返回空字符串表示调用方继续显示「已使用克隆音色」。
+ */
+export function defaultVoiceLabel(voice) {
+  if (voice && voice.mode === 'clone' && voice.degraded !== true && voice.voiceId) return '';
+  return '讲师男声';
+}
+
 /** ASR provider 规范化：未知值回退本地 whisper（工作台只展示两种） */
 export function normalizeAsrEngine(value, fallback = 'whisper-local') {
   const raw = typeof value === 'string' ? value.trim() : '';

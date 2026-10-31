@@ -26,7 +26,8 @@ Two surfaces:
 - **Chrome extension** (MV3, `tabCapture`) — any web video (YouTube, Bilibili, Coursera,
   edX, Udemy, university portals, local `file://`); since v0.3 iframe/WebAudio players get
   original-audio ducking too.
-- **Local workbench** (`studio/`) — local course video with live subtitles + dub, glossary,
+- **Local workbench** (`studio/`) — local course video, or a course page (title + timed
+  captions; YouTube/Bilibili do not yield a playable file), with live subtitles + dub, glossary,
   SRT/event export, local/cloud ASR switch, session replay.
 - **macOS desktop overlay** (`apps/macos/`) — ScreenCaptureKit captures system/app audio and
   shows a floating bilingual subtitle panel + Chinese dub over Zoom/Meetings/players.

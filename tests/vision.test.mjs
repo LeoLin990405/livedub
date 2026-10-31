@@ -248,6 +248,7 @@ function makeContext({
   spawnHandlers = [],
   fetchHandler = () => ({ status: 500, json: {} }),
   vision = {},
+  providers = {},
   bin = makeFakeBin(),
   buildScript = BUILD_SCRIPT,
   log = () => {},
@@ -259,6 +260,7 @@ function makeContext({
     providers: {
       'fake-vlm': { baseUrl: 'https://vlm.example.com/v1', apiKey: 'test-key-vlm', model: 'fake-vlm-model' },
       'fake-text': { baseUrl: 'https://text.example.com/v1', apiKey: 'test-key-text', model: 'fake-text-model' },
+      ...providers,
     },
     vision: {
       provider: 'fake-vlm',
@@ -364,8 +366,8 @@ test('vision: parseSummaryOutput 容忍代码围栏 / 非 JSON 兜底 / keyPoint
   assert.match(plain.summary, /梯度下降是最优化方法/);
   assert.deepEqual(plain.keyPoints, ['沿负梯度走', '学习率控制步长']);
 
-  assert.deepEqual(parseSummaryOutput(''), { summary: '', keyPoints: [] });
-  assert.deepEqual(parseSummaryOutput(null), { summary: '', keyPoints: [] });
+  assert.deepEqual(parseSummaryOutput(''), { summary: '', keyPoints: [], links: [] });
+  assert.deepEqual(parseSummaryOutput(null), { summary: '', keyPoints: [], links: [] });
 });
 
 test('vision: buildSummaryInput 含标题/时间戳/双语/画面，超长按预算裁剪且保留首尾', () => {
@@ -960,6 +962,7 @@ test('vision.summarize: 成功返回 summary/keyPoints/provider/model/ms，请�
   });
   assert.match(result.summary, /梯度下降/);
   assert.ok(Array.isArray(result.keyPoints));
+  assert.ok(Array.isArray(result.links));
   assert.ok(result.keyPoints.length >= 3 && result.keyPoints.length <= 6);
   assert.equal(result.provider, 'fake-text');
   assert.equal(result.model, 'fake-text-model');
@@ -972,6 +975,27 @@ test('vision.summarize: 成功返回 summary/keyPoints/provider/model/ms，请�
   assert.match(userContent, /Gradient descent computes the gradient/);
   assert.match(userContent, /画面文字/);
   assert.match(call.body.messages[0].content, /JSON/);
+  await service.dispose();
+});
+
+test('vision.summarize: 指定另一家 provider 时用那一家自己的 model', async () => {
+  const { service, fakeFetch } = makeContext({
+    fetchHandler: () => ({ status: 200, json: SUMMARY_DATA }),
+    providers: {
+      'other-text': { baseUrl: 'https://other.example.com/v1', apiKey: 'test-key-other', model: 'other-text-model' },
+    },
+    vision: { summary: { provider: 'fake-text', model: 'deepseek-flash' } },
+  });
+  const result = await service.summarize({
+    title: '换模型',
+    transcript: DEMO_TRANSCRIPT,
+    visuals: [],
+    provider: 'other-text',
+  });
+  assert.equal(result.provider, 'other-text');
+  assert.equal(result.model, 'other-text-model');
+  assert.match(fakeFetch.calls[0].url, /^https:\/\/other\.example\.com\/v1\/chat\/completions$/);
+  assert.equal(fakeFetch.calls[0].body.model, 'other-text-model');
   await service.dispose();
 });
 

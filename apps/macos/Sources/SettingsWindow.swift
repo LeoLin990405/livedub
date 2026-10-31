@@ -141,7 +141,7 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
         // ---- 音频 ----
         root.addArrangedSubview(sectionTitle("音频"))
         dubCheckbox = NSButton(checkboxWithTitle: "播放中文配音", target: self, action: #selector(dubChanged))
-        root.addArrangedSubview(row("配音", control: dubCheckbox, description: "系统原声不会被自动压低：配音与原声会同时存在（已知限制）"))
+        root.addArrangedSubview(row("配音", control: dubCheckbox, description: Settings.dubMuteWarning))
 
         // ---- 笔记与视觉 ----
         root.addArrangedSubview(sectionTitle("笔记与视觉（⌥N / 画面上下文）"))

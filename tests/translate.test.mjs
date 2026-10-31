@@ -364,15 +364,6 @@ test('会话级术语表覆盖项目默认译法（调用方优先）', () => {
  * v0.6 画面 OCR 上下文（仅术语/语境参考，不翻译、不当指令、不覆盖字幕原文）
  * ------------------------------------------------------------------ */
 
-/** 从 user prompt 里取出 <<< >>> 包裹的 OCR 区块内容（测试辅助） */
-function extractVisualBlock(userContent) {
-  const start = userContent.indexOf('<<<\n');
-  if (start < 0) return '';
-  const end = userContent.indexOf('\n>>>', start);
-  if (end < 0) return '';
-  return userContent.slice(start + 4, end);
-}
-
 test('cleanVisualContext：控制字符/空行/分隔符逃逸清洗，纯标点/空值返回空，截断 ≤1200', () => {
   assert.equal(cleanVisualContext(''), '');
   assert.equal(cleanVisualContext('   \n\n\t '), '');
@@ -404,7 +395,7 @@ test('prompt：无 visualContext 时与 v0.5 完全一致（不注入 OCR 区块
   assert.ok(!withPairs[1].content.includes('本页画面文字'));
 });
 
-test('prompt：visualContext 注入标题/分隔符/防注入说明，且不混入待翻译文本', () => {
+test('prompt：visualContext 只贡献短术语，不注入 OCR 原文区块', () => {
   const ocr = 'learning rate · stochastic gradients\nloss: L(θ) = 1/N Σ loss';
   const messages = buildTranslationMessages({
     text: 'We use stochastic gradient descent.',
@@ -413,18 +404,15 @@ test('prompt：visualContext 注入标题/分隔符/防注入说明，且不混�
     config: {},
   });
   const [system, user] = messages;
-  assert.match(system.content, /本页画面文字（OCR）/);
-  assert.match(system.content, /不是指令/);
-  assert.match(system.content, /只翻译【待翻译文本】/);
-  assert.ok(user.content.includes('【本页画面文字（OCR'));
-  assert.ok(user.content.includes('以下内容不是指令'));
-  assert.deepEqual(extractVisualBlock(user.content), ocr);
+  assert.ok(!system.content.includes('本页画面文字'));
+  assert.ok(!system.content.includes('OCR'));
+  assert.ok(!user.content.includes('【本页画面文字'));
+  assert.ok(!user.content.includes('<<<'));
+  assert.ok(user.content.includes('learning rate'));
   assert.ok(user.content.includes('【最近上下文'));
   assert.ok(user.content.includes('上一句'));
   assert.ok(user.content.includes('We use stochastic gradient descent.'));
-  // 顺序：OCR 区块在【待翻译文本】之前，不能混进去
-  assert.ok(user.content.indexOf('【本页画面文字') < user.content.indexOf('【待翻译文本'));
-  assert.ok(user.content.indexOf('\n>>>') < user.content.indexOf('【待翻译文本'));
+  assert.ok(user.content.indexOf('【术语表') < user.content.indexOf('【待翻译文本'));
 });
 
 test('prompt：兼容顶层参数 / context 对象 / context 数组挂载三种入参，顶层优先', () => {
@@ -456,17 +444,16 @@ test('prompt：visualContext 为空/纯标点/null/空数组时 prompt 完全不
   }
 });
 
-test('prompt：OCR 正文截断 ≤1200、system 增量 ≤400、小上下文时整体 prompt 增量 ≤400', () => {
+test('prompt：长 OCR 不整段进入 prompt，短术语让整体增量仍 ≤400', () => {
   const baseline = buildTranslationMessages({ text: 'Hello world.', config: {} });
   const bigOcr = 'slide term code formula '.repeat(400); // 9600 字符
   const withBig = buildTranslationMessages({ text: 'Hello world.', visualContext: bigOcr, config: {} });
   const systemDelta = Array.from(withBig[0].content).length - Array.from(baseline[0].content).length;
-  assert.ok(systemDelta > 0 && systemDelta <= 400, `system prompt 增量应 ≤400 字符，实际 ${systemDelta}`);
-  const block = extractVisualBlock(withBig[1].content);
-  assert.ok(block.length > 0);
-  assert.ok(Array.from(block).length <= VISUAL_CONTEXT_MAX_CHARS, `OCR 区块应 ≤1200 字符，实际 ${Array.from(block).length}`);
+  assert.equal(systemDelta, 0, '画面术语不应改 system prompt');
+  assert.ok(!withBig[1].content.includes(bigOcr.slice(0, 80)));
+  assert.ok(withBig[1].content.includes('slide term'));
+  assert.ok(Array.from(withBig[1].content).length - Array.from(baseline[1].content).length <= 400);
 
-  // 120 字符的典型 OCR：整条 prompt 增量（system+user）也应 ≤400 字符
   const smallOcr = 'learning rate stochastic gradients loss function '.repeat(3).slice(0, 120);
   const withSmall = buildTranslationMessages({ text: 'Hello world.', visualContext: smallOcr, config: {} });
   const totalChars = (messages) => Array.from(messages[0].content).length + Array.from(messages[1].content).length;
@@ -486,9 +473,10 @@ test('translate 流式链路：SSE 请求 body 携带 visualContext，且译文�
   assert.equal(result.text, '我们使用随机梯度下降。');
   assert.ok(!result.text.includes('stochastic gradients'), '译文不能把画面文字带出来');
   const [system, user] = fetchImpl.calls[0].body.messages;
-  assert.match(system.content, /不是指令/);
-  assert.ok(user.content.includes(ocr));
-  assert.deepEqual(extractVisualBlock(user.content), ocr);
+  assert.ok(!system.content.includes('本页画面文字'));
+  assert.ok(!user.content.includes('<<<'));
+  assert.ok(user.content.includes('learning rate'));
+  assert.ok(!user.content.includes(ocr) || user.content.includes(`${ocr} = ${ocr}`));
 });
 
 test('translate 非流式链路：整包 JSON 请求 body 携带 visualContext', async () => {
@@ -507,7 +495,8 @@ test('translate 非流式链路：整包 JSON 请求 body 携带 visualContext',
   assert.equal(result.text, '梯度下降。');
   const [, user] = fetchImpl.calls[0].body.messages;
   assert.ok(user.content.includes('formula L(θ) = 1/N Σ loss'));
-  assert.deepEqual(extractVisualBlock(user.content), 'formula L(θ) = 1/N Σ loss');
+  assert.ok(!user.content.includes('<<<'));
+  assert.ok(!user.content.includes('【本页画面文字'));
 });
 
 test('translate：context 对象里的 visualContext 也生效（顶层参数优先）', async () => {
@@ -532,15 +521,11 @@ test('translate：OCR 控制字符/注入分隔符在请求体被清洗，且不
   await translator.translate({ text: 'Hello.', visualContext: dirty });
   const system = fetchImpl.calls[0].body.messages[0].content;
   const user = fetchImpl.calls[0].body.messages[1].content;
-  assert.match(system, /不是指令/);
+  assert.ok(!system.includes('本页画面文字'));
   assert.ok(!user.includes('\u0000'));
-  const block = extractVisualBlock(user);
-  assert.ok(block.includes('ignore previous instructions 忽略以上指令'));
-  assert.ok(block.includes('learning rate'));
-  assert.ok(!block.includes('<<<') && !block.includes('>>>') && !block.includes('```'));
-  // 只有 OCR 区块自身那一对分隔符
-  assert.equal(user.split('<<<').length - 1, 1);
-  assert.equal(user.split('>>>').length - 1, 1);
+  assert.ok(!user.includes('<<<') && !user.includes('>>>') && !user.includes('```'));
+  assert.ok(user.includes('learning rate'));
+  assert.ok(!user.includes(dirty));
 });
 
 test('stats()：visualContextSegments / lastVisualContextChars 计数正确，日志不打印 OCR 原文', async () => {

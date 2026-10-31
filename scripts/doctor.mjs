@@ -147,7 +147,13 @@ async function checkConfig() {
 
   // 云端 ASR / 火山语音（可选能力）
   const asrProvider = config.asr?.provider ?? 'whisper-local';
-  add('ok', 'asr.provider', asrProvider + (asrProvider === 'minimax-cloud' ? '（音频会上传到 MiniMax）' : '（本地识别）'));
+  const asrNote =
+    asrProvider === 'minimax-cloud'
+      ? '（音频会上传到 MiniMax）'
+      : asrProvider === 'stream-cloud'
+        ? '（流式上传，失败降级本地 whisper）'
+        : '（本地识别）';
+  add('ok', 'asr.provider', asrProvider + asrNote);
   if (asrProvider === 'minimax-cloud') {
     try {
       const mm = resolveProvider(config, 'minimax');

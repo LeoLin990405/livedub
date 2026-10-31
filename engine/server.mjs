@@ -3,7 +3,8 @@
  * livedub 本地引擎服务：HTTP（静态工作台 + 只读 API）+ WebSocket（/ws 实时同传）。
  *
  * 职责边界：
- * - 传输层：静态托管 studio/（/studio/、/replay/）与 demo/（回放素材）；HTTP API：/health、/api/config、/api/voices；
+ * - 传输层：静态托管 studio/（/studio/、/replay/）与 demo/（回放素材）；
+ *   HTTP API：/health、/api/config、/api/voices、/api/translate、/api/page/parse、/api/notes、/api/vision。
  *   WebSocket：hello -> createSession() 建会话，二进制音频帧 / JSON 音频 / control/config/glossary 全部转发给会话，
  *   会话事件原样下发；连接关闭时调用 session.close('client disconnected')。
  * - 会话编排在 engine/pipeline.mjs（Lead scope）。本文件只依赖契约，不关心 ASR/翻译/TTS 细节。
@@ -22,6 +23,8 @@ import os from 'node:os';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { pathToFileURL } from 'node:url';
+
+import { collectPage } from './page/parse.mjs';
 
 import {
   AUDIO_FRAME_MS,
@@ -81,6 +84,13 @@ const ASR_ENGINE_META = Object.freeze({
     cloud: true,
     privacyTitle: '音频会上传到 MiniMax',
     privacyDetail: '云端语音识别会把音频上传到 MiniMax 用于转写；不经过浏览器厂商等其它第三方。',
+  },
+  'stream-cloud': {
+    label: '流式云端识别',
+    shortLabel: '流式',
+    cloud: true,
+    privacyTitle: '音频会上传到流式识别服务',
+    privacyDetail: '流式识别会边收音频边转写；连接失败时同一会话继续使用本地 whisper，不中断。',
   },
   mock: {
     label: 'Mock（开发用）',
@@ -2003,6 +2013,8 @@ function allowedMethodsForPath(pathname) {
   if (pathname === '/api/notes/export.md') return ['GET', 'HEAD'];
   if (pathname === '/api/notes/obsidian/status') return ['GET', 'HEAD'];
   if (pathname.startsWith('/api/notes/')) return ['PUT', 'DELETE'];
+  if (pathname === '/api/translate') return ['POST'];
+  if (pathname === '/api/page/parse') return ['POST'];
   if (pathname.startsWith('/api/vision/')) {
     if (pathname === '/api/vision/health') return ['GET', 'HEAD'];
     return ['POST'];
@@ -2183,7 +2195,7 @@ async function readVisionImageInput(state, req) {
 function normalizeSummarizeInput(input) {
   const fail = (code, message, field) => ({ ok: false, error: { code, message, ...(field ? { field } : {}) } });
   if (!input || typeof input !== 'object' || Array.isArray(input)) return fail('invalid_body', '请求体必须是 JSON 对象');
-  const allowed = new Set(['title', 'transcript', 'visuals', 'lang']);
+  const allowed = new Set(['title', 'transcript', 'visuals', 'lang', 'provider']);
   for (const key of Object.keys(input)) {
     if (!allowed.has(key)) return fail('unknown_field', `不支持的字段：${key}`, key);
   }
@@ -2219,7 +2231,138 @@ function normalizeSummarizeInput(input) {
       ...(caption ? { caption } : {}),
     });
   }
-  return { ok: true, value: { title, lang, transcript, visuals } };
+  let provider = '';
+  if (input.provider != null && input.provider !== '') {
+    if (typeof input.provider !== 'string') return fail('invalid_provider', 'provider 必须是字符串', 'provider');
+    provider = input.provider.trim().slice(0, 40);
+    if (!/^[a-z0-9][a-z0-9-]{0,39}$/i.test(provider)) return fail('invalid_provider', 'provider 名称不合法', 'provider');
+  }
+  return { ok: true, value: { title, lang, transcript, visuals, ...(provider ? { provider } : {}) } };
+}
+
+const TRANSLATE_PROVIDER_IDS = new Set(['deepseek', 'minimax', 'mimo-plan', 'mock']);
+const TRANSLATE_TEXT_MAX = 4000;
+
+function normalizeTranslateInput(input) {
+  const fail = (code, message, field) => ({ ok: false, error: { code, message, ...(field ? { field } : {}) } });
+  if (!input || typeof input !== 'object' || Array.isArray(input)) return fail('invalid_body', '请求体必须是 JSON 对象');
+  const allowed = new Set(['text', 'provider']);
+  for (const key of Object.keys(input)) {
+    if (!allowed.has(key)) return fail('unknown_field', `不支持的字段：${key}`, key);
+  }
+  if (typeof input.text !== 'string') return fail('invalid_text', 'text 必须是字符串', 'text');
+  const text = input.text.trim();
+  if (!text) return fail('empty_text', 'text 不能为空', 'text');
+  if (Array.from(text).length > TRANSLATE_TEXT_MAX) return fail('text_too_long', `text 最多 ${TRANSLATE_TEXT_MAX} 字`, 'text');
+  let provider = '';
+  if (input.provider != null && input.provider !== '') {
+    if (typeof input.provider !== 'string') return fail('invalid_provider', 'provider 必须是字符串', 'provider');
+    provider = input.provider.trim();
+    if (!TRANSLATE_PROVIDER_IDS.has(provider)) return fail('invalid_provider', `provider 必须是 ${[...TRANSLATE_PROVIDER_IDS].join(' / ')}`, 'provider');
+  }
+  return { ok: true, value: { text, provider } };
+}
+
+function publicCausalLinks(links) {
+  if (!Array.isArray(links)) return [];
+  const out = [];
+  for (const item of links) {
+    if (!item || typeof item !== 'object') continue;
+    const relation = String(item.relation ?? '').trim();
+    const evidence = String(item.evidence ?? '').trim();
+    if (!relation || !evidence) continue;
+    out.push({
+      relation: relation.slice(0, 40),
+      evidence: evidence.slice(0, 80),
+      cause: String(item.cause ?? '').trim().slice(0, 180),
+      effect: String(item.effect ?? '').trim().slice(0, 180),
+    });
+    if (out.length >= 6) break;
+  }
+  return out;
+}
+
+/** 批量翻译把 chain 钉死在这一家，避免备胎把「多个模型一起用」偷换成第一家成功。 */
+async function createPinnedTranslator(state, providerName) {
+  const config = deepMerge(state.config ?? {}, { translate: { provider: providerName, chain: [providerName] } });
+  if (typeof state.translateFactory === 'function') {
+    const translator = await Promise.resolve(state.translateFactory({ config, log: state.log }));
+    if (!translator || typeof translator.translate !== 'function') throw new Error('翻译服务未提供 translate()');
+    return translator;
+  }
+  const mod = await import('./translate/index.mjs');
+  return mod.createTranslator({ config, log: state.log });
+}
+
+function normalizePageInput(input) {
+  const fail = (code, message, field) => ({ ok: false, error: { code, message, ...(field ? { field } : {}) } });
+  if (!input || typeof input !== 'object' || Array.isArray(input)) return fail('invalid_body', '请求体必须是 JSON 对象');
+  for (const key of Object.keys(input)) {
+    if (key !== 'url') return fail('unknown_field', `不支持的字段：${key}`, key);
+  }
+  if (typeof input.url !== 'string') return fail('invalid_url', 'url 必须是字符串', 'url');
+  const url = input.url.trim();
+  if (!url) return fail('invalid_url', 'url 不能为空', 'url');
+  if (url.length > 2000) return fail('invalid_url', 'url 过长', 'url');
+  return { ok: true, value: { url } };
+}
+
+async function handlePageParseRequest(state, req, res) {
+  const parsed = await readJsonBodyForNotes(req, 16 * 1024);
+  if (!parsed.ok) return sendJson(res, parsed.status, { ok: false, error: parsed.error.code, message: parsed.error.message });
+  const normalized = normalizePageInput(parsed.value);
+  if (!normalized.ok) {
+    return sendJson(res, 400, { ok: false, error: normalized.error.code, message: normalized.error.message, ...(normalized.error.field ? { field: normalized.error.field } : {}) });
+  }
+  try {
+    const result = await collectPage(normalized.value.url, {
+      fetch: typeof state.pageFetch === 'function' ? state.pageFetch : globalThis.fetch,
+      ...(typeof state.pageLookup === 'function' ? { lookup: state.pageLookup } : {}),
+    });
+    let host = '';
+    try {
+      host = new URL(result.finalUrl).host;
+    } catch {
+      host = '';
+    }
+    state.log(`页面解析 ${result.site} ${result.kind} cues=${result.cueCount} ${host}`);
+    return sendJson(res, 200, result);
+  } catch (err) {
+    const status = Number(err?.statusCode) || 502;
+    const code = typeof err?.code === 'string' && err.code ? err.code : 'page_fetch_failed';
+    const message = String(err?.message ?? err).slice(0, 500);
+    state.log(`页面解析失败：${code} ${message}`);
+    return sendJson(res, status >= 400 && status < 600 ? status : 502, { ok: false, error: code, message });
+  }
+}
+
+async function handleTranslateRequest(state, req, res) {
+  const parsed = await readJsonBodyForNotes(req, 64 * 1024);
+  if (!parsed.ok) return sendJson(res, parsed.status, { ok: false, error: parsed.error.code, message: parsed.error.message });
+  const normalized = normalizeTranslateInput(parsed.value);
+  if (!normalized.ok) {
+    return sendJson(res, 400, { ok: false, error: normalized.error.code, message: normalized.error.message, ...(normalized.error.field ? { field: normalized.error.field } : {}) });
+  }
+  const providerName = normalized.value.provider || String(state.config?.translate?.provider ?? '').trim();
+  if (!TRANSLATE_PROVIDER_IDS.has(providerName)) {
+    return sendJson(res, 400, { ok: false, error: 'invalid_provider', message: '没有可用的翻译 provider', field: 'provider' });
+  }
+  const started = Date.now();
+  try {
+    const translator = await createPinnedTranslator(state, providerName);
+    const result = await translator.translate({ text: normalized.value.text });
+    const text = String(result?.text ?? '').trim();
+    if (!text) return sendJson(res, 502, { ok: false, error: 'translate_failed', message: '翻译返回空译文' });
+    return sendJson(res, 200, {
+      ok: true,
+      text,
+      provider: String(result?.provider ?? providerName),
+      model: result?.model ?? null,
+      ms: Math.max(0, Date.now() - started),
+    });
+  } catch (err) {
+    return sendJson(res, 502, { ok: false, error: 'translate_failed', message: String(err?.message ?? err).slice(0, 500) });
+  }
 }
 
 /** /api/vision/health 的规范化返回（不含密钥） */
@@ -2373,9 +2516,9 @@ async function handleVisionRequest(state, req, res, { method, pathname, url }) {
       return sendJson(res, 400, { ok: false, error: normalized.error.code, message: normalized.error.message, ...(normalized.error.field ? { field: normalized.error.field } : {}) });
     }
     try {
-      const { title, transcript, visuals, lang } = normalized.value;
+      const { title, transcript, visuals, lang, provider } = normalized.value;
       const result = await callVisionWithTimeout(
-        () => service.summarize({ title, transcript, visuals, lang }),
+        () => service.summarize({ title, transcript, visuals, lang, ...(provider ? { provider } : {}) }),
         visionTimeoutFor(state, 'summarize'),
         '图文总结',
       );
@@ -2383,6 +2526,7 @@ async function handleVisionRequest(state, req, res, { method, pathname, url }) {
         ok: true,
         summary: String(result?.summary ?? ''),
         keyPoints: Array.isArray(result?.keyPoints) ? result.keyPoints.map((point) => String(point)).slice(0, 20) : [],
+        links: publicCausalLinks(result?.links),
         provider: result?.provider ?? null,
         model: result?.model ?? null,
         ms: Number(result?.ms) || 0,
@@ -2505,6 +2649,14 @@ function createRequestHandler(state) {
           return sendJson(res, 200, { ...buildUiSettingsPayload(state), saved: true, nextSessionOnly: true });
         }
         return sendJson(res, 200, buildUiSettingsPayload(state), { head: method === 'HEAD' });
+      }
+
+      if (pathname === '/api/translate') {
+        return await handleTranslateRequest(state, req, res);
+      }
+
+      if (pathname === '/api/page/parse') {
+        return await handlePageParseRequest(state, req, res);
       }
 
       if (pathname === '/api/config') {
@@ -3148,6 +3300,8 @@ async function loadDefaultSessionFactory({ log, forceDemo = false }) {
  * @param {object} [options.configOverrides] loadConfig 的 overrides（测试用 mock provider）
  * @param {Function} [options.sessionFactory] 注入会话工厂（{id, options, emit, log, config} -> session）
  * @param {Function} [options.voiceLister] 注入音色列表实现（测试用；默认读 T3 tts/index.mjs）
+ * @param {Function} [options.pageFetch] 注入页面抓取（测试用；默认 global fetch）
+ * @param {Function} [options.pageLookup] 注入 DNS 查询（测试用；默认 dns.lookup）
  * @param {Function} [options.log]
  * @param {boolean} [options.demo] 强制内置演示会话
  * @param {number} [options.readyTimeoutMs]
@@ -3207,6 +3361,9 @@ export async function startServer(options = {}) {
     // v0.5：视觉服务（懒加载 engine/vision/index.mjs；测试可注入 visionService/visionFactory）
     visionService: options.visionService ?? null,
     visionFactory: typeof options.visionFactory === 'function' ? options.visionFactory : null,
+    translateFactory: typeof options.translateFactory === 'function' ? options.translateFactory : null,
+    pageFetch: typeof options.pageFetch === 'function' ? options.pageFetch : null,
+    pageLookup: typeof options.pageLookup === 'function' ? options.pageLookup : null,
     visionServicePromise: null,
     visionUnavailableError: null,
     visionUnavailableAt: 0,
@@ -3474,7 +3631,14 @@ async function main(argv = process.argv.slice(2)) {
   const uiEffective = started.state?.uiSettings?.effective ?? null;
   const asrProvider = uiEffective?.asr?.provider ?? config?.asr?.provider ?? '?';
   const uiNote = started.state?.uiSettings?.overrides?.asr?.provider ? '（UI 设置，下次会话生效）' : '';
-  const asrNote = asrProvider === 'minimax-cloud' ? '云端识别，音频会上传到 MiniMax' : whisperModel ? `模型 ${toProjectRelative(whisperModel)}` : '⚠ 未找到 whisper 模型';
+  const asrNote =
+    asrProvider === 'minimax-cloud'
+      ? '云端识别，音频会上传到 MiniMax'
+      : asrProvider === 'stream-cloud'
+        ? '流式识别，音频会上传；失败则同一会话降级本地 whisper'
+        : whisperModel
+          ? `模型 ${toProjectRelative(whisperModel)}`
+          : '⚠ 未找到 whisper 模型';
   line('ASR', `${asrProvider} · ${asrNote}${uiNote}`);
   line('设置', `${toProjectRelative(started.uiSettingsPath)}${started.state?.uiSettings?.overrides && Object.keys(started.state.uiSettings.overrides).length ? '（已应用）' : '（默认）'}`);
   const desktopApp = detectDesktopApp(started.state);

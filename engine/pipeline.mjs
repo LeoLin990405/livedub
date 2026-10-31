@@ -3,7 +3,7 @@
  *
  * 设计要点：
  * - 纯事件驱动，不依赖具体 provider；deps 可注入（tests/pipeline.test.mjs 用 engine/mock.mjs）。
- * - ASR final 的每句并行度=1 的顺序队列，保证字幕/配音顺序稳定（教学视频句子间有停顿，够用）。
+ * - ASR final 到达后立刻开始翻译，不等上一句 TTS；配音仍按句序从 _dubTail 发出。
  * - 所有下游失败都被隔离：翻译失败 -> 只显示原文；配音失败 -> 双语字幕照常；不得中断会话。
  * - 时间轴：客户端 tMs -> 会话时间轴（首个音频包为 0），所有下发的 t0Ms/t1Ms/startMs 都是会话时间轴。
  */
@@ -22,6 +22,7 @@ import {
 import { base64Pcm, concatPcm, pcmDurationMs, msToSamples } from './audio.mjs';
 import { createMetrics, now } from './metrics.mjs';
 import { loadConfig, deepMerge } from './config.mjs';
+import { draftTranslationReusable, extractGlossaryTerms } from './translate/index.mjs';
 
 /** 会话时间轴音频保留窗口（用于抽取讲师声音样本做克隆） */
 class AudioTimeline {
@@ -142,6 +143,33 @@ function createNaiveClauseExtractor({ minClauseChars = 8, maxChunkChars = 80, st
 
 let sessionSeq = 0;
 
+/** 一句译文的子句队列：翻译侧 push，配音侧按序 next，close 后 next 得到 null */
+function createClauseQueue() {
+  const items = [];
+  let closed = false;
+  /** @type {Array<(clause: string|null) => void>} */
+  const waiters = [];
+  return {
+    push(clause) {
+      const text = String(clause ?? '').trim();
+      if (!text || closed) return;
+      const waiter = waiters.shift();
+      if (waiter) waiter(text);
+      else items.push(text);
+    },
+    close() {
+      if (closed) return;
+      closed = true;
+      while (waiters.length) waiters.shift()(null);
+    },
+    next() {
+      if (items.length) return Promise.resolve(items.shift());
+      if (closed) return Promise.resolve(null);
+      return new Promise((resolve) => waiters.push(resolve));
+    },
+  };
+}
+
 export class Session {
   constructor({ id, options = {}, emit = () => {}, log = () => {}, deps = null } = {}) {
     this.id = id || `s_${Date.now().toString(36)}_${(++sessionSeq).toString(36)}`;
@@ -158,8 +186,12 @@ export class Session {
     this._pendingSegments = 0;
     this._activeDubs = 0;
     this._dubTimer = null;
-    this._processQueue = Promise.resolve();
+    this._dubTail = Promise.resolve();
     this._ttsQueue = Promise.resolve();
+    this._learnedGlossary = [];
+    this._draft = null;
+    this._draftCalls = 0;
+    this._draftInflight = Promise.resolve();
     this._partialCounter = 0;
     this._segmentCounter = 0;
     this._partialTimer = null;
@@ -237,12 +269,14 @@ export class Session {
     }
 
     this.state = 'ready';
+    const asrHasWarmup = typeof this.asr?.warmup === 'function';
     this._send({
       type: MSG.READY,
       sessionId: this.id,
       protocol: PROTOCOL_VERSION,
       providers: sessionProviderInfo(this.config),
       voice: this._voiceInfo,
+      asrReady: !asrHasWarmup,
       limits: {
         audioFrameMs: AUDIO_FRAME_MS,
         sampleRate: AUDIO_INPUT_SAMPLE_RATE,
@@ -252,6 +286,31 @@ export class Session {
     });
     this._sendVoiceEvent(this._voiceInfo);
     this._refreshStatus(true);
+    if (asrHasWarmup) {
+      this.asr
+        .warmup()
+        .then(() => {
+          if (this._closed) return;
+          this._send({
+            type: MSG.STATUS,
+            state: this._status ?? 'listening',
+            detail: 'asr-ready',
+            asrReady: true,
+            tsMs: this._currentSessionMs(),
+          });
+        })
+        .catch((err) => {
+          this.log(`asr warmup failed: ${err.message}`);
+          if (this._closed) return;
+          this._send({
+            type: MSG.STATUS,
+            state: this._status ?? 'listening',
+            detail: 'asr-ready',
+            asrReady: true,
+            tsMs: this._currentSessionMs(),
+          });
+        });
+    }
     this.log(`session ${this.id} ready`);
     return this;
   }
@@ -301,6 +360,7 @@ export class Session {
         const tMs = Number.isFinite(Number(msg.tMs)) ? Math.max(0, Number(msg.tMs)) : this._currentSessionMs();
         this._visualContext = { text, tMs, at: now() };
         this._visualContextStats.received += 1;
+        this._learnVisualTerms(text, tMs);
         this.log(`visual context updated（${text.length} 字，t=${Math.round(tMs)}ms，source=${msg.source ?? '?'}）`);
         return;
       }
@@ -335,6 +395,8 @@ export class Session {
     }
     if (action === 'seek') {
       this._visualContext = null; // 画面位置已变化，旧上下文作废
+      this._addTerms([], 'visual', { replace: true });
+      this._resetDraft();
       this._audioTimeline.reset();
       try {
         await this.asr?.flush?.();
@@ -433,6 +495,7 @@ export class Session {
         t1Ms: Math.round(ev.t1Ms ?? this._currentSessionMs()),
         text,
       });
+      this._offerDraft(ev);
       return;
     }
     if (ev.type === 'final') {
@@ -444,71 +507,192 @@ export class Session {
         t1Ms: Math.max(0, Math.round(ev.t1Ms ?? this._currentSessionMs())),
         lang: ev.lang ?? this.config?.session?.langFrom ?? 'en',
       };
+      const id = ++this._segmentCounter;
+      this.metrics.mark(id, 'segmentReceivedAt');
+      this.metrics.mark(id, 'asrFinalAt');
+      this._send({ type: MSG.SEGMENT, id, t0Ms: segment.t0Ms, t1Ms: segment.t1Ms, text, lang: segment.lang });
+      this._refreshStatus(true);
+      this._learnOpeningTranscript(text, segment.t0Ms);
+      this._kickVoiceSample(segment);
+
+      const bucket = createClauseQueue();
+      // 没有在途草稿时，translate() 必须在本轮同步调用，不能先 await。
+      const work = this._beginTranslation(id, segment, bucket);
       this._pendingSegments += 1;
       this._refreshStatus();
-      this._processQueue = this._processQueue
-        .then(() => this._processSegment(segment))
+
+      const prev = this._dubTail;
+      let release = () => {};
+      const gate = new Promise((resolve) => {
+        release = resolve;
+      });
+      this._dubTail = gate;
+      prev
+        .then(() => this._emitDub(id, segment, bucket, work))
         .catch((err) => {
           this.log(`segment pipeline error: ${err.message}`);
           this._send(errorEvent('session', `处理句子失败：${err.message}`));
+          bucket.close();
         })
         .finally(() => {
           this._pendingSegments = Math.max(0, this._pendingSegments - 1);
           this._refreshStatus();
+          release();
         });
       return;
     }
   }
 
-  async _processSegment(segment) {
-    if (this._closed) return;
-    const id = ++this._segmentCounter;
-    const { text, t0Ms, t1Ms, lang } = segment;
-    this.metrics.mark(id, 'segmentReceivedAt');
-    this.metrics.mark(id, 'asrFinalAt');
-    this._send({ type: MSG.SEGMENT, id, t0Ms, t1Ms, text, lang });
-    this._refreshStatus(true);
+  _kickVoiceSample(segment) {
+    if (!this.voice || this.config?.tts?.voiceMode === 'preset') return;
+    const sample = this._audioTimeline.slice(segment.t0Ms, segment.t1Ms);
+    if (sample.length === 0) return;
+    this.voice
+      .ensureVoice({ pcm: sample, sampleRate: AUDIO_INPUT_SAMPLE_RATE })
+      .then((info) => {
+        if (!info) return;
+        const changed =
+          !this._voiceInfo ||
+          info.mode !== this._voiceInfo.mode ||
+          info.voiceId !== this._voiceInfo.voiceId ||
+          Boolean(info.degraded) !== Boolean(this._voiceInfo.degraded);
+        if (changed) {
+          this._voiceInfo = info;
+          this._sendVoiceEvent(info);
+        }
+      })
+      .catch((err) => this.log(`voice ensure failed: ${err.message}`));
+  }
 
-    // 收集讲师声音样本 -> 克隆音色（失败自动降级，不阻塞）
-    if (this.voice && this.config?.tts?.voiceMode !== 'preset') {
-      const sample = this._audioTimeline.slice(t0Ms, t1Ms);
-      if (sample.length > 0) {
-        this.voice
-          .ensureVoice({ pcm: sample, sampleRate: AUDIO_INPUT_SAMPLE_RATE })
-          .then((info) => {
-            if (!info) return;
-            const changed =
-              !this._voiceInfo ||
-              info.mode !== this._voiceInfo.mode ||
-              info.voiceId !== this._voiceInfo.voiceId ||
-              Boolean(info.degraded) !== Boolean(this._voiceInfo.degraded);
-            if (changed) {
-              this._voiceInfo = info;
-              this._sendVoiceEvent(info);
-            }
-          })
-          .catch((err) => this.log(`voice ensure failed: ${err.message}`));
-      }
+  _visualTermLimit() {
+    const n = Number(this.config?.translate?.visualTermLimit ?? 8);
+    return Number.isFinite(n) && n > 0 ? Math.floor(n) : 8;
+  }
+
+  _inOpeningWindow(tMs) {
+    const windowMs = Number(this.config?.translate?.openingWindowMs ?? 90000);
+    if (!Number.isFinite(windowMs) || windowMs <= 0) return false;
+    return Number(tMs) <= windowMs;
+  }
+
+  _addTerms(terms, note, { replace = false } = {}) {
+    let kept = Array.isArray(this._learnedGlossary) ? this._learnedGlossary.slice() : [];
+    if (replace) kept = kept.filter((entry) => entry.note !== note);
+    const occupied = new Set([
+      ...(this._glossary ?? []).map((entry) => String(entry.src).toLowerCase()),
+      ...kept.map((entry) => String(entry.src).toLowerCase()),
+    ]);
+    for (const term of terms ?? []) {
+      const src = String(term?.src ?? '').trim();
+      if (!src) continue;
+      const key = src.toLowerCase();
+      if (occupied.has(key)) continue;
+      occupied.add(key);
+      const dst = String(term?.dst ?? src).trim() || src;
+      kept.push({ src, dst, note });
     }
+    this._learnedGlossary = sanitizeGlossary(kept);
+  }
 
-    const dubEnabled = this.config?.dub?.enabled !== false;
-    // 默认开启「翻译流式 x TTS 重叠」：已稳定的子句先合成，缩短第一个配音可播时间
-    const overlap = dubEnabled && this.config?.dub?.overlapStreaming !== false;
-    const dubStream = dubEnabled ? this._createDubStreamer(id, segment) : null;
-    const extractor = overlap ? this._createClauseExtractor() : null;
-    let translateFailed = false;
+  _learnVisualTerms(text, tMs) {
+    const terms = extractGlossaryTerms(text, { maxTerms: this._visualTermLimit() });
+    if (this._inOpeningWindow(tMs)) this._addTerms(terms, 'opening', { replace: false });
+    this._addTerms(terms, 'visual', { replace: true });
+  }
 
+  _learnOpeningTranscript(text, tMs) {
+    if (!this._inOpeningWindow(tMs)) return;
+    this._addTerms(extractGlossaryTerms(text, { maxTerms: this._visualTermLimit() }), 'opening', { replace: false });
+  }
+
+  glossaryEntries() {
+    return sanitizeGlossary([...(this._glossary ?? []), ...(this._learnedGlossary ?? [])]);
+  }
+
+  _draftReuseEnabled() {
+    return this.config?.translate?.draftReuse === true;
+  }
+
+  _draftCap() {
+    const n = Number(this.config?.translate?.draftMaxExtraCalls ?? 1);
+    return Number.isFinite(n) && n >= 0 ? Math.floor(n) : 1;
+  }
+
+  _resetDraft() {
+    this._draft = null;
+    this._draftCalls = 0;
+    this._draftInflight = Promise.resolve();
+  }
+
+  _offerDraft(ev) {
+    if (!this._draftReuseEnabled() || !this.translator) return;
+    const text = String(ev?.text ?? '').trim();
+    if (!text) return;
+    if (this._draftCalls >= this._draftCap()) return;
+    this._draftCalls += 1;
+    const glossary = this.glossaryEntries();
+    const context = this._context.slice(-(Number(this.config?.translate?.contextSegments) || 3));
+    this._draftInflight = this._draftInflight
+      .then(async () => {
+        const result = await this.translator.translate({
+          text,
+          context,
+          glossary,
+          signal: this._abort.signal,
+        });
+        this._draft = { src: text, dst: String(result?.text ?? '') };
+      })
+      .catch((err) => {
+        this.log(`draft translate failed: ${err.message}`);
+      });
+  }
+
+  _beginTranslation(id, segment, bucket) {
+    const reuse = this._draftReuseEnabled() && (this._draft != null || this._draftCalls > 0);
+    if (!reuse) return this._startTranslate(id, segment, bucket);
+    return this._translateFromDraftOrFresh(id, segment, bucket);
+  }
+
+  async _translateFromDraftOrFresh(id, segment, bucket) {
+    const pending = this._draft;
+    this._draft = null;
+    this._draftCalls = 0;
     try {
-      this._send(statusEvent('translating', '', t1Ms));
-      let firstWall = null;
-      const visual = this._visualContextForTranslate();
-      if (visual) this._visualContextStats.used += 1;
-      const result = await this.translator.translate({
+      await this._draftInflight;
+    } catch {
+      /* 草稿失败就走正式翻译 */
+    }
+    const draft = this._draft ?? pending;
+    this._draft = null;
+    const translated = String(draft?.dst ?? '').trim();
+    if (draft && translated && draftTranslationReusable({ draftSource: draft.src, finalSource: segment.text })) {
+      this.metrics.mark(id, 'mtFirstAt');
+      this.metrics.mark(id, 'mtDoneAt');
+      this._send({ type: MSG.TRANSLATION, id, text: translated, final: true });
+      this._context.push({ src: segment.text, dst: translated });
+      if (this._context.length > 8) this._context.shift();
+      for (const clause of this._splitClauses(translated)) bucket.push(clause);
+      bucket.close();
+      return { failed: false, reused: true };
+    }
+    return this._startTranslate(id, segment, bucket);
+  }
+
+  _startTranslate(id, segment, bucket) {
+    const { text, t1Ms } = segment;
+    const overlap = this.config?.dub?.enabled !== false && this.config?.dub?.overlapStreaming !== false;
+    const extractor = overlap ? this._createClauseExtractor() : null;
+    let firstWall = null;
+    this._send(statusEvent('translating', '', t1Ms));
+    const visual = this._visualContextForTranslate();
+    if (visual) this._visualContextStats.used += 1;
+    let translatePromise;
+    try {
+      translatePromise = this.translator.translate({
         text,
         context: this._context.slice(-(Number(this.config?.translate?.contextSegments) || 3)),
-        glossary: this._glossary,
+        glossary: this.glossaryEntries(),
         signal: this._abort.signal,
-        ...(visual ? { visualContext: visual.text, visualContextAtMs: visual.tMs } : {}),
         onPartial: (partial) => {
           const p = String(partial ?? '');
           if (!p) return;
@@ -517,27 +701,29 @@ export class Session {
             this.metrics.mark(id, 'mtFirstAt', firstWall);
           }
           this._send({ type: MSG.TRANSLATION, id, text: p, final: false });
-          if (overlap && dubStream && extractor) {
-            let clauses = [];
-            try {
-              clauses = extractor.push(p) ?? [];
-            } catch (err) {
-              this.log(`clause extractor failed: ${err.message}`);
-            }
-            for (const clause of clauses) dubStream.enqueue(clause);
+          if (!extractor) return;
+          let clauses = [];
+          try {
+            clauses = extractor.push(p) ?? [];
+          } catch (err) {
+            this.log(`clause extractor failed: ${err.message}`);
           }
+          for (const clause of clauses) bucket.push(clause);
         },
       });
-      this.metrics.mark(id, 'mtDoneAt');
-      const translated = String(result?.text ?? '').trim();
-      if (!translated) throw new Error('翻译结果为空');
-      this._send({ type: MSG.TRANSLATION, id, text: translated, final: true });
-      this._context.push({ src: text, dst: translated });
-      if (this._context.length > 8) this._context.shift();
-
-      if (dubStream) {
+    } catch (err) {
+      translatePromise = Promise.reject(err);
+    }
+    return Promise.resolve(translatePromise)
+      .then((result) => {
+        this.metrics.mark(id, 'mtDoneAt');
+        const translated = String(result?.text ?? '').trim();
+        if (!translated) throw new Error('翻译结果为空');
+        this._send({ type: MSG.TRANSLATION, id, text: translated, final: true });
+        this._context.push({ src: text, dst: translated });
+        if (this._context.length > 8) this._context.shift();
         let rest = [];
-        if (overlap && extractor) {
+        if (extractor) {
           try {
             rest = extractor.flush(translated) ?? [];
           } catch (err) {
@@ -547,22 +733,44 @@ export class Session {
         } else {
           rest = this._splitClauses(translated);
         }
-        for (const clause of rest) dubStream.enqueue(clause);
-      }
-    } catch (err) {
-      translateFailed = true;
-      this.log(`translate failed: ${err.message}`);
-      this._send(errorEvent('translate', `翻译失败：${err.message}`, { segmentId: id, tsMs: t1Ms }));
-    }
+        for (const clause of rest) bucket.push(clause);
+        bucket.close();
+        return { failed: false };
+      })
+      .catch((err) => {
+        bucket.close();
+        if (this._closed || err?.name === 'AbortError') return { failed: true };
+        this.log(`translate failed: ${err.message}`);
+        this._send(errorEvent('translate', `翻译失败：${err.message}`, { segmentId: id, tsMs: t1Ms }));
+        return { failed: true };
+      });
+  }
 
-    if (dubStream) {
+  async _emitDub(id, segment, bucket, work) {
+    const dubEnabled = this.config?.dub?.enabled !== false;
+    let outcome = { failed: false };
+    const done = Promise.resolve(work).then((value) => {
+      outcome = value ?? outcome;
+    });
+    if (dubEnabled && !this._closed) {
+      const dubStream = this._createDubStreamer(id, segment);
       try {
+        for (;;) {
+          const clause = await bucket.next();
+          if (clause == null) break;
+          dubStream.enqueue(clause);
+        }
         await dubStream.finish();
       } catch (err) {
         this.log(`dub stream failed: ${err.message}`);
       }
     }
-    this._sendMetrics(id, { t0Ms, t1Ms, ...(translateFailed ? { failed: 'translate' } : {}) });
+    await done;
+    this._sendMetrics(id, {
+      t0Ms: segment.t0Ms,
+      t1Ms: segment.t1Ms,
+      ...(outcome.failed ? { failed: 'translate' } : {}),
+    });
   }
 
   _splitClauses(text) {

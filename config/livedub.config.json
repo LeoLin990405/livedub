@@ -60,7 +60,11 @@
     "timeoutMs": 15000,
     "style": "teaching",
     "clauseStabilityMs": 160,
-    "partialThrottleMs": 40
+    "partialThrottleMs": 40,
+    "draftReuse": false,
+    "draftMaxExtraCalls": 1,
+    "openingWindowMs": 90000,
+    "visualTermLimit": 8
   },
   "tts": {
     "provider": "minimax",

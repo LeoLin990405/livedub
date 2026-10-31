@@ -84,7 +84,11 @@ bash scripts/build-macos.sh --clean
 
 ## 运行
 
-### 1. 启动本地引擎（真实同传需要）
+### 1. 启动 App（会一起打开本机引擎）
+
+直接打开 App 即可。本机 `127.0.0.1:8787` 上如果还没有 livedub 引擎，App 会自己拉起仓库里的 `node engine/server.mjs`（安装在 `/Applications` 时找 `~/livedub`，从仓库里的构建产物启动时找上层目录）。引擎已经在跑就复用，退出 App 只关掉自己拉起的那一个。
+
+仍可手动先开引擎，App 发现健康检查通过后不会再开第二个：
 
 ```bash
 node engine/server.mjs          # 或 npm start / npm run studio
@@ -608,7 +612,7 @@ LIVEDUB_MACOS_BUILD=1 node --test tests/macos.test.mjs
 | 现象 | 排查 |
 |---|---|
 | 一直「等待屏幕录制权限」 | 系统设置 → 隐私与安全性 → 屏幕录制 勾选 livedub / 启动它的终端；重启 App；构建后权限可能重置 |
-| 状态一直「重连引擎…」 | `node engine/server.mjs` 是否在跑、端口 8787 是否被占、菜单里地址是否改错；看引擎终端日志 |
+| 状态一直「重连引擎…」 | 菜单里的引擎地址是否仍是本机 `127.0.0.1:8787`；App 是否提示找不到项目或 node（需要 `~/livedub` 或 `LIVEDUB_ROOT`，以及 Homebrew / `PATH` 里的 node）；端口是否被别的程序占用 |
 | 有原文没有译文 / 配音 | 引擎 translate / tts provider 配置或 Key 问题（`npm run doctor`、`docs/PROVIDERS.md`） |
 | 字幕有、没声音 | 菜单「播放中文配音」是否开；系统输出设备；`--simulate` 本来就不播音频 |
 | 浮层挡住操作 | 开「字幕点击穿透」或隐藏浮层；「重置字幕位置」 |

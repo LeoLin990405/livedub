@@ -192,8 +192,11 @@ final class Settings {
 
     // MARK: - 配音 / 语言
 
+    /// 全新安装默认只出字幕。已经写过这个键的用户保持原选择。
+    static let dubMuteWarning = "系统原声不会被自动压低。请先把播放器静音，否则配音会和原声叠在一起。"
+
     var dubEnabled: Bool {
-        get { bool(forKey: Key.dubEnabled, default: true) }
+        get { bool(forKey: Key.dubEnabled, default: false) }
         set { defaults.set(newValue, forKey: Key.dubEnabled) }
     }
 

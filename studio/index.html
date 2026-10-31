@@ -130,7 +130,7 @@
             <div class="empty-inner">
               <div class="empty-badge"><svg class="icon"><use href="#i-subtitles"/></svg><span>本地优先 · 不传云端语音</span></div>
               <h1>把视频放进来，<br />实时看双语同传</h1>
-              <p>英文语音在本地 whisper 识别，增量翻译成中文，并用克隆音色实时配音。<br />音频与字幕只在本地引擎处理，不会上传视频。</p>
+              <p>英文语音在本地 whisper 识别，增量翻译成中文。默认用讲师男声配音，克隆成功后才改用克隆音色。<br />音频与字幕只在本地引擎处理，不会上传视频。</p>
               <div class="empty-actions">
                 <label class="btn btn-primary btn-lg" for="fileInput">
                   <svg class="icon"><use href="#i-folder"/></svg><span>打开本地视频</span>
@@ -139,14 +139,14 @@
               </div>
               <div class="empty-url">
                 <svg class="icon"><use href="#i-link"/></svg>
-                <input id="emptyUrl" type="url" placeholder="粘贴视频 / 音频 URL（mp4、webm、mp3…）" spellcheck="false" />
+                <input id="emptyUrl" type="url" placeholder="粘贴课程页或视频 URL（YouTube、B站、mp4…）" spellcheck="false" />
                 <button id="btnEmptyLoad" class="btn btn-ghost">载入</button>
               </div>
               <div class="empty-foot">
                 <span>示例：</span>
                 <a class="link" href="/replay/?session=/demo/session.jsonl&t=20000">打开真实回放 →</a>
                 <span class="dot-sep">·</span>
-                <span>支持 mp4 / webm / mkv / mp3</span>
+                <span>支持课程页（YouTube / B站 / 带字幕的网页）和 mp4 / webm / mp3</span>
               </div>
               <div class="empty-shortcuts" aria-label="键盘快捷键">
                 <span><kbd>Space</kbd> 播放/暂停</span>
@@ -241,8 +241,8 @@
       <button id="btnNotesOutline" class="btn btn-ghost btn-sm" type="button" title="用本次会话字幕生成课程大纲">
         <svg class="icon"><use href="#i-list"/></svg><span>大纲</span>
       </button>
-      <button id="btnNotesVisual" class="btn btn-ghost btn-sm" type="button" title="抽取关键帧 + OCR/VLM 生成图文笔记（v0.5）" disabled>
-        <svg class="icon"><use href="#i-image"/></svg><span>图文笔记</span>
+      <button id="btnNotesVisual" class="btn btn-ghost btn-sm" type="button" title="翻译、笔记、因果可以一起做" disabled>
+        <svg class="icon"><use href="#i-image"/></svg><span>课程处理</span>
       </button>
       <details id="notesExportMenu" class="notes-export">
         <summary class="btn btn-ghost btn-sm" title="导出 Markdown">
@@ -556,7 +556,7 @@
             <input id="fileInput" type="file" accept="video/*,audio/*" hidden />
             <div class="url-loader">
               <svg class="icon"><use href="#i-link"/></svg>
-              <input id="urlInput" type="url" placeholder="视频 / 音频 URL" spellcheck="false" />
+              <input id="urlInput" type="url" placeholder="课程页 / 视频 URL" spellcheck="false" />
               <button id="btnLoadUrl" class="btn btn-ghost btn-sm">载入</button>
             </div>
             <span class="capture-hint" id="captureHint" hidden>
@@ -614,12 +614,12 @@
     <img id="lightboxImage" alt="笔记大图" />
   </div>
 
-  <div id="visualModal" class="visual-modal" hidden aria-hidden="true" role="dialog" aria-modal="true" aria-label="生成图文笔记">
+  <div id="visualModal" class="visual-modal" hidden aria-hidden="true" role="dialog" aria-modal="true" aria-label="课程处理">
     <div class="visual-panel">
       <header class="visual-head">
         <span class="notes-head-icon"><svg class="icon"><use href="#i-image"/></svg></span>
         <div class="visual-title">
-          <strong>生成图文笔记</strong>
+          <strong>课程处理</strong>
           <span id="visualVideoTitle">未加载视频</span>
         </div>
         <span class="tag" id="visualVisionBadge">视觉引擎检测中…</span>
@@ -630,9 +630,29 @@
       </header>
       <div class="visual-body">
         <p class="panel-hint visual-hint">
-          按画面变化抽取关键帧（默认每 6s 采样、64×36 灰度差异去重，默认最多 12 帧）→ 本地 OCR 提取画面文字
-          → 可选 VLM 画面理解（慢、可能产生模型费用）→ 结合字幕生成总结与时间线，保存为 <code class="inline-code">kind:visual</code> 笔记。
+          三件事可以一起做：翻译、笔记、因果。视频语音走实时同传，按勾选顺序做备胎，第一家成功就用，不会等其他模型。
+          已有字幕、笔记和因果会让每个勾选的模型都跑一遍：译文说法一致用多数，对不上用主模型；笔记要点同样合并；因果不能发明规则没认出的关系。
+          笔记仍会抽关键帧、做本地 OCR，可选 VLM，保存为 <code class="inline-code">kind:visual</code> 图文笔记。
         </p>
+        <div class="visual-row">
+          <span>要做的事</span>
+          <div class="course-checks" id="courseJobs">
+            <label class="toggle"><input id="jobTranslate" type="checkbox" checked /><span>翻译</span></label>
+            <label class="toggle"><input id="jobNotes" type="checkbox" checked /><span>笔记</span></label>
+            <label class="toggle"><input id="jobCausal" type="checkbox" checked /><span>因果</span></label>
+          </div>
+        </div>
+        <div class="visual-row" id="courseSourceRow">
+          <span>翻译来源</span>
+          <div class="segmented segmented-sm" id="courseSource" role="group" aria-label="翻译来源">
+            <button type="button" data-source="video" aria-pressed="true" data-active="true">视频语音</button>
+            <button type="button" data-source="subtitles" aria-pressed="false" data-active="false">已有字幕</button>
+          </div>
+        </div>
+        <div class="visual-row">
+          <span>模型</span>
+          <div class="course-checks" id="courseModels"></div>
+        </div>
         <div class="visual-row">
           <span>模式</span>
           <div class="segmented segmented-sm" id="visualMode" role="group" aria-label="图文笔记模式">
@@ -659,6 +679,7 @@
           <li data-step="sample"><i></i><span>采样关键帧</span></li>
           <li data-step="ocr"><i></i><span>本地 OCR</span></li>
           <li data-step="vlm"><i></i><span>画面理解</span></li>
+          <li data-step="translate"><i></i><span>多模型翻译</span></li>
           <li data-step="summary"><i></i><span>生成总结</span></li>
           <li data-step="save"><i></i><span>保存笔记</span></li>
         </ol>
@@ -672,7 +693,7 @@
         <span class="muted" id="visualFootHint">默认仅 OCR（快）；VLM 默认关闭</span>
         <span class="spacer"></span>
         <button id="btnVisualCancel" class="btn btn-ghost btn-sm" type="button" hidden>取消</button>
-        <button id="btnVisualStart" class="btn btn-primary" type="button">开始生成</button>
+        <button id="btnVisualStart" class="btn btn-primary" type="button">开始处理</button>
       </footer>
     </div>
   </div>

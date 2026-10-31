@@ -5,6 +5,7 @@
 //  形态：LSUIElement 菜单栏 App（无 Dock 图标），抓取系统/应用音频（ScreenCaptureKit）
 //        -> 本地 livedub 引擎（ws://127.0.0.1:8787/ws）
 //        -> 置顶双语字幕浮层 + 中文配音。
+//  打开 App 时会拉起本机引擎（已在跑则复用）。--simulate / --self-test 不拉起。
 //
 //  v0.4：全局 ⌥N「快捷笔记」——把当前双语字幕 + 时间戳 +（可选）屏幕截图
 //        记进本地引擎 Notes API（失败进离线队列，重连后自动补发）。
@@ -62,7 +63,9 @@ struct LaunchOptions {
       --self-test           headless 自检（协议字节布局 / hello / 事件解析 / 字幕排版），退出码 0/1
       -h, --help            显示本帮助并退出
 
-    正常模式从菜单栏「开始同传」启动；首次使用需在 系统设置 → 隐私与安全性 → 屏幕录制 授权。
+    正常模式打开 App 就会拉起本机引擎（127.0.0.1:8787）；引擎已在跑则复用。
+    退出 App 只关闭自己拉起的引擎。--simulate / --self-test 不会拉起。
+    同传仍从菜单栏「开始同传」启动；首次使用需在 系统设置 → 隐私与安全性 → 屏幕录制 授权。
     构建：bash scripts/build-macos.sh --check
     """
 
@@ -232,6 +235,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var lastVisualContextText: String?
     private var visualContextStartToastShown = false
     private var engineConnectionState: EngineConnectionState = .disconnected
+    private var engineBootDetail = ""
+    private let engineSupervisor = LocalEngineSupervisor()
 
     // v0.7 视觉重设计 / 设置窗口
     private var settingsController: SettingsWindowController?
@@ -288,11 +293,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         if options.simulate {
+            engineBootDetail = "模拟模式，未拉起"
             startSimulation()
-        } else if options.autoStart || settings.autoStart {
-            startSession()
+        } else {
+            bootLocalEngine()
+            if options.autoStart || settings.autoStart {
+                startSession()
+            }
         }
         refreshMenu()
+    }
+
+    /// 打开 App 就拉起本机引擎。模拟模式走上面的分支，不会进这里。
+    private func bootLocalEngine() {
+        engineBootDetail = "正在启动…"
+        engineSupervisor.onLog = { [weak self] message in
+            DispatchQueue.main.async { self?.log(message) }
+        }
+        engineSupervisor.ensureRunning(engineURL: settings.engineURL, simulate: false) { [weak self] outcome in
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.engineBootDetail = outcome.detail
+                self.refreshMenu()
+                self.log("[engine-boot] \(outcome.detail)")
+            }
+        }
     }
 
     func applicationWillTerminate(_ notification: Notification) {
@@ -308,6 +333,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         capture?.stop()
         engine?.stop()
         dubPlayer?.stop()
+        engineSupervisor.stopIfOwned()
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
@@ -425,7 +451,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             vlmAvailable: visionStatus?.vision.available,
             visualContextEnabled: visualContextEnabledForRun
         )
-        engineMenuItem?.title = "引擎：\(settings.engineURL)"
+        engineMenuItem?.title = EngineLaunchPlanner.menuTitle(detail: engineBootDetail, engineURL: settings.engineURL)
         visionSummaryItem?.title = visionStatus?.summaryText ?? "视觉：检测中…"
         toggleMenuItem?.title = MenuDesign.startStopTitle(isRunning: isRunning || isSimulating)
         toggleMenuItem?.image = NSImage(
@@ -884,6 +910,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         lines.append("livedub macOS app（v0.7）")
         lines.append("状态：\(currentStatus)")
         lines.append("引擎地址：\(settings.engineURL)")
+        if !engineBootDetail.isEmpty {
+            lines.append("引擎启动：\(engineBootDetail)")
+        }
         if let engine {
             let stats = engine.stats
             lines.append("连接：\(stats.state.displayText) · 丢帧 \(stats.droppedAudioFrames)")

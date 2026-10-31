@@ -437,8 +437,9 @@ test('pipeline: visual-context 传给翻译器（top-level 参数）+ 去重/TTL
   await feedAudio(session, 5200);
   await recorder.waitFor((e) => e.type === 'translation' && e.id === 1 && e.final, { label: 'translation' });
   assert.ok(calls.length >= 1, 'translator 应被调用');
-  assert.equal(calls[0].visualContext, 'Gradient Descent · learning rate 学习率');
-  assert.equal(calls[0].visualContextAtMs, 1000);
+  assert.equal(calls[0].visualContext, undefined);
+  const glossarySrc = (calls[0].glossary ?? []).map((term) => term.src).join('\n');
+  assert.match(glossarySrc, /learning rate/);
   assert.equal(session.stats().visualContext.used >= 1, true);
 
   // seek 后旧画面上下文作废
@@ -451,5 +452,63 @@ test('pipeline: visual-context 传给翻译器（top-level 参数）+ 去重/TTL
   session._configForTest = null;
   session.config.visual = { contextTtlMs: 1 };
   assert.equal(session.stats().visualContext.hasContext, false);
+  await session.close('done');
+});
+
+test('pipeline: next translation starts before previous TTS finishes, dub stays in sentence order', async () => {
+  const starts = [];
+  let ttsEntered = 0;
+  let ttsFinished = 0;
+  let releaseFirst;
+  const firstGate = new Promise((resolve) => {
+    releaseFirst = resolve;
+  });
+  const { session, recorder } = await openCustomSession({}, (config) => ({
+    ...makeDeps(config),
+    createAsr: ({ onEvent }) => {
+      let fired = false;
+      return {
+        name: 'two-finals',
+        async push() {
+          if (fired) return;
+          fired = true;
+          onEvent({ type: 'final', text: 'First sentence about gradient descent.', t0Ms: 0, t1Ms: 1000, lang: 'en' });
+          onEvent({ type: 'final', text: 'Second sentence about learning rate.', t0Ms: 1000, t1Ms: 2000, lang: 'en' });
+        },
+        async flush() {},
+        async close() {},
+      };
+    },
+    createTranslator: () => ({
+      name: 'timed-translator',
+      translate({ text }) {
+        starts.push(text);
+        const zh = String(text).startsWith('First') ? '第一句讲梯度下降。' : '第二句讲学习率。';
+        return Promise.resolve({ text: zh });
+      },
+    }),
+    createTts: () => ({
+      name: 'blocking-tts',
+      async synthesize() {
+        ttsEntered += 1;
+        if (ttsEntered === 1) await firstGate;
+        ttsFinished += 1;
+        return { pcm: Buffer.alloc(4800), sampleRate: 24000 };
+      },
+    }),
+  }));
+  await recorder.waitFor((e) => e.type === 'ready', { label: 'ready' });
+  session.onAudio(silencePcm(100, SAMPLE_RATE), 0);
+  await sleep(40);
+  assert.equal(starts.length, 2, '第二句翻译应在第一句 TTS 结束前已经开始');
+  assert.equal(ttsFinished, 0, '此时第一句 TTS 仍被挡住');
+  assert.ok(ttsEntered >= 1);
+  releaseFirst();
+  await recorder.waitFor((e) => e.type === 'dub' && e.id === 2 && e.final, { label: 'dub 2 final' });
+  const ids = recorder.of('dub').map((event) => event.id);
+  for (let i = 1; i < ids.length; i += 1) assert.ok(ids[i] >= ids[i - 1], `配音 id 应非递减：${ids.join(',')}`);
+  const firstOf2 = ids.indexOf(2);
+  const lastOf1 = ids.lastIndexOf(1);
+  assert.ok(lastOf1 >= 0 && firstOf2 > lastOf1, `id 1 的配音应全部早于 id 2：${ids.join(',')}`);
   await session.close('done');
 });

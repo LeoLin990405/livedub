@@ -87,6 +87,8 @@ import {
   desktopAppInstructions,
   isEditableTarget,
   mergeSettingsSnapshot,
+  canStartPlayback,
+  defaultVoiceLabel,
   normalizeAsrEngine,
   normalizeSubsStyle,
   normalizeTheme,
@@ -1180,6 +1182,27 @@ test('UI 设置注入下一次会话 overrides：asr/tts/dub 生效，客户端 
 });
 
 test('UI 纯函数（v0.3）：ASR 标签/隐私文案/桌面 App 引导/设置补丁', () => {
+  assert.equal(canStartPlayback({ sessionReady: true, asrReady: false }), false);
+  assert.equal(canStartPlayback({ sessionReady: false, asrReady: true }), false);
+  assert.equal(canStartPlayback({ sessionReady: true, asrReady: true }), true);
+  assert.equal(defaultVoiceLabel({ mode: 'preset' }), '讲师男声');
+  assert.equal(defaultVoiceLabel({ mode: 'clone', degraded: true, voiceId: 'clone-1' }), '讲师男声');
+  assert.equal(defaultVoiceLabel({ mode: 'clone', voiceId: '' }), '讲师男声');
+  assert.equal(defaultVoiceLabel({ mode: 'clone', degraded: false, voiceId: 'clone-1' }), '');
+  const appSource = fs.readFileSync(new URL('../studio/app.mjs', import.meta.url), 'utf8');
+  const htmlSource = fs.readFileSync(new URL('../studio/index.html', import.meta.url), 'utf8');
+  const readme = fs.readFileSync(new URL('../README.md', import.meta.url), 'utf8');
+  const roadmap = fs.readFileSync(new URL('../docs/ROADMAP.md', import.meta.url), 'utf8');
+  const providers = fs.readFileSync(new URL('../docs/PROVIDERS.md', import.meta.url), 'utf8');
+  assert.match(appSource, /canStartPlayback/);
+  assert.match(appSource, /asrReady/);
+  assert.match(htmlSource, /讲师男声/);
+  assert.match(readme, /讲师男声/);
+  assert.doesNotMatch(roadmap, /幻灯片 OCR 作为翻译上下文（v0\.5 已能抽帧\+OCR，下一步接入翻译 prompt）/);
+  assert.doesNotMatch(providers, /规划/);
+  assert.doesNotMatch(providers, /🚧/);
+  assert.match(providers, /火山语音复刻 \| openspeech `S_` 音色 \/ 复刻接口（v3 已实现）/);
+  assert.match(providers, /讲师男声/);
   assert.equal(ASR_ENGINE_OPTIONS.length, 2);
   assert.deepEqual(
     ASR_ENGINE_OPTIONS.map((engine) => engine.id),
@@ -1775,11 +1798,14 @@ function makeFakeVisionService(overrides = {}) {
           : {}),
       };
     },
-    async summarize({ title, transcript, visuals }) {
+    async summarize(input) {
       calls.summarize += 1;
+      service.lastSummarize = input;
+      const { title, transcript, visuals } = input;
       return {
         summary: `《${title}》共 ${transcript.length} 句字幕、${visuals.length} 个画面：讲了梯度下降与学习率。`,
         keyPoints: ['梯度下降沿反方向更新参数', '学习率控制步长'],
+        links: [{ relation: 'speech_explains_visual', evidence: 'learning rate', cause: 'learning rate controls', effect: 'The Learning Rate' }],
         provider: 'fake-summary',
         model: 'fake-summary-model',
         ms: 55,
@@ -1914,6 +1940,11 @@ test('vision API：注入 fake service 的 OCR / analyze / summarize / health + 
     assert.equal(result.data.keyPoints.length, 2);
     assert.equal(result.data.provider, 'fake-summary');
     assert.equal(result.data.model, 'fake-summary-model');
+    assert.equal(result.data.links.length, 1);
+    assert.equal(result.data.links[0].relation, 'speech_explains_visual');
+    result = await notesApi(srv, 'POST', '/api/vision/summarize', { ...summarizeBody, provider: 'minimax' });
+    assert.equal(result.status, 200);
+    assert.equal(fake.lastSummarize.provider, 'minimax');
     for (const [label, body] of [
       ['unknown field', { ...summarizeBody, secret: 'x' }],
       ['bad transcript', { title: 'x', transcript: 'nope' }],

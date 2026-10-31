@@ -22,7 +22,7 @@
 | TTS | `macos-say` | 系统 `say`（Tingting 等），无 Key 兜底 | ✅ |
 | TTS | `mock` | 正弦波测试音 | ✅ |
 | 声音克隆 | `minimax`（pay-as-you-go） | `/v1/files/upload` + `/v1/voice_clone` | ⚠️ Token Plan 返回 2061，自动降级 |
-| 声音克隆 | 火山语音复刻（规划） | openspeech `S_` 音色 / 复刻接口 | 🚧 需要语音控制台 UUID Key |
+| 声音克隆 | 火山语音复刻 | openspeech `S_` 音色 / 复刻接口（v3 已实现） | ✅ 需要豆包语音 UUID Key，否则使用讲师男声 |
 
 > 火山方舟 **Agent Plan 的 ark- Key 不能调用 openspeech 语音服务**（实测 401/45000030）。云端语音识别/克隆请使用火山「豆包语音」控制台的 Key，或继续用本地 whisper + MiniMax TTS。
 
@@ -77,10 +77,10 @@
 
 要求：音频 10s–5min、mp3/m4a/wav、≤20MB。教学视频里讲师声音稳定，通常 12–20s 就够。
 
-### 4.2 火山语音复刻（规划中）
+### 4.2 火山语音复刻（已实现，需要豆包语音 UUID Key）
 
-需要「豆包语音控制台 → API Key 管理」的 **UUID Key**（不是方舟 ark- Key），以及控制台里已复刻的音色 ID（`S_` 开头）。
-livedub 的 TTS 适配器层已按「克隆 provider 可插拔」设计，接入时新增一个 provider 即可。
+v3 适配器已经接上（TTS 与 `voice_clone`）。需要「豆包语音控制台 → API Key 管理」的 **UUID Key**（不是方舟 ark- Key），以及控制台里已复刻的音色 ID（`S_` 开头）。
+没有这把 Key 时克隆不会成功，界面使用预设音色「讲师男声」。
 
 ### 4.3 没有克隆能力时的降级策略
 
@@ -88,9 +88,11 @@ livedub 的 TTS 适配器层已按「克隆 provider 可插拔」设计，接入
 - `voiceMode: "preset"`：完全不尝试克隆（最省额度、最快）；
 - 克隆失败只尝试一次并记住原因，不会每句重试。
 
-## 5. 云端 ASR（MiniMax，v0.3 新增）
+## 5. 云端 ASR
 
-本地 whisper 是默认（离线、免费）。v0.3 新增 **MiniMax 云端 ASR**，用同一个 `providers.minimax` Key 即可，实测更快：
+本地 whisper 是默认（离线、免费）。`LIVEDUB_PROFILE=cloud` 使用 **一条流式识别器**（`asr.provider = stream-cloud`）：音频一边到达一边上传，服务端可以回 partial；连接失败或中途断开时，同一会话继续用本地 whisper（`asr.fallback`），不把会话关掉。不配置 `asr.streamCloud.url` 时也会走这条降级。
+
+更早的 **MiniMax 云端 ASR**（`minimax-cloud`，整段上传）仍然保留，用同一个 `providers.minimax` Key。它不是云端档的默认识别器。历史实测：
 
 | 音频长度 | 整段转写耗时（含上传/网络） |
 |---|---|
@@ -98,9 +100,9 @@ livedub 的 TTS 适配器层已按「克隆 provider 可插拔」设计，接入
 | 12s | ~1.0–1.2s |
 
 - 接口：`POST https://api.minimaxi.com/v1/speech_to_text`，multipart `model=asr-1.0` + WAV 16k mono；`stream=true` 时 SSE 增量
-- 使用：`npm run start:cloud` / `npm run batch:cloud`（等价 `LIVEDUB_PROFILE=cloud`）
-- 隐私：**云端 ASR 会把音频上传到 MiniMax**；工作台会显示隐私提示。失败自动降级本地 whisper（`asr.fallback`）
-- 不支持音频流式输入：由客户端 VAD 切句后整段上传，因此最终延迟 ≈ VAD 静音判定 + 一次上传/识别
+- 云端档：`npm run start:cloud` / `npm run batch:cloud`（等价 `LIVEDUB_PROFILE=cloud`），走 `stream-cloud`
+- `minimax-cloud` 仍是整段上传：由本地 VAD 切句后一次上传，最终延迟 ≈ VAD 静音判定 + 一次识别
+- 隐私：流式档和 MiniMax 档都会把音频上传；失败时同一会话降级本地 whisper（`asr.fallback`）
 
 > 想完全离线就保持默认档；想让延迟更低且能接受音频上云就用 cloud 档。
 
@@ -142,7 +144,7 @@ livedub 的 TTS 适配器层已按「克隆 provider 可插拔」设计，接入
 |---|---|---|---|---|
 | 质量档（默认） | `npm start` | 本地 whisper large | ~3.0s | 离线、术语准确 |
 | 快速档 | `npm run start:fast` | 本地 whisper small | ~2.4s | 离线、低延迟 |
-| 云端档 | `npm run start:cloud` | MiniMax 云端 ASR | 见 docs/MEASUREMENTS.md | 低延迟、可接受音频上云 |
+| 云端档 | `npm run start:cloud` | `stream-cloud`（流式 partial，失败降级本地 whisper） | 不把旧的上传 ASR 数字算到这条新链路上 | 可接受音频上云 |
 
 `config/livedub.fast.json` / `config/livedub.cloud.json` 是档位覆盖文件（`LIVEDUB_PROFILE` 叠加）。
 

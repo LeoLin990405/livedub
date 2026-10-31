@@ -23,6 +23,7 @@
 ```
 
 零 npm 依赖：WS 服务端（`engine/ws.mjs`）、HTTP、音频处理、SSE 解析全部用 Node 内置能力实现。
+课程页解析在 `engine/page/parse.mjs`：工作台把课程页交给本地引擎抓取，浏览器不直接请求外站。YouTube / B 站只取带时间轴的字幕。
 
 ## 2. 时间轴约定（实时性的基础）
 
@@ -137,8 +138,8 @@
 - 新 provider `minimax-cloud`（`engine/asr/minimax-cloud.mjs`）：仍用本地 VAD 切句，每个 final 段上传 WAV（16k mono）到
   `POST /v1/speech_to_text`（multipart `model=asr-1.0`，可选 `language` header），解析 `{ text }`。
 - 延迟：4s 音频 ≈0.79s、12s ≈1.0–1.2s（含上传/网络），比本地 whisper 的 ~1.4s 快。
-- **隐私**：音频会上传。默认档仍是本地 whisper；云端档需显式 `LIVEDUB_PROFILE=cloud` / `npm run start:cloud`，工作台显示隐私提示。
-- 失败降级：网络/401/超时/空文本 → 本段自动切 `asr.fallback`（本地 whisper 懒创建），连续失败熔断；云端可用时后台可预热本地兜底。
+- **隐私**：音频会上传。默认档仍是本地 whisper。`LIVEDUB_PROFILE=cloud` 现在指向 `stream-cloud`（一条流式识别，失败后同一会话降级本地 whisper）。`minimax-cloud` 仍是上面的整段上传 provider。
+- 失败降级：网络/401/超时/空文本 → 本段自动切 `asr.fallback`（本地 whisper 懒创建），连续失败熔断；云端可用时后台可预热本地兜底。流式识别器断开时同样降级，并且不结束会话。
 
 ### 10.2 火山引擎 TTS + 声音复刻 v3（真正原声克隆）
 

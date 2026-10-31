@@ -23,7 +23,7 @@ macOS 悬浮窗重设计 + 设置窗口。设计规范见 [docs/DESIGN.md](docs/
 **v0.4**：学习笔记（Notes API / 工作台笔记抽屉 / 扩展 `Alt+Shift+N` / macOS `⌥N` / CLI / Markdown·Obsidian 导出）。
 **v0.3**：云端 ASR（MiniMax，e2e ~2.2s）、火山 TTS+声音复刻、macOS 桌面悬浮窗、全局限定压音/裸视频全屏。
 详见 [CHANGELOG](CHANGELOG.md)。
-> 形态：Chrome 扩展（任意网页视频） + 本地工作台（本地课程文件 / 回放 / 导出）。
+> 形态：Chrome 扩展（任意网页视频） + 本地工作台（本地课程文件 / 课程页字幕 / 回放 / 导出）。
 
 ```text
 YouTube / B站 / 网课页面       本地引擎 (127.0.0.1)               输出
@@ -50,7 +50,7 @@ YouTube / B站 / 网课页面       本地引擎 (127.0.0.1)               输�
 |---|---|---|
 | ASR | 本地 `whisper-server`（large-v3-turbo q5，常驻进程） | 29.4s 音频热推理 **≈1.4s**（RTF≈0.05），离线、不上传声音 |
 | 翻译 | OpenAI 兼容流式 LLM，默认 `deepseek-flash`，可配置 failover 链 | 首字 **≈1.0s** |
-| TTS | MiniMax `speech-2.8-hd` 流式（PCM），默认男声讲师音色 | 短句首包 **≈1.1–1.5s** |
+| TTS | MiniMax `speech-2.8-hd` 流式（PCM），克隆未成功时默认音色是讲师男声 | 短句首包 **≈1.1–1.5s** |
 | 音色克隆 | 火山声音复刻 v3 / MiniMax / 自动降级 preset | 协议已实现（火山需豆包语音 UUID Key，目前本机无此 Key，真机验证了 401→降级路径）；MiniMax Token Plan 返回 2061 自动降级 |
 | 云端 ASR | MiniMax `asr-1.0`（`npm run start:cloud`） | 4s≈0.79s / 12s≈1.0-1.2s；**云端档 e2e ≈2.2–2.4s**，音频会上传、失败自动降级本地 |
 | 学习笔记 | 时间戳 + 双语引用 + 截图 + 代码块 + 大纲；三端快捷记录（工作台 `N`、扩展 `Alt+Shift+N`、桌面 `⌥N`、CLI） | 笔记只落本机 `data/notes/`，导出 Markdown 可直接进 Obsidian（见 [docs/NOTES.md](docs/NOTES.md)） |
@@ -130,7 +130,8 @@ npm start                   # 或 npm run studio（会打开浏览器）
 # 打开 http://127.0.0.1:8787/studio/
 ```
 
-选择一个本地课程视频 → 开始播放 → 你会看到双语字幕、听到中文配音、原声自动压低。
+选择一个本地课程视频，或粘贴课程页 / 直接视频地址 → 开始播放 → 你会看到双语字幕、听到中文配音、原声自动压低。
+直接的 mp4 / webm / mp3 会进播放器。YouTube、B 站和带字幕的网页会解析出标题和带时间轴的字幕（观看页本身的视频文件不会被当成可播放地址；配音仍用扩展抓标签页声音）。
 工作台还提供：延迟 HUD、术语表编辑、音色模式、导出双语 SRT。
 
 ### 3. Chrome 扩展（看任意网页视频）
@@ -247,6 +248,7 @@ livedub/
 │   ├── asr/                流式 ASR（本地 whisper-server / mock）
 │   ├── segmenter.mjs       VAD 切分/滚动 partial
 │   ├── translate/          增量翻译（流式 LLM、术语、上下文、failover）
+│   ├── page/parse.mjs      课程页：标题 / 直接视频 / 带时间轴字幕
 │   ├── subtitles.mjs       SRT / 双语排版 / CPS
 │   ├── tts/                TTS（MiniMax 流式 / macOS say / mock）
 │   ├── voice.mjs           克隆优先 → 自动降级

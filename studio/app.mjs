@@ -19,8 +19,25 @@ import {
   shouldSendVisualContext,
 } from './context-kit.mjs';
 import {
+  availableCourseModels,
+  formatTranslationMarkdown,
+  mergeCausalVotes,
+  mergeNoteDrafts,
+  planCourseRun,
+  translateSubtitleCues,
+} from './jobs-kit.mjs';
+import {
+  chooseSubtitleTrack,
+  cuesForSession,
+  isDirectMediaUrl,
+  isLoadableVideo,
+} from './page-kit.mjs';
+import {
+  applyModelCausalLinks,
   buildVisualNoteMarkdown,
   collectTranscript,
+  formatCausalBullet,
+  linkSpeechAndVisuals,
   contactSheetLayout,
   changedPixelRatio,
   extractImageUrls,
@@ -77,6 +94,8 @@ import {
   asrEngineLabel,
   asrPrivacyCopy,
   buildSparkline,
+  canStartPlayback,
+  defaultVoiceLabel,
   desktopAppInstructions,
   isEditableTarget,
   mergeSettingsSnapshot,
@@ -145,6 +164,12 @@ const els = {
   visualMode: $('visualMode'),
   visualRange: $('visualRange'),
   visualVlm: $('visualVlm'),
+  jobTranslate: $('jobTranslate'),
+  jobNotes: $('jobNotes'),
+  jobCausal: $('jobCausal'),
+  courseSource: $('courseSource'),
+  courseSourceRow: $('courseSourceRow'),
+  courseModels: $('courseModels'),
   visualPlan: $('visualPlan'),
   visualProgress: $('visualProgress'),
   visualProgressBar: $('visualProgressBar'),
@@ -319,6 +344,7 @@ const state = {
   helloSent: false,
   sessionActive: false,
   sessionReady: false,
+  asrReady: false,
   reconnectAttempts: 0,
   reconnectTimer: null,
   maxEndMs: 0,
@@ -343,10 +369,13 @@ const state = {
   dock: { tab: 'subtitles', collapsed: false, mobileOpen: false },
   ui: { commandOpen: false, commandIndex: 0, commandResults: [], helpOpen: false, lightboxOpen: false },
   media: { name: '', url: '', objectUrl: null, isFile: false, size: null },
+  pageCues: [],
+  page: null,
   // v0.4：当前视频身份（Notes API 的 VideoRef 基础）+ 学习笔记状态
   video: null,
   vision: { available: null, health: null, checkedAt: null, checking: false },
-  visual: { open: false, running: false, cancelled: false, sampling: false, phase: 'idle', debug: {}, mode: 'single', range: 'rest', vlm: false, abort: null, lastError: null },
+  visual: { open: false, running: false, cancelled: false, sampling: false, phase: 'idle', debug: {}, mode: 'single', range: 'rest', vlm: false, translateSource: 'video', plan: null, abort: null, lastError: null },
+  course: { liveChain: null },
   obsidian: {
     loaded: false,
     loading: false,
@@ -586,6 +615,7 @@ async function loadEngineInfo() {
       state.config = payload.config ?? null;
       const config = state.config;
       if (config) {
+        renderCourseModels();
         if (!state.settings.voiceMode) state.settings.voiceMode = config.tts?.voiceMode ?? 'clone-first';
         if (!state.settings.glossaryText && Array.isArray(config.glossary) && config.glossary.length > 0) {
           state.settings.glossaryText = config.glossary.map((term) => `${term.src}=${term.dst}`).join('\n');
@@ -690,6 +720,7 @@ function connect({ silent = false } = {}) {
     state.wsReady = false;
     state.helloSent = false;
     state.sessionReady = false;
+    state.asrReady = false;
     state.sending = false;
     updateSessionButtons();
     els.captureChip.dataset.on = 'false';
@@ -737,6 +768,9 @@ function sendHello() {
   const terms = parseGlossaryText(els.glossaryInput.value);
   const overrides = {};
   if (state.settings.voiceMode) overrides.tts = { voiceMode: state.settings.voiceMode };
+  if (Array.isArray(state.course.liveChain) && state.course.liveChain.length > 0) {
+    overrides.translate = { provider: state.course.liveChain[0], chain: state.course.liveChain.slice() };
+  }
   const payload = {
     type: 'hello',
     protocol: 1,
@@ -818,6 +852,7 @@ function handleEngineEvent(event) {
 
 function onReady(event) {
   state.sessionReady = true;
+  state.asrReady = event.asrReady !== false;
   state.providers = event.providers ?? null;
   state.sessionProviders = event.providers ?? null;
   renderAsrEngine();
@@ -829,17 +864,22 @@ function onReady(event) {
   setBadge('ok', '已连接');
   if (event.limits?.langFrom) updateSessionLangs(event.limits.langFrom, event.limits.langTo);
   logEvent('session', `会话就绪 ${event.sessionId ?? ''}`, 'ok');
-  if (state.sessionActive) beginStreaming();
+  if (state.sessionActive && canStartPlayback({ sessionReady: state.sessionReady, asrReady: state.asrReady })) beginStreaming();
+  else if (state.sessionActive) logEvent('session', '会话已连接，等待语音识别就绪后再播放', 'mt');
   else toast('引擎已就绪，点击「开始同传」即可开始', 'ok', 3000);
 }
 
 function onStatus(event) {
+  if (event.asrReady === true || event.detail === 'asr-ready') state.asrReady = true;
   const meta = STATUS_META[event.state] ?? { tone: 'ok', label: String(event.state ?? '未知') };
   state.status = event.state;
   setSessionState(meta.label, meta.tone);
   setBadge(meta.tone, meta.label);
   if (event.detail) logEvent('status', event.detail, meta.tone === 'err' ? 'err' : 'mt');
   else logEvent('status', meta.label, meta.tone === 'err' ? 'err' : 'mt');
+  if (state.sessionActive && !state.sending && canStartPlayback({ sessionReady: state.sessionReady, asrReady: state.asrReady })) {
+    beginStreaming();
+  }
 }
 
 function onPartial(event) {
@@ -961,7 +1001,8 @@ async function startSession() {
   }
 
   if (state.sessionReady && state.wsReady) {
-    beginStreaming();
+    if (canStartPlayback({ sessionReady: state.sessionReady, asrReady: state.asrReady })) beginStreaming();
+    else toast('正在等待语音识别就绪…', 'info', 4000);
     return;
   }
   if (!state.ws || state.ws.readyState !== WebSocket.OPEN) connect();
@@ -970,6 +1011,7 @@ async function startSession() {
 }
 
 function beginStreaming() {
+  if (!canStartPlayback({ sessionReady: state.sessionReady, asrReady: state.asrReady })) return;
   state.sending = true;
   state.audioSeconds = 0;
   state.lastSentTMs = -100;
@@ -994,6 +1036,7 @@ function stopSession({ silent = false } = {}) {
   if (!state.sessionActive) return;
   state.sessionActive = false;
   state.sessionReady = false;
+  state.asrReady = false;
   state.sending = false;
   state.lastSentTMs = -100;
   els.captureHint.hidden = true;
@@ -1055,7 +1098,32 @@ function resetMediaState() {
   clearTranscriptActive();
 }
 
+function clearPageCues() {
+  state.pageCues = [];
+  state.page = null;
+}
+
+function pageCueEndMs() {
+  let end = 0;
+  for (const cue of state.pageCues ?? []) end = Math.max(end, Number(cue.t1Ms) || 0);
+  return end;
+}
+
+function storePageCues(page) {
+  const track = chooseSubtitleTrack(page?.subtitles);
+  state.pageCues = cuesForSession(page);
+  state.page = {
+    url: String(page?.finalUrl || page?.url || ''),
+    title: String(page?.title || '').trim(),
+    site: page?.site || 'generic',
+    lang: track?.lang || '',
+    warning: String(page?.warning || ''),
+    cueCount: state.pageCues.length,
+  };
+}
+
 function setMedia(src, label, { isFile = false, objectUrl = null, size = null } = {}) {
+  clearPageCues();
   if (state.media.objectUrl) {
     try {
       URL.revokeObjectURL(state.media.objectUrl);
@@ -1092,20 +1160,115 @@ function loadMediaFromFile(file) {
   setMedia(url, file.name, { isFile: true, objectUrl: url, size: file.size });
 }
 
-function loadVideoUrl(url) {
-  const value = String(url ?? '').trim();
-  if (!value) {
-    toast('请输入视频 / 音频 URL', 'warn');
-    return;
+let pageLoadSeq = 0;
+
+function releaseMediaElement() {
+  if (state.media.objectUrl) {
+    try {
+      URL.revokeObjectURL(state.media.objectUrl);
+    } catch {
+      /* ignore */
+    }
   }
   try {
-    // 允许 http(s)/同源相对路径；其它协议直接拒绝
-    const parsed = new URL(value, location.href);
+    els.video.pause();
+    els.video.removeAttribute('src');
+    els.video.load();
+  } catch {
+    /* ignore */
+  }
+}
+
+function adoptPageWithoutMedia({ title, url }) {
+  releaseMediaElement();
+  state.media = { name: title || filenameFromUrl(url), url, objectUrl: null, isFile: false, size: null };
+  els.stage.classList.add('has-media');
+  els.stage.classList.remove('sim-stage');
+  els.videoLabel.lastElementChild.textContent = shorten(state.media.name, 40);
+  els.videoLabel.title = state.media.name;
+  els.btnPlay.disabled = true;
+  els.btnStopVideo.disabled = true;
+  els.seek.disabled = true;
+  els.urlInput.value = url;
+  els.emptyUrl.value = url;
+  resetMediaState();
+  onVideoChanged();
+  updatePlayButton();
+}
+
+function applyParsedPage(page) {
+  const cues = cuesForSession(page);
+  const video = (Array.isArray(page?.videos) ? page.videos : []).find((item) => isLoadableVideo(item)) ?? null;
+  const title = String(page?.title || '').trim();
+  const pageUrl = String(page?.finalUrl || page?.url || '');
+  if (video) {
+    setMedia(video.url, title || filenameFromUrl(video.url), { isFile: false });
+    storePageCues(page);
+    if (title && state.video) {
+      state.video.title = title;
+      state.media.name = title;
+      els.videoLabel.lastElementChild.textContent = shorten(title, 40);
+      els.videoLabel.title = title;
+      renderNotesAll();
+    }
+    setTranslateSource('video');
+    let crossOrigin = true;
+    try {
+      crossOrigin = new URL(video.url, location.href).origin !== location.origin;
+    } catch {
+      crossOrigin = true;
+    }
+    if (crossOrigin) toast('跨域视频无法读取画面，笔记和因果的截图不可用；同传和字幕可以', 'warn', 7000);
+    if (state.pageCues.length) toast(`已读入 ${state.pageCues.length} 条带时间轴的字幕`, 'ok');
+    else if (page?.warning) toast(page.warning, 'warn', 7000);
+    return;
+  }
+  if (cues.length > 0) {
+    adoptPageWithoutMedia({ title: title || '课程页面', url: pageUrl });
+    storePageCues(page);
+    if (state.video) state.video.durationMs = pageCueEndMs();
+    setTranslateSource('subtitles');
+    const warning = page?.warning ? ` ${page.warning}` : '';
+    toast(`已读入 ${cues.length} 条带时间轴的字幕，可以用「已有字幕」翻译。${warning}`.trim(), 'ok', 8000);
+    return;
+  }
+  toast(page?.warning || '没有从这一页解析出可播放的视频或带时间轴的字幕', 'warn', 7000);
+}
+
+async function loadVideoUrl(url) {
+  const value = String(url ?? '').trim();
+  if (!value) {
+    toast('请输入课程页或视频 URL', 'warn');
+    return;
+  }
+  let parsed;
+  try {
+    parsed = new URL(value, location.href);
     if (!['http:', 'https:'].includes(parsed.protocol)) throw new Error('只支持 http(s) 地址');
-    if (parsed.origin !== location.origin && !/^https?:$/.test(parsed.protocol)) throw new Error('协议不受支持');
-    setMedia(parsed.href, filenameFromUrl(parsed.href), { isFile: false });
   } catch (err) {
     toast(`URL 无效：${err.message}`, 'err');
+    return;
+  }
+  if (isDirectMediaUrl(parsed.href)) {
+    setTranslateSource('video');
+    setMedia(parsed.href, filenameFromUrl(parsed.href), { isFile: false });
+    return;
+  }
+  const seq = ++pageLoadSeq;
+  toast('正在解析页面…', 'info', 1600);
+  try {
+    const response = await fetch('/api/page/parse', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ url: parsed.href }),
+    });
+    const payload = await response.json().catch(() => ({}));
+    if (seq !== pageLoadSeq) return;
+    if (!response.ok || payload.ok === false) throw new Error(payload.message || `HTTP ${response.status}`);
+    applyParsedPage(payload);
+  } catch (err) {
+    if (seq !== pageLoadSeq) return;
+    toast(`页面解析失败：${err.message}`, 'err', 7000);
   }
 }
 
@@ -1135,6 +1298,10 @@ function updateTimeUi() {
 
 function videoPlayPause() {
   if (!els.video.src) return;
+  if (state.sessionActive && !canStartPlayback({ sessionReady: state.sessionReady, asrReady: state.asrReady })) {
+    toast('语音识别尚未就绪，请稍候再播放', 'warn');
+    return;
+  }
   if (els.video.paused) {
     els.video.play().catch((err) => toast(`播放失败：${err.message}`, 'err'));
   } else {
@@ -1971,13 +2138,16 @@ function applyVoice(info) {
   els.voiceId.title = state.voice.voiceId || '';
   const mode = state.voice.mode === 'clone' ? 'clone-first' : 'preset';
   setVoiceModeButtons(mode);
-  if (info.degraded && info.reason) {
-    els.voiceNote.textContent = `已降级：${info.reason}`;
-    els.voiceNote.title = String(info.reason);
-  } else if (state.voice.mode === 'clone') {
+  const label = defaultVoiceLabel({ mode: state.voice.mode, degraded: info.degraded, voiceId: state.voice.voiceId });
+  if (!label) {
     els.voiceNote.textContent = '已使用克隆音色';
+    els.voiceNote.title = '';
+  } else if (info.degraded && info.reason) {
+    els.voiceNote.textContent = `${label} · 已降级：${info.reason}`;
+    els.voiceNote.title = String(info.reason);
   } else {
-    els.voiceNote.textContent = '';
+    els.voiceNote.textContent = label;
+    els.voiceNote.title = label;
   }
   if (previous !== next) {
     logEvent('voice', `音色 ${state.voice.mode} / ${state.voice.voiceId}${info.degraded ? '（降级）' : ''}`, 'ok');
@@ -2001,7 +2171,7 @@ function setVoiceMode(mode) {
   if (state.serverReachable !== false && state.uiSettings?.ttsVoiceMode !== next) {
     void saveUiSettingsPatch({ tts: { voiceMode: next } }, { label: '音色模式' });
   }
-  els.voiceNote.textContent = next === 'clone-first' ? '克隆优先：会先尝试克隆讲师音色，失败自动降级并记住原因' : '预设音色：使用配置里的系统音色';
+  els.voiceNote.textContent = next === 'clone-first' ? '克隆优先：会先尝试克隆讲师音色，失败后使用讲师男声' : '预设音色：讲师男声';
   if (state.wsReady) {
     sendJson({ type: 'config', patch: { tts: { voiceMode: next } } });
     logEvent('voice', `切换音色模式：${next}（已通知引擎）`, 'mt');
@@ -2870,9 +3040,16 @@ function getSessionSegments() {
       translation: segment.translation,
     }));
   }
-  return [...state.segments.values()]
+  const live = [...state.segments.values()]
     .sort((a, b) => a.t0Ms - b.t0Ms)
     .map((segment) => ({ t0Ms: segment.t0Ms, t1Ms: segment.t1Ms, text: segment.text, translation: segment.translation }));
+  if (live.length > 0) return live;
+  return (state.pageCues ?? []).map((cue) => ({
+    t0Ms: cue.t0Ms,
+    t1Ms: cue.t1Ms,
+    text: cue.text,
+    translation: cue.translation ?? '',
+  }));
 }
 
 async function generateOutlineNote() {
@@ -2883,7 +3060,7 @@ async function generateOutlineNote() {
   }
   const segments = getSessionSegments().filter((segment) => segment.text || segment.translation);
   if (segments.length === 0) {
-    toast('还没有字幕可生成大纲：先播放视频并开启同传（或载入演示回放）', 'warn', 5200);
+    toast('还没有字幕可生成大纲：先播放并同传，或载入带字幕的课程页', 'warn', 5200);
     return;
   }
   const body = buildOutlineMarkdown({ video, segments, langFrom: 'en', langTo: 'zh' });
@@ -3001,12 +3178,12 @@ function renderVisionAvailability() {
   const visionAvailable = Boolean(state.vision.health?.visionAvailable);
   const ocrAvailable = Boolean(state.vision.health?.ocrAvailable);
   if (els.btnNotesVisual) {
-    els.btnNotesVisual.disabled = !state.video || !available;
+    els.btnNotesVisual.disabled = !state.video;
     els.btnNotesVisual.title = !state.video
       ? '先载入视频'
       : available
-        ? `抽取关键帧 + OCR/${visionAvailable ? 'VLM ' : ''}生成图文笔记（v0.5）`
-        : '视觉引擎未就绪：缺少 engine/vision/index.mjs 或 OCR 依赖（/api/vision 返回 503）';
+        ? '翻译、笔记、因果可以一起做'
+        : '视觉引擎未就绪时仍可只做翻译';
   }
   if (els.visualVlm) {
     els.visualVlm.disabled = !available || !visionAvailable;
@@ -3021,14 +3198,15 @@ function renderVisionAvailability() {
     els.visualVisionBadge.className = `tag ${available ? (visionAvailable ? 'ok' : '') : 'warn'}`.trim();
   }
   if (els.btnVisualStart) {
-    els.btnVisualStart.disabled = !available;
-    els.btnVisualStart.title = available ? '开始抽取关键帧并生成图文笔记' : '视觉引擎未就绪（/api/vision 返回 503）';
+    const blocked = visualStartBlocked();
+    els.btnVisualStart.disabled = blocked;
+    els.btnVisualStart.title = blocked ? '笔记和因果需要视觉引擎（/api/vision 返回 503）。可以只做翻译' : '按勾选的任务处理这段课';
   }
   if (els.visualFootHint) {
     els.visualFootHint.textContent = !available
-      ? '视觉引擎未就绪：图文笔记不可用（/api/vision 返回 503）'
+      ? '视觉引擎未就绪：笔记和因果先不可用，翻译可以做'
       : visionAvailable
-        ? '默认仅 OCR（快）；VLM 可选，慢且可能产生模型费用'
+        ? '视频语音按顺序备胎；已有字幕、笔记、因果会问过每个勾选的模型'
         : '默认仅 OCR（快）；VLM 未配置，无法开启';
   }
   renderVisualPlan();
@@ -3037,7 +3215,7 @@ function renderVisionAvailability() {
 function visualDurationMs() {
   if (Number.isFinite(els.video.duration) && els.video.duration > 0) return Math.round(els.video.duration * 1000);
   if (state.sim.parsed && state.sim.maxMs > 0) return state.sim.maxMs;
-  return Math.max(1000, state.maxEndMs, Math.round((els.video.currentTime || 0) * 1000));
+  return Math.max(1000, state.maxEndMs, pageCueEndMs(), Math.round((els.video.currentTime || 0) * 1000));
 }
 
 function computeVisualRange() {
@@ -3099,6 +3277,15 @@ function renderVisualPlan() {
   } else {
     parts.splice(2, 0, `最多 ${options.maxFrames} 个关键帧`);
   }
+  const plan = readCoursePlan();
+  const jobs = [
+    plan.jobs.translate ? (plan.translateSource === 'subtitles' ? '翻译已有字幕' : '翻译视频语音') : '',
+    plan.jobs.notes ? '笔记' : '',
+    plan.jobs.causal ? '因果' : '',
+  ].filter(Boolean);
+  const modelText = (plan.liveChain ?? plan.models.translate).join(' → ');
+  parts.unshift(jobs.join(' + ') || '未选任务');
+  if (modelText) parts.push(plan.liveChain ? `同传备胎 ${modelText}` : `模型 ${modelText}`);
   els.visualPlan.textContent = parts.join(' · ');
 }
 
@@ -3128,6 +3315,8 @@ function openVisualModal() {
     button.dataset.active = String(active);
   }
   setVisualRange(state.visual.range);
+  renderCourseModels();
+  setTranslateSource(state.visual.translateSource);
   if (state.vision.checkedAt == null || Date.now() - state.vision.checkedAt > 30_000) void loadVisionHealth({ silent: false });
   else renderVisionAvailability();
 }
@@ -3342,17 +3531,279 @@ async function visionSummarize(payload, signal = null) {
   return await notesFetch('/api/vision/summarize', { method: 'POST', body: payload, signal });
 }
 
+function selectedCourseModels() {
+  if (!els.courseModels) return [];
+  return [...els.courseModels.querySelectorAll('input[type="checkbox"][data-model]')]
+    .filter((input) => input.checked)
+    .map((input) => input.dataset.model)
+    .filter(Boolean);
+}
+
+function readCoursePlan() {
+  const available = availableCourseModels(state.config);
+  const selected = selectedCourseModels();
+  const shared = selected.length ? selected : available;
+  return planCourseRun({
+    jobs: {
+      translate: els.jobTranslate ? els.jobTranslate.checked : true,
+      notes: els.jobNotes ? els.jobNotes.checked : true,
+      causal: els.jobCausal ? els.jobCausal.checked : true,
+    },
+    translateSource: state.visual.translateSource === 'subtitles' ? 'subtitles' : 'video',
+    models: shared,
+    availableModels: available.length ? available : shared,
+  });
+}
+
+function visualStartBlocked() {
+  const plan = readCoursePlan();
+  const needsVision = plan.jobs.notes || plan.jobs.causal;
+  if (!needsVision) return false;
+  return state.vision.available !== true;
+}
+
+function renderCourseModels() {
+  if (!els.courseModels) return;
+  const models = availableCourseModels(state.config);
+  const signature = models.join('|');
+  if (els.courseModels.dataset.signature === signature && els.courseModels.childElementCount > 0) return;
+  const previous = new Set(
+    [...els.courseModels.querySelectorAll('input[data-model]')].filter((input) => input.checked).map((input) => input.dataset.model),
+  );
+  const keep = previous.size > 0;
+  els.courseModels.replaceChildren();
+  els.courseModels.dataset.signature = signature;
+  if (models.length === 0) {
+    const empty = document.createElement('span');
+    empty.className = 'muted';
+    empty.textContent = '引擎配置里还没有翻译模型';
+    els.courseModels.append(empty);
+    return;
+  }
+  for (const name of models) {
+    const label = document.createElement('label');
+    label.className = 'toggle';
+    const input = document.createElement('input');
+    input.type = 'checkbox';
+    input.dataset.model = name;
+    input.checked = keep ? previous.has(name) : true;
+    const text = document.createElement('span');
+    text.textContent = name;
+    label.append(input, text);
+    els.courseModels.append(label);
+  }
+}
+
+function syncCourseForm() {
+  if (els.courseSourceRow) els.courseSourceRow.hidden = Boolean(els.jobTranslate && !els.jobTranslate.checked);
+  renderVisionAvailability();
+}
+
+function setTranslateSource(source) {
+  state.visual.translateSource = source === 'subtitles' ? 'subtitles' : 'video';
+  if (els.courseSource) {
+    for (const button of els.courseSource.querySelectorAll('button[data-source]')) {
+      const active = button.dataset.source === state.visual.translateSource;
+      button.setAttribute('aria-pressed', String(active));
+      button.dataset.active = String(active);
+    }
+  }
+  syncCourseForm();
+}
+
+async function beginVideoTranslation(plan) {
+  if (!plan.jobs.translate || plan.translateSource !== 'video') return;
+  state.course.liveChain = plan.models.translate.slice();
+  const chainText = plan.models.translate.join(' → ');
+  if (state.sim.active) {
+    toast('演示回放没有实时语音。翻译来源请改成「已有字幕」', 'warn', 5500);
+    return;
+  }
+  if (!plan.models.translate.length) {
+    toast('没有可用的翻译模型。请确认引擎配置里的 translate.chain', 'warn', 5500);
+    return;
+  }
+  if (state.sessionActive) {
+    toast(`同传已在进行。模型顺序 ${chainText} 从下次开始同传生效`, 'info', 5500);
+    return;
+  }
+  await startSession();
+  if (state.sessionActive) toast(`同传已开始。翻译按 ${chainText} 做备胎，第一家成功就用`, 'info', 6000);
+}
+
+async function translateRange(plan, segments, range, signal) {
+  const models = plan.models.translate;
+  if (!models.length) {
+    toast('没有可用的翻译模型。请确认引擎配置里的 translate.chain', 'warn', 5500);
+    return [];
+  }
+  const pool = segments.filter((segment) => segment.t1Ms >= range.startMs && segment.t0Ms <= range.endMs && String(segment.text ?? '').trim());
+  const cues = pool.slice(0, 40).map((segment) => ({
+    id: String(segment.t0Ms),
+    t0Ms: segment.t0Ms,
+    t1Ms: segment.t1Ms,
+    text: segment.text,
+  }));
+  if (pool.length > cues.length) toast(`字幕超过 ${cues.length} 句，这次只翻译前 ${cues.length} 句`, 'info', 5000);
+  if (cues.length === 0) return [];
+  setVisualProgress(`翻译已有字幕（${models.length} 个模型）…`, 70);
+  return translateSubtitleCues({
+    cues,
+    models,
+    signal,
+    translate: ({ text, provider, signal: inner }) => notesFetch('/api/translate', {
+      method: 'POST',
+      body: { text, provider },
+      signal: inner,
+    }),
+  });
+}
+
+function overlayTranslations(segments, cues) {
+  const byId = new Map((cues ?? []).filter((cue) => cue.text).map((cue) => [String(cue.t0Ms), cue.text]));
+  if (byId.size === 0) return segments;
+  return segments.map((segment) => {
+    const text = byId.get(String(segment.t0Ms));
+    return text ? { ...segment, translation: text } : segment;
+  });
+}
+
+async function summarizeCourseDrafts({ title, transcript, visuals, plan, signal }) {
+  const models = plan.jobs.notes ? plan.models.notes : plan.models.causal;
+  const targets = models.length ? models : [''];
+  const drafts = [];
+  const errors = [];
+  for (let index = 0; index < targets.length; index += 1) {
+    checkVisualCancel();
+    const provider = targets[index];
+    setVisualProgress(`总结 ${provider || '默认模型'}（${index + 1}/${targets.length}）…`, 78);
+    try {
+      const result = await visionSummarize({
+        title,
+        transcript,
+        visuals,
+        lang: 'zh',
+        ...(provider ? { provider } : {}),
+      }, signal);
+      drafts.push({
+        provider: String(result?.provider ?? provider ?? 'model'),
+        summary: String(result?.summary ?? ''),
+        keyPoints: Array.isArray(result?.keyPoints) ? result.keyPoints : [],
+        links: Array.isArray(result?.links) ? result.links : [],
+      });
+    } catch (error) {
+      if (state.visual.cancelled || error?.name === 'AbortError') throw error;
+      errors.push(`${provider || '模型'}：${error.message}`);
+    }
+  }
+  return { drafts, errors };
+}
+
+function courseNoteParts({ plan, drafts, frames, segments }) {
+  const merged = mergeNoteDrafts(drafts);
+  const deterministic = linkSpeechAndVisuals({ frames, segments });
+  const voted = plan.jobs.causal
+    ? mergeCausalVotes({
+      deterministic,
+      modelSets: drafts.map((draft) => ({ provider: draft.provider, links: draft.links })),
+    })
+    : [];
+  return {
+    summary: plan.jobs.notes ? merged.summary : '',
+    keyPoints: plan.jobs.notes ? merged.keyPoints : [],
+    includeNotes: plan.jobs.notes,
+    includeCausal: plan.jobs.causal,
+    causalLinks: plan.jobs.causal ? applyModelCausalLinks(deterministic, voted) : [],
+    extraNote: plan.jobs.translate && plan.translateSource === 'subtitles'
+      ? '译文由勾选的模型分别生成：说法一致时采用多数，对不上时采用主模型（列表第一个）。实时同传不在这里合并。'
+      : '',
+  };
+}
+
+function finishVisualButtons() {
+  if (!els.btnVisualStart) return;
+  els.btnVisualStart.disabled = visualStartBlocked();
+  els.btnVisualStart.textContent = '开始处理';
+  if (els.btnVisualCancel) els.btnVisualCancel.hidden = true;
+}
+
 // ---------------------------------------------------------- 图文笔记生成
+
+async function runSubtitleTranslation(plan, range) {
+  state.visual.running = true;
+  state.visual.cancelled = false;
+  state.visual.lastError = null;
+  state.visual.abort = new AbortController();
+  const signal = state.visual.abort.signal;
+  els.btnVisualStart.disabled = true;
+  els.btnVisualStart.textContent = '处理中…';
+  els.btnVisualCancel.hidden = false;
+  els.visualError.hidden = true;
+  els.visualProgress.hidden = false;
+  try {
+    const segments = getSessionSegments();
+    const cues = await translateRange(plan, segments, range, signal);
+    if (cues.length === 0) {
+      toast('范围内还没有字幕。先播放并同传，或载入带字幕的课程页', 'warn', 5500);
+      setVisualProgress('没有可翻译的字幕', 0);
+      return;
+    }
+    setVisualProgress('保存字幕翻译…', 90);
+    const markdown = formatTranslationMarkdown({ title: state.video.title, cues });
+    const payload = await notesFetch('/api/notes', {
+      method: 'POST',
+      signal,
+      body: {
+        video: currentVideoRef(),
+        tMs: range.startMs,
+        body: markdown,
+        kind: 'note',
+        tags: ['字幕翻译'],
+        source: 'studio',
+      },
+    });
+    if (!payload?.note) throw new Error('保存字幕翻译失败（响应缺少 note）');
+    await refreshNotes({ silent: true });
+    selectNote(payload.note.id);
+    await openNotesDrawer();
+    setVisualProgress('完成 ✓', 100);
+    toast(`字幕翻译已保存：${cues.length} 句，${plan.models.translate.length} 个模型`, 'ok', 6000);
+    notifyObsidianAutoSync();
+    setTimeout(() => closeVisualModal({ force: true }), 700);
+  } catch (error) {
+    if (state.visual.cancelled || error?.name === 'AbortError') {
+      setVisualProgress('已取消', 0);
+      toast('已取消字幕翻译', 'info');
+    } else {
+      els.visualError.hidden = false;
+      els.visualError.textContent = `翻译失败：${error.message}`;
+      setVisualProgress(`失败：${error.message}`, 0);
+      toast(`字幕翻译失败：${error.message}`, 'err', 7000);
+    }
+  } finally {
+    state.visual.running = false;
+    state.visual.abort = null;
+    finishVisualButtons();
+  }
+}
 
 async function runVisualPipeline() {
   if (state.visual.running) return;
-  if (state.visual.mode === 'chapters') return await runChaptersPipeline();
+  const plan = readCoursePlan();
+  state.visual.plan = plan;
+  if (!plan.jobs.translate && !plan.jobs.notes && !plan.jobs.causal) {
+    toast('请至少选择翻译、笔记、因果中的一项', 'warn');
+    return;
+  }
   if (!state.video) {
     toast('请先载入视频', 'warn');
     return;
   }
-  if (state.vision.available !== true) {
-    toast('视觉引擎未就绪：/api/vision 返回 503（需要 engine/vision/index.mjs 与本地 OCR 依赖）', 'warn', 6000);
+  await beginVideoTranslation(plan);
+  const framesNeeded = Boolean(plan.jobs.notes || plan.jobs.causal);
+  if (!plan.batchTranslate && !framesNeeded) return;
+  if (framesNeeded && state.vision.available !== true) {
+    toast('笔记和因果需要视觉引擎。/api/vision 返回 503 时，可以只做翻译', 'warn', 6500);
     return;
   }
   const range = computeVisualRange();
@@ -3360,6 +3811,11 @@ async function runVisualPipeline() {
     toast('范围太短（至少 1 秒），请切换范围或稍后再试', 'warn');
     return;
   }
+  if (!framesNeeded && plan.batchTranslate) {
+    await runSubtitleTranslation(plan, range);
+    return;
+  }
+  if (state.visual.mode === 'chapters') return runChaptersPipeline();
   const options = resolveKeyframeOptions(state.config);
   state.visual.running = true;
   state.visual.cancelled = false;
@@ -3369,7 +3825,7 @@ async function runVisualPipeline() {
   state.visual.abort = new AbortController();
   const signal = state.visual.abort.signal;
   els.btnVisualStart.disabled = true;
-  els.btnVisualStart.textContent = '生成中…';
+  els.btnVisualStart.textContent = '处理中…';
   els.btnVisualCancel.hidden = false;
   els.visualError.hidden = true;
   els.visualProgress.hidden = false;
@@ -3455,42 +3911,51 @@ async function runVisualPipeline() {
       if (vlmFailure) state.visual.lastError = `画面理解部分失败：${vlmFailure}`;
     }
 
-    // 3) 文本总结（字幕 + 画面文字 + 画面理解）
+    // 3) 已有字幕：每个模型都翻，再合并进笔记引用
+    const coursePlan = state.visual.plan ?? readCoursePlan();
+    let noteSegments = getSessionSegments();
+    if (coursePlan.batchTranslate) {
+      const cues = await translateRange(coursePlan, noteSegments, range, signal);
+      noteSegments = overlayTranslations(noteSegments, cues);
+      if (cues.length === 0) state.visual.lastError = state.visual.lastError ?? '范围内没有可翻译的字幕';
+    }
+
+    // 4) 笔记和因果：每个勾选的模型各总结一次，再合并
     state.visual.phase = 'summarize';
-    setVisualProgress('生成总结…', 78);
-    const segments = getSessionSegments();
-    const transcript = collectTranscript(segments, { startMs: range.startMs, endMs: range.endMs, limit: 200 });
+    const transcript = collectTranscript(noteSegments, { startMs: range.startMs, endMs: range.endMs, limit: 200 });
     const visuals = frames.map((frame) => ({
       tMs: frame.tMs,
       ocrText: frame.ocrText,
       ...(frame.caption ? { caption: frame.caption } : {}),
     }));
-    let summary = '';
-    let keyPoints = [];
-    try {
-      const result = await visionSummarize({ title: state.video.title, transcript, visuals, lang: 'zh' }, signal);
-      summary = String(result?.summary ?? '');
-      keyPoints = Array.isArray(result?.keyPoints) ? result.keyPoints : [];
-      state.visual.debug.summaryDone = true;
-    } catch (error) {
-      if (state.visual.cancelled || error?.name === 'AbortError') throw error;
-      state.visual.lastError = `总结失败（已保留 OCR 时间线）：${error.message}`;
+    let drafts = [];
+    if (coursePlan.jobs.notes || coursePlan.jobs.causal) {
+      const summarized = await summarizeCourseDrafts({ title: state.video.title, transcript, visuals, plan: coursePlan, signal });
+      drafts = summarized.drafts;
+      if (summarized.errors.length) state.visual.lastError = `总结部分失败（已保留成功的模型）：${summarized.errors.join('；')}`;
+      if (drafts.length > 0) state.visual.debug.summaryDone = true;
+      else if (!state.visual.lastError) state.visual.lastError = '总结失败（已保留 OCR 时间线）';
     }
+    const noteParts = courseNoteParts({ plan: coursePlan, drafts, frames, segments: noteSegments });
 
-    // 4) 组装 Markdown 并保存为 kind:'visual' 笔记
+    // 5) 组装 Markdown 并保存为 kind:'visual' 笔记
     state.visual.phase = 'save';
     setVisualProgress('组装并保存图文笔记…', 90);
     const markdown = buildVisualNoteMarkdown({
       title: state.video.title,
-      summary,
-      keyPoints,
+      summary: noteParts.summary,
+      keyPoints: noteParts.keyPoints,
       frames,
-      segments,
+      segments: noteSegments,
       range,
       langFrom: 'en',
       langTo: 'zh',
       generatedAt: new Date(),
       vlm: useVlm,
+      includeNotes: noteParts.includeNotes,
+      includeCausal: noteParts.includeCausal,
+      causalLinks: noteParts.includeCausal ? noteParts.causalLinks : null,
+      extraNote: noteParts.extraNote,
     });
     const payload = await notesFetch('/api/notes', {
       method: 'POST',
@@ -3500,7 +3965,10 @@ async function runVisualPipeline() {
         tMs: range.startMs,
         body: markdown,
         kind: 'visual',
-        tags: visualNoteTags({ vlm: useVlm, extra: ['OCR'] }),
+        tags: visualNoteTags({
+          vlm: useVlm,
+          extra: ['OCR', ...((coursePlan.jobs.notes || coursePlan.jobs.causal) && (coursePlan.models.notes.length > 1 || coursePlan.models.causal.length > 1) ? ['多模型'] : [])],
+        }),
         source: 'studio',
         ...(frames[0]?.imageUrl ? { imageUrl: frames[0].imageUrl } : {}),
       },
@@ -3542,9 +4010,7 @@ async function runVisualPipeline() {
     state.visual.running = false;
     state.visual.sampling = false;
     state.visual.abort = null;
-    els.btnVisualStart.disabled = state.vision.available !== true;
-    els.btnVisualStart.textContent = '开始生成';
-    els.btnVisualCancel.hidden = true;
+    finishVisualButtons();
     try {
       els.video.currentTime = Math.min(Number.isFinite(els.video.duration) ? els.video.duration : originalTime, originalTime);
     } catch {
@@ -3585,7 +4051,7 @@ async function runChaptersPipeline() {
   state.visual.abort = new AbortController();
   const signal = state.visual.abort.signal;
   els.btnVisualStart.disabled = true;
-  els.btnVisualStart.textContent = '生成中…';
+  els.btnVisualStart.textContent = '处理中…';
   els.btnVisualCancel.hidden = false;
   els.visualError.hidden = true;
   els.visualProgress.hidden = false;
@@ -3621,8 +4087,14 @@ async function runChaptersPipeline() {
       }
     }
     state.visual.sampling = false;
-    const segments = getSessionSegments();
-    const inRangeSegments = segments.filter((segment) => segment.t1Ms >= range.startMs && segment.t0Ms <= range.endMs);
+    const coursePlan = state.visual.plan ?? readCoursePlan();
+    let noteSegments = getSessionSegments();
+    if (coursePlan.batchTranslate) {
+      const cues = await translateRange(coursePlan, noteSegments, range, signal);
+      noteSegments = overlayTranslations(noteSegments, cues);
+      if (cues.length === 0) state.visual.lastError = state.visual.lastError ?? '范围内没有可翻译的字幕';
+    }
+    const inRangeSegments = noteSegments.filter((segment) => segment.t1Ms >= range.startMs && segment.t0Ms <= range.endMs);
     let chapters = computeChapters(inRangeSegments, candidates, {
       minGapMs: 2500,
       minChapterMs: 20000,
@@ -3712,38 +4184,44 @@ async function runChaptersPipeline() {
       }
 
       setVisualProgress(`${prefix} · 总结中…`, 80 + (chapterIndex / total) * 10);
-      const transcript = collectTranscript(segments, { startMs: chapter.startMs, endMs: chapter.endMs, limit: 200 });
+      const transcript = collectTranscript(noteSegments, { startMs: chapter.startMs, endMs: chapter.endMs, limit: 200 });
       const visuals = chapterFrames.map((frame) => ({
         tMs: frame.tMs,
         ocrText: frame.ocrText,
         ...(frame.caption ? { caption: frame.caption } : {}),
       }));
-      let summary = '';
-      let keyPoints = [];
-      try {
-        const result = await visionSummarize(
-          { title: `${state.video.title} · ${prefix} ${chapter.title}`, transcript, visuals, lang: 'zh' },
+      let drafts = [];
+      if (coursePlan.jobs.notes || coursePlan.jobs.causal) {
+        const summarized = await summarizeCourseDrafts({
+          title: `${state.video.title} · ${prefix} ${chapter.title}`,
+          transcript,
+          visuals,
+          plan: coursePlan,
           signal,
-        );
-        summary = String(result?.summary ?? '');
-        keyPoints = Array.isArray(result?.keyPoints) ? result.keyPoints : [];
-      } catch (error) {
-        if (state.visual.cancelled || error?.name === 'AbortError') throw error;
-        state.visual.lastError = state.visual.lastError ?? `第 ${chapterIndex + 1} 章总结失败（保留 OCR 时间线）：${error.message}`;
+        });
+        drafts = summarized.drafts;
+        if (summarized.errors.length && !state.visual.lastError) {
+          state.visual.lastError = `第 ${chapterIndex + 1} 章总结部分失败：${summarized.errors.join('；')}`;
+        }
       }
+      const noteParts = courseNoteParts({ plan: coursePlan, drafts, frames: chapterFrames, segments: noteSegments });
 
       const markdown = buildVisualNoteMarkdown({
         title: state.video.title,
-        summary,
-        keyPoints,
+        summary: noteParts.summary,
+        keyPoints: noteParts.keyPoints,
         frames: chapterFrames,
-        segments,
+        segments: noteSegments,
         range: chapterRange,
         chapter: { index: chapterIndex + 1, total },
         langFrom: 'en',
         langTo: 'zh',
         generatedAt: new Date(),
         vlm: useVlm,
+        includeNotes: noteParts.includeNotes,
+        includeCausal: noteParts.includeCausal,
+        causalLinks: noteParts.includeCausal ? noteParts.causalLinks : null,
+        extraNote: noteParts.extraNote,
       });
       const payload = await notesFetch('/api/notes', {
         method: 'POST',
@@ -3753,7 +4231,10 @@ async function runChaptersPipeline() {
           tMs: chapter.startMs,
           body: markdown,
           kind: 'visual',
-          tags: visualNoteTags({ vlm: useVlm, extra: ['章节', 'OCR'] }),
+          tags: visualNoteTags({
+            vlm: useVlm,
+            extra: ['章节', 'OCR', ...((coursePlan.jobs.notes || coursePlan.jobs.causal) && (coursePlan.models.notes.length > 1 || coursePlan.models.causal.length > 1) ? ['多模型'] : [])],
+          }),
           source: 'studio',
           ...(chapterFrames[0]?.imageUrl ? { imageUrl: chapterFrames[0].imageUrl } : {}),
         },
@@ -3823,9 +4304,7 @@ async function runChaptersPipeline() {
     state.visual.running = false;
     state.visual.sampling = false;
     state.visual.abort = null;
-    els.btnVisualStart.disabled = state.vision.available !== true;
-    els.btnVisualStart.textContent = '开始生成';
-    els.btnVisualCancel.hidden = true;
+    finishVisualButtons();
     try {
       els.video.currentTime = Math.min(Number.isFinite(els.video.duration) ? els.video.duration : originalTime, originalTime);
     } catch {
@@ -4186,6 +4665,11 @@ async function captureCurrentVisual() {
       if (!existed) state.notes.quotes.push(quote);
       parts.push('', buildQuoteMarkdown(quote));
     }
+    const causal = applyModelCausalLinks(linkSpeechAndVisuals({
+      frames: [{ tMs, ocrText, caption }],
+      segments: quote ? [{ t0Ms: quote.t0Ms, t1Ms: quote.t1Ms, text: quote.src, translation: quote.dst }] : [],
+    }), []);
+    if (causal.length > 0) parts.push('', '**因果关系**', '', formatCausalBullet(causal[0]));
     insertIntoNotesEditor(`${parts.join('\n')}\n`);
     await flushNotesSave();
     toast(ocrText ? '已捕获当前画面（截图 + OCR + 当前句）' : '已插入当前画面截图（OCR 不可用，仅截图）', 'ok', 4200);
@@ -4463,8 +4947,8 @@ const COMMANDS = [
   { id: 'play', title: '播放 / 暂停', keywords: 'play pause space 播放 暂停', icon: 'i-play', action: () => els.btnPlay.click() },
   { id: 'stop', title: '停止同传', keywords: 'stop 停止', icon: 'i-stop', action: () => els.btnStop.click() },
   { id: 'notes', title: '打开笔记工作区', keywords: 'notes 笔记 打开', icon: 'i-note', action: () => void openNotesDrawer() },
-  { id: 'visual', title: '生成图文笔记（整段）', keywords: 'visual 图文 生成 ocr', icon: 'i-image', action: () => { openVisualModal(); setVisualMode('single'); } },
-  { id: 'chapters', title: '按章节生成图文笔记', keywords: 'chapter 章节 分段 总览', icon: 'i-list', action: () => { openVisualModal(); setVisualMode('chapters'); } },
+  { id: 'visual', title: '课程处理（翻译 / 笔记 / 因果）', keywords: 'visual 图文 生成 ocr 翻译 字幕 因果 模型', icon: 'i-image', action: () => { openVisualModal(); setVisualMode('single'); } },
+  { id: 'chapters', title: '按章节做笔记和因果', keywords: 'chapter 章节 分段 总览 笔记 因果', icon: 'i-list', action: () => { openVisualModal(); setVisualMode('chapters'); } },
   { id: 'quote', title: '插入当前句到笔记', keywords: 'quote 当前句 插入 字幕', icon: 'i-subtitles', action: () => void (async () => { await openNotesDrawer(); if (!currentNote()) await createNoteAtCurrentTime(); insertCurrentQuote(); })() },
   { id: 'capture', title: '捕获当前画面', keywords: 'capture 画面 截图 ocr', icon: 'i-camera', action: () => void (async () => { await openNotesDrawer(); await captureCurrentVisual(); })() },
   { id: 'obsidian', title: '同步到 Obsidian', keywords: 'obsidian sync 同步 笔记', icon: 'i-sync', action: () => void syncCurrentVideoToObsidian() },
@@ -4598,14 +5082,19 @@ function visualStepForText(text) {
   if (/采样/.test(value)) return 'sample';
   if (/识别|OCR/i.test(value)) return 'ocr';
   if (/画面理解|VLM/.test(value)) return 'vlm';
+  if (/翻译/.test(value)) return 'translate';
   if (/总结|总览/.test(value)) return 'summary';
   if (/保存|组装|整理/.test(value)) return 'save';
   return null;
 }
 
+const COURSE_STEPS = ['sample', 'ocr', 'vlm', 'translate', 'summary', 'save'];
+
 function applyVisualSteps(activeStep) {
   if (!els.visualSteps) return;
-  const states = activeStep === 'done' ? progressStepStates(null).map((entry) => ({ ...entry, state: 'done' })) : progressStepStates(activeStep);
+  const states = activeStep === 'done'
+    ? progressStepStates(null, COURSE_STEPS).map((entry) => ({ ...entry, state: 'done' }))
+    : progressStepStates(activeStep, COURSE_STEPS);
   for (const item of els.visualSteps.querySelectorAll('li[data-step]')) {
     const entry = states.find((value) => value.step === item.dataset.step);
     item.dataset.state = entry?.state ?? 'pending';
@@ -5003,6 +5492,14 @@ function bindEvents() {
     state.visual.vlm = Boolean(els.visualVlm.checked);
     renderVisualPlan();
   });
+  for (const input of [els.jobTranslate, els.jobNotes, els.jobCausal]) {
+    input?.addEventListener('change', () => syncCourseForm());
+  }
+  els.courseSource?.addEventListener('click', (event) => {
+    const button = event.target.closest('button[data-source]');
+    if (button) setTranslateSource(button.dataset.source);
+  });
+  els.courseModels?.addEventListener('change', () => renderVisualPlan());
   els.btnCaptureVisual.addEventListener('click', () => void captureCurrentVisual());
   els.btnNotesRetry.addEventListener('click', () => void syncLocalNotes());
   els.notesSearch.addEventListener('input', () => {

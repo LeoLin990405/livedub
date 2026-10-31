@@ -40,6 +40,8 @@ const SWIFT_FILES = [
   // v0.7 视觉重设计 + 设置窗口
   'OverlayDesign.swift',
   'SettingsWindow.swift',
+  // 打开 App 时拉起本机引擎
+  'EngineLauncher.swift',
 ];
 
 test('macos: 构建脚本存在，bash -n 语法检查通过', () => {
@@ -116,6 +118,16 @@ test('macos: Swift 源文件齐全且包含关键实现', () => {
   assert.match(main, /--simulate/);
   assert.match(main, /--self-test/);
   assert.match(main, /--duration/);
+  assert.match(main, /bootLocalEngine/);
+  assert.match(main, /stopIfOwned/);
+  assert.match(main, /if options\.simulate \{[\s\S]*模拟模式，未拉起[\s\S]*\} else \{[\s\S]*bootLocalEngine/);
+
+  const launcher = readSource('EngineLauncher.swift');
+  assert.match(launcher, /engine\/server\.mjs/);
+  assert.match(launcher, /已随 App 启动/);
+  assert.match(launcher, /本机已在运行/);
+  assert.match(launcher, /name"\] as\? String == "livedub"/);
+  assert.match(launcher, /stopIfOwned/);
 });
 
 test('macos: Swift 只用系统框架（零第三方 Swift 依赖）', () => {
@@ -245,6 +257,8 @@ test('macos: v0.7 视觉重设计 + 设置窗口 + 菜单 / 可访问性', () =>
   assert.match(overlay, /showToast/);
 
   const settingsWindow = readSource('SettingsWindow.swift');
+  assert.match(settingsWindow, /播放中文配音/);
+  assert.match(settingsWindow, /Settings\.dubMuteWarning/);
   assert.match(settingsWindow, /class SettingsWindow: NSWindow/);
   assert.match(settingsWindow, /cancelOperation/, 'Esc 关闭设置窗口');
   assert.match(settingsWindow, /fontSlider/);
@@ -261,6 +275,9 @@ test('macos: v0.7 视觉重设计 + 设置窗口 + 菜单 / 可访问性', () =>
   assert.match(settings, /positionMode/);
   assert.match(settings, /resetPresentationDefaults/);
   assert.match(settings, /clampTranslationFont/, '字号应钳制到 22–26');
+  assert.match(settings, /dubMuteWarning/);
+  assert.match(settings, /请先把播放器静音/);
+  assert.match(settings, /dubEnabled[\s\S]{0,180}default:\s*false/);
 
   const main = readSource('main.swift');
   assert.match(main, /--show-settings/);
@@ -272,7 +289,7 @@ test('macos: v0.7 视觉重设计 + 设置窗口 + 菜单 / 可访问性', () =>
   assert.match(main, /systemSymbolName: MenuDesign/);
 
   const selfTest = readSource('SelfTest.swift');
-  for (const must of ['checkDesign()', 'v0.7 默认字号', 'v0.7 自动宽度随字号', 'v0.7 toast：成功', 'v0.7 a11y', 'v0.7 reduceMotion']) {
+  for (const must of ['checkDesign()', 'v0.7 默认字号', 'v0.7 自动宽度随字号', 'v0.7 toast：成功', 'v0.7 a11y', 'v0.7 reduceMotion', 'removeObject(forKey: "livedub.macos.dubEnabled")', 'fresh dub default off', '静音']) {
     assert.ok(selfTest.includes(must), `SelfTest.swift 缺少 v0.7 检查：${must}`);
   }
 });

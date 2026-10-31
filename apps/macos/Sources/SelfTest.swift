@@ -77,6 +77,7 @@ enum SelfTest {
         checkVision()
         checkVisualContext()
         checkDesign()
+        checkEngineLaunch()
         checkSimulationData()
 
         if failures.isEmpty {
@@ -1035,10 +1036,14 @@ enum SelfTest {
 
     private static func checkDesign() {
         let suite = UserDefaults(suiteName: "com.livedub.macos.selftest.design") ?? .standard
+        suite.removeObject(forKey: "livedub.macos.dubEnabled")
         let settings = Settings(defaults: suite)
 
         // 设置默认值与钳制（隔离 UserDefaults，只读）
         check("v0.7 默认字号 24pt", settings.fontSize == 24, detail: "\(settings.fontSize)")
+        check("fresh dub default off", settings.dubEnabled == false)
+        check("配音开关提示先静音播放器",
+              Settings.dubMuteWarning.contains("静音") && Settings.dubMuteWarning.contains("播放器"))
         check("v0.7 默认宽度自动（0）", settings.overlayWidth == 0)
         check("v0.7 默认不透明度 0.92", abs(settings.overlayOpacity - 0.92) < 0.001)
         check("v0.7 默认字幕双语", settings.captionMode == .bilingual)
@@ -1245,6 +1250,121 @@ enum SelfTest {
                   && OverlayTheme.animationDuration(0.18, reduceMotion: false) == 0.18
                   && OverlayTheme.accentBreathingAlpha(reduceMotion: true) == nil
                   && !OverlayTheme.shouldAnimate(reduceMotion: true))
+    }
+
+    // MARK: 打开 App 时拉起本机引擎
+
+    private static func checkEngineLaunch() {
+        let files: Set<String> = [
+            "/Users/leo/livedub/engine/server.mjs",
+            "/opt/homebrew/bin/node",
+        ]
+        let fileExists = { (path: String) in files.contains(path) }
+        let roots = EngineLaunchPlanner.candidateRoots(
+            executablePath: "/Applications/livedub.app/Contents/MacOS/livedub",
+            envRoot: nil,
+            homeDirectory: "/Users/leo"
+        )
+        check("安装到 /Applications 时仍能找到 ~/livedub",
+              roots.contains("/Users/leo/livedub"))
+        let spawn = EngineLaunchPlanner.decide(
+            engineURL: "ws://127.0.0.1:8787/ws",
+            healthOK: false,
+            simulate: false,
+            ownedCommand: nil,
+            roots: roots,
+            nodeCandidates: ["/opt/homebrew/bin/node", "/usr/local/bin/node"],
+            fileExists: fileExists,
+            isExecutable: fileExists
+        )
+        check("本机引擎没在跑就拉起", spawn.kind == .spawn && spawn.ownsProcess)
+        let reuse = EngineLaunchPlanner.decide(
+            engineURL: "ws://127.0.0.1:8787/ws",
+            healthOK: true,
+            simulate: false,
+            ownedCommand: nil,
+            roots: roots,
+            nodeCandidates: ["/opt/homebrew/bin/node"],
+            fileExists: fileExists,
+            isExecutable: fileExists
+        )
+        check("引擎已在跑则复用，退出时不关",
+              reuse.kind == .alreadyRunning && reuse.ownsProcess == false && reuse.detail == "本机已在运行")
+        let adopt = EngineLaunchPlanner.decide(
+            engineURL: "ws://localhost:8787/ws",
+            healthOK: true,
+            simulate: false,
+            ownedCommand: "/bin/bash -c node engine/server.mjs",
+            roots: roots,
+            nodeCandidates: ["/opt/homebrew/bin/node"],
+            fileExists: fileExists,
+            isExecutable: fileExists
+        )
+        check("自己拉起的引擎退出时关掉", adopt.kind == .adopt && adopt.ownsProcess)
+        check("照看脚本认得出自己的引擎",
+              EngineLaunchPlanner.commandOwnsEngine("/bin/bash -c \"$node\" engine/server.mjs"))
+        let remote = EngineLaunchPlanner.decide(
+            engineURL: "wss://example.com/ws",
+            healthOK: false,
+            simulate: false,
+            ownedCommand: nil,
+            roots: roots,
+            nodeCandidates: ["/opt/homebrew/bin/node"],
+            fileExists: fileExists,
+            isExecutable: fileExists
+        )
+        check("外部引擎地址不在本机拉起", remote.kind == .skipped && remote.ownsProcess == false)
+        let simulated = EngineLaunchPlanner.decide(
+            engineURL: "ws://127.0.0.1:8787/ws",
+            healthOK: false,
+            simulate: true,
+            ownedCommand: nil,
+            roots: roots,
+            nodeCandidates: ["/opt/homebrew/bin/node"],
+            fileExists: fileExists,
+            isExecutable: fileExists
+        )
+        check("模拟模式不拉起引擎", simulated.kind == .skipped && simulated.detail == "模拟模式，未拉起")
+        let missing = EngineLaunchPlanner.decide(
+            engineURL: "ws://127.0.0.1:8787/ws",
+            healthOK: false,
+            simulate: false,
+            ownedCommand: nil,
+            roots: ["/nowhere"],
+            nodeCandidates: ["/opt/homebrew/bin/node"],
+            fileExists: fileExists,
+            isExecutable: fileExists
+        )
+        check("找不到项目就不拉起", missing.kind == .skipped && missing.detail.contains("找不到 livedub"))
+        let noNode = EngineLaunchPlanner.decide(
+            engineURL: "ws://127.0.0.1:8787/ws",
+            healthOK: false,
+            simulate: false,
+            ownedCommand: nil,
+            roots: ["/Users/leo/livedub"],
+            nodeCandidates: ["/missing/node"],
+            fileExists: fileExists,
+            isExecutable: fileExists
+        )
+        check("找不到 node 就不拉起", noNode.kind == .skipped && noNode.detail.contains("找不到 node"))
+        let health = EngineLaunchPlanner.healthURL(engineWebSocket: "ws://127.0.0.1:8787/ws")
+        check("健康检查地址是本机 /health",
+              health?.absoluteString == "http://127.0.0.1:8787/health")
+        check("默认端口不额外传 --port",
+              EngineLaunchPlanner.serverArguments(engineURL: "ws://127.0.0.1:8787/ws") == ["engine/server.mjs"])
+        check("自定义端口传给引擎",
+              EngineLaunchPlanner.serverArguments(engineURL: "ws://127.0.0.1:18787/ws") == ["engine/server.mjs", "--port", "18787"])
+        let livedub = Data("{\"ok\":true,\"name\":\"livedub\"}".utf8)
+        let other = Data("{\"ok\":true,\"name\":\"other\"}".utf8)
+        check("只把 name=livedub 当成自己的引擎",
+              EngineLaunchPlanner.isLivedubHealth(livedub) && !EngineLaunchPlanner.isLivedubHealth(other))
+        check("菜单能看出引擎是不是随 App 起来的",
+              EngineLaunchPlanner.menuTitle(detail: "已随 App 启动", engineURL: "ws://127.0.0.1:8787/ws") == "引擎：已随 App 启动"
+                && EngineLaunchPlanner.menuTitle(detail: "", engineURL: "ws://127.0.0.1:8787/ws") == "引擎：ws://127.0.0.1:8787/ws")
+        check("照看脚本会在父进程消失后关掉引擎",
+              LocalEngineSupervisor.watchScript.contains("engine/server.mjs")
+                && LocalEngineSupervisor.watchScript.contains("PPID")
+                && LocalEngineSupervisor.watchScript.contains("TERM"))
     }
 
     // MARK: - 断言帮手
