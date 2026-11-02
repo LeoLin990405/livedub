@@ -1254,19 +1254,36 @@ enum SelfTest {
 
     // MARK: 打开 App 时拉起本机引擎
 
+    /// 自检用的主目录。先看 HOME，再看当前用户目录，最后落到临时目录。
+    /// 候选根仍是「这个目录下的 livedub」，不把某台机器的绝对路径写进源码。
+    private static func runtimeHomeDirectory() -> String {
+        func usable(_ raw: String?) -> String? {
+            let trimmed = raw?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            if trimmed.isEmpty || trimmed == "/" { return nil }
+            return trimmed.hasSuffix("/") ? String(trimmed.dropLast()) : trimmed
+        }
+        if let envHome = usable(ProcessInfo.processInfo.environment["HOME"]) { return envHome }
+        if let userHome = usable(FileManager.default.homeDirectoryForCurrentUser.path) { return userHome }
+        if let tmp = usable(NSTemporaryDirectory()) { return tmp }
+        return "/tmp/livedub-selftest-home"
+    }
+
     private static func checkEngineLaunch() {
+        let home = runtimeHomeDirectory()
+        let project = (home as NSString).appendingPathComponent("livedub")
+        let serverScript = (project as NSString).appendingPathComponent("engine/server.mjs")
         let files: Set<String> = [
-            "/Users/leo/livedub/engine/server.mjs",
+            serverScript,
             "/opt/homebrew/bin/node",
         ]
         let fileExists = { (path: String) in files.contains(path) }
         let roots = EngineLaunchPlanner.candidateRoots(
             executablePath: "/Applications/livedub.app/Contents/MacOS/livedub",
             envRoot: nil,
-            homeDirectory: "/Users/leo"
+            homeDirectory: home
         )
         check("安装到 /Applications 时仍能找到 ~/livedub",
-              roots.contains("/Users/leo/livedub"))
+              roots.contains(project))
         let spawn = EngineLaunchPlanner.decide(
             engineURL: "ws://127.0.0.1:8787/ws",
             healthOK: false,
@@ -1341,7 +1358,7 @@ enum SelfTest {
             healthOK: false,
             simulate: false,
             ownedCommand: nil,
-            roots: ["/Users/leo/livedub"],
+            roots: [project],
             nodeCandidates: ["/missing/node"],
             fileExists: fileExists,
             isExecutable: fileExists
