@@ -1,306 +1,316 @@
-# livedub · 看视频，像原声一样同传
+<div align="center">
 
-[简体中文](README.md) | [English](README.en.md)
+<img src="docs/assets/banner.svg" alt="livedub banner" width="100%">
 
-[![CI](https://github.com/LeoLin990405/livedub/actions/workflows/ci.yml/badge.svg)](https://github.com/LeoLin990405/livedub/actions/workflows/ci.yml)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-[![Node](https://img.shields.io/badge/node-%E2%89%A522-brightgreen.svg)](package.json)
-[![runtime deps](https://img.shields.io/badge/runtime%20deps-0-blue.svg)](package.json)
-[![Release](https://img.shields.io/github/v/release/LeoLin990405/livedub)](https://github.com/LeoLin990405/livedub/releases)
-[![stars](https://img.shields.io/github/stars/LeoLin990405/livedub.svg?style=social)](https://github.com/LeoLin990405/livedub)
+# livedub
 
-> 本地优先的**实时同声传译引擎**：抓取视频声音 → 流式识别 → 增量翻译 → 克隆音色配音 + 双语字幕。
-> 面向**教学视频**（公开课/网课/技术讲座）优化：术语表约束、子句级低延迟配音、原声自动压音。
->
+**Local-first simultaneous interpretation for lecture videos.**
 
-**v0.7（2026-10-30）**：**界面设计优化**——统一三端设计语言（jade/ink、短动效、可访问性），
-工作台布局重构（视频/字幕舞台 + 可折叠 dock + 命令面板 ⌘K）、笔记工作区升级、扩展浮层/面板/popup、
-macOS 悬浮窗重设计 + 设置窗口。设计规范见 [docs/DESIGN.md](docs/DESIGN.md)。
-**v0.6（2026-10-30）**：**按章节自动生成图文笔记**（字幕停顿+画面切换分章 + 课程总览）、
-**画面 OCR 作为翻译上下文**（术语/公式更一致）、**Obsidian 目录自动同步**（Markdown+截图+索引，保存后自动导出）。
-**v0.5（2026-10-30）**：**视频画面理解 → 图文笔记**——按画面变化抽关键帧，本地 macOS Vision OCR 提取幻灯片/代码文字，
-可选 VLM 画面语义理解，和双语字幕一起合成「音频 + 画面 + 总结」的图文笔记；快捷笔记自动附带画面文字。
-**v0.4**：学习笔记（Notes API / 工作台笔记抽屉 / 扩展 `Alt+Shift+N` / macOS `⌥N` / CLI / Markdown·Obsidian 导出）。
-**v0.3**：云端 ASR（MiniMax，e2e ~2.2s）、火山 TTS+声音复刻、macOS 桌面悬浮窗、全局限定压音/裸视频全屏。
-详见 [CHANGELOG](CHANGELOG.md)。
-> 形态：Chrome 扩展（任意网页视频） + 本地工作台（本地课程文件 / 课程页字幕 / 回放 / 导出）。
+Streaming ASR · incremental translation · cloned-voice dubbing · bilingual subtitles · local study notes
 
-```text
-YouTube / B站 / 网课页面       本地引擎 (127.0.0.1)               输出
-┌──────────────────┐   16k PCM   ┌───────────────────────────┐   ┌──────────────────────────┐
-│ Chrome 扩展       │ ──────────▶ │ 流式 ASR（本地 whisper）    │   │ 页面浮层：英/中双语字幕     │
-│ tabCapture 抓声音 │             │ → 增量翻译（deepseek 流式） │──▶│ 中文配音（克隆音色，失败降级）│
-│ 本地工作台        │ ◀────────── │ → 流式 TTS（MiniMax）       │   │ 原声自动压低（ducking）     │
-└──────────────────┘   WS 事件    │ → 调度/压音/字幕/指标        │   └──────────────────────────┘
-                                  └───────────────────────────┘
-       实测：语音结束后 ~3.0s（快速档 ~2.4s / 云端档 ~2.2s）出中文配音，见 docs/MEASUREMENTS.md
+[**简体中文**](README.zh-CN.md) · **English**
+
+<a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-22C55E?style=flat-square" alt="License: MIT"></a>
+<a href="package.json"><img src="https://img.shields.io/badge/node-%E2%89%A522-339933?style=flat-square&logo=nodedotjs&logoColor=white" alt="Node.js 22+"></a>
+<a href="package.json"><img src="https://img.shields.io/badge/runtime_deps-0-0EA5E9?style=flat-square" alt="Zero runtime dependencies"></a>
+<a href="extension/README.md"><img src="https://img.shields.io/badge/Chrome-MV3-4285F4?style=flat-square&logo=googlechrome&logoColor=white" alt="Chrome MV3 extension"></a>
+<a href="apps/macos/README.md"><img src="https://img.shields.io/badge/macOS-14%2B-111827?style=flat-square&logo=apple&logoColor=white" alt="macOS 14+"></a>
+<a href=".github/workflows/ci.yml"><img src="https://img.shields.io/badge/CI-GitHub_Actions-2088FF?style=flat-square&logo=githubactions&logoColor=white" alt="CI workflow"></a>
+
+</div>
+
+> [!NOTE]
+> **Current state.** v0.7.0 (2026-10-30) contains the Node engine, Chrome MV3 extension, local studio,
+> macOS overlay, offline batch pipeline, and the notes/visual-note stack. Latency figures here are
+> single-machine measurements from this repository, not service guarantees.
+
+## ✨ Features
+
+- **Local ASR by default.** `whisper-server` keeps the `large-v3-turbo-q5` model resident; audio does
+  not leave the machine unless the cloud profile is selected.
+- **Incremental translation.** Every finalized speech segment is sent to an OpenAI-compatible
+  streaming LLM; `translate.chain` supplies an ordered failover list.
+- **Clause-level TTS.** Long sentences are split by punctuation and length, and synthesis starts on
+  the first stable clause instead of waiting for the full translation.
+- **Clone-first voice handling.** A session collects at least 12s of lecturer speech, tries the
+  configured clone chain (MiniMax, then Volcengine), records a failure once, and continues with a
+  preset voice.
+- **Bilingual subtitles and ducking.** The translation is drawn under the source line; the browser
+  and studio lower the original to 18% while a dub chunk plays. The macOS overlay cannot mute
+  system audio, so its original and dub play together.
+- **Four capture surfaces.** A Chrome extension for tab audio, a local studio for files and course
+  pages, a macOS overlay for system audio, and a batch runner for offline output.
+- **Study notes.** Notes carry video timestamps, bilingual quotes, screenshots and code blocks, and
+  export to Markdown with a course outline. All three UIs and a CLI can create them.
+- **Visual notes and chapters.** Keyframe sampling plus local macOS Vision OCR (optional VLM)
+  produces visual notes; chapter mode segments a course by caption gaps and frame changes and keeps
+  a course overview.
+- **Obsidian sync.** Markdown, screenshot assets and an index file are exported to a configured
+  vault, with debounced auto-sync after note changes.
+- **Zero npm runtime dependencies.** The Node engine and browser clients ship no third-party packages;
+  tests use `node:test`.
+
+## 🧠 Architecture
+
+```mermaid
+flowchart LR
+    subgraph capture["Capture"]
+        EXT["Chrome extension\ntabCapture"]
+        STUDIO["Studio workbench\nlocal video / course page"]
+        MAC["macOS overlay\nScreenCaptureKit"]
+        BATCH["Batch runner\nscripts/batch.mjs"]
+    end
+
+    subgraph engine["Local engine - 127.0.0.1:8787"]
+        VAD["VAD segmenter\n+ rolling partial"]
+        ASR["ASR\nwhisper-server / stream-cloud"]
+        MT["Streaming translation\nfailover chain"]
+        TTS["Streaming TTS\nclone-first to preset"]
+        SCHED["Dub scheduler\n+ ducking plan"]
+        METRICS["Metrics\nsession events"]
+    end
+
+    subgraph output["Outputs"]
+        SUBS["Bilingual subtitle overlay"]
+        DUB["Chinese dub audio"]
+        FILES["SRT / dubbed MP4\nsession JSONL"]
+        NOTES["Local notes\ndata/notes"]
+    end
+
+    EXT -->|"16 kHz PCM over WS"| VAD
+    STUDIO -->|"16 kHz PCM over WS"| VAD
+    MAC -->|"16 kHz PCM over WS"| VAD
+    BATCH --> VAD
+    VAD --> ASR --> MT --> TTS --> SCHED
+    ASR --> METRICS
+    MT --> METRICS
+    TTS --> METRICS
+    MT --> SUBS
+    SCHED --> DUB
+    SCHED --> FILES
+    SUBS --> NOTES
+    METRICS --> NOTES
 ```
 
-## 它解决什么问题
+Capture clients send 16 kHz mono s16le PCM in 100 ms frames over a local WebSocket (`/ws`). The
+engine keeps a per-session timeline in milliseconds, runs VAD and whisper, streams translation
+tokens, and emits `partial`, `segment`, `translation`, `dub`, `metrics`, and `error` events. Clients
+schedule dub chunks by `startMs` and duck the original while speaking. The wire contract is
+[`docs/CONTRACTS.md`](docs/CONTRACTS.md); module layout and failure modes are in
+[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
 
-看英文公开课时，字幕软件只给「延迟 1-2 秒的整句字幕」，听不懂还是听不懂。livedub 做三件事：
+## 🚀 Quick start
 
-1. **双语字幕**：原文下方直接给中文，分句粒度、边听边出；
-2. **中文配音**：「像同传耳机一样」用中文音色朗读译文，可选手压原声，眼睛可以离开字幕；
-3. **教学场景优化**：术语表（`gradient descent → 梯度下降`）强约束；公式/代码标识符不翻译；一句太长会按子句切块先出声，不让用户干等。
+**Requirements:** macOS is the primary platform (Linux is used for CI tests); Node.js **≥ 22**;
+`ffmpeg` / `ffprobe`; a `whisper-server` binary with a ggml model. The macOS overlay needs macOS 14+
+and Swift 5.10 Command Line Tools. Translation and TTS need provider credentials.
 
-## 真实能力（已在本机实测）
+```sh
+git clone https://github.com/LeoLin990405/livedub.git
+cd livedub
+brew install ffmpeg whisper-cpp
+mkdir -p models
+curl -L -o models/ggml-large-v3-turbo-q5_0.bin \
+  https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-turbo-q5_0.bin
+npm run doctor          # read-only environment check
+npm start               # engine + studio on http://127.0.0.1:8787/studio/
+```
 
-| 环节 | 实现 | 实测 |
+Open `http://127.0.0.1:8787/studio/` and pick a local course video, or paste a course page or direct
+media URL. Direct `mp4` / `webm` / `mp3` files go to the player; course pages yield a title, any
+directly playable media, and timed captions.
+
+Chrome extension: open `chrome://extensions`, enable **Developer mode**, choose **Load unpacked**, and
+select `extension/`. Start playback, click the livedub icon, then click start — `tabCapture` requires
+that user gesture. macOS overlay:
+
+```sh
+bash scripts/build-macos.sh          # -> apps/macos/build/livedub.app
+open apps/macos/build/livedub.app
+```
+
+Offline batch: `npm run batch` runs the real pipeline over `demo/original.mp4` and writes
+`demo/dubbed.mp4`, `demo/bilingual.srt`, `demo/session.jsonl`, and `demo/metrics.json`.
+
+> [!TIP]
+> Provider keys are read read-only from `~/.sayless/config.json`, from `providers` in
+> `config/livedub.config.json`, or from `LIVEDUB_PROVIDER_<NAME>_API_KEY`. The engine does not write
+> keys back and does not log them. `npm run doctor --probe` performs one small real request.
+
+## 🗂️ Surfaces and profiles
+
+| Surface | Start with | What it handles |
 |---|---|---|
-| ASR | 本地 `whisper-server`（large-v3-turbo q5，常驻进程） | 29.4s 音频热推理 **≈1.4s**（RTF≈0.05），离线、不上传声音 |
-| 翻译 | OpenAI 兼容流式 LLM，默认 `deepseek-flash`，可配置 failover 链 | 首字 **≈1.0s** |
-| TTS | MiniMax `speech-2.8-hd` 流式（PCM），克隆未成功时默认音色是讲师男声 | 短句首包 **≈1.1–1.5s** |
-| 音色克隆 | 火山声音复刻 v3 / MiniMax / 自动降级 preset | 协议已实现（火山需豆包语音 UUID Key，目前本机无此 Key，真机验证了 401→降级路径）；MiniMax Token Plan 返回 2061 自动降级 |
-| 云端 ASR | MiniMax `asr-1.0`（`npm run start:cloud`） | 4s≈0.79s / 12s≈1.0-1.2s；**云端档 e2e ≈2.2–2.4s**，音频会上传、失败自动降级本地 |
-| 学习笔记 | 时间戳 + 双语引用 + 截图 + 代码块 + 大纲；三端快捷记录（工作台 `N`、扩展 `Alt+Shift+N`、桌面 `⌥N`、CLI） | 笔记只落本机 `data/notes/`，导出 Markdown 可直接进 Obsidian（见 [docs/NOTES.md](docs/NOTES.md)） |
-| 图文笔记（画面理解） | 按画面变化抽关键帧 + 本地 macOS Vision OCR（serve 模式首帧 ~0.7–1.5s、后续 0.2–1.5s）+ 可选 VLM 画面语义理解 + 音频字幕综合总结 | demo 3 帧图文笔记全程 ~10s（真实 OCR+DeepSeek）；VLM 单帧约 20–22s（可选，默认关）；见 [docs/NOTES.md](docs/NOTES.md#图文笔记画面理解v05) |
-| 章节 / Obsidian / 画面上下文（v0.6） | 字幕停顿+画面变化自动分章 → 逐章图文笔记 + 课程总览；Obsidian vault 自动同步（Markdown+截图+索引）；画面 OCR 经 WS 推给翻译作术语参考 | demo 全片 52s → **2 章 + 1 篇总览**、7 张截图、约 42s；画面上下文默认关闭（工作台 9s / macOS 10s 采样，仅 WS 连接时发送）；见 [docs/NOTES.md](docs/NOTES.md) |
-| 桌面端 | macOS 原生悬浮窗（ScreenCaptureKit） | `apps/macos/` 源码 + `scripts/build-macos.sh`（见 [apps/macos/README.md](apps/macos/README.md)） |
-| 管线 | Node 零依赖引擎，VAD 切分 + 子句级 TTS + 调度压音 | 52.7s 示例课实测：**质量档 e2e 3.0s** / **快速档 2.4s**（ASR 1.8s→0.9s、翻译首字 0.8s、TTS 首包 0.25s；[完整数据](docs/MEASUREMENTS.md)） |
+| **Chrome extension** (MV3) | `npm start` + load `extension/` | Audio from any tab; `tabCapture` needs a click; iframe/WebAudio players get ducking |
+| **Studio workbench** | `npm start` → `/studio/` | Local video, direct media URLs, course pages with timed captions, replay, SRT export |
+| **macOS overlay** | `bash scripts/build-macos.sh` | System audio (display mix) through ScreenCaptureKit, floating bilingual panel, Chinese dub |
+| **Offline batch** | `npm run batch` | Burned-in bilingual subtitles, mixed dub, SRT/JSONL/metrics artifacts |
+| **Notes CLI** | `npm run note -- "..."` | Timestamped quick note; falls back to `data/notes/` when the engine is offline |
 
-> ⚠️ 声音克隆能力取决于你的 TTS 服务套餐（MiniMax 按量付费 / 火山语音复刻等）。livedub 的原则是：**克隆能通就用克隆，不能通也保证同传可用**，不会因为克隆失败让整条链路挂掉。
+| Profile | Command | ASR backend | Repo-measured e2e |
+|---|---|---|---|
+| **Quality** (default) | `npm start` / `npm run batch` | local `whisper-server`, `large-v3-turbo-q5` | ~3.0 s |
+| **Fast** | `npm run start:fast` / `npm run batch:fast` | local whisper `small` | ~2.4 s |
+| **Cloud** | `npm run start:cloud` / `npm run batch:cloud` | `stream-cloud`, local whisper fallback | audio upload; see note |
 
-## 看一眼（真实产物）
+> [!WARNING]
+> The cloud profile sends audio to a remote ASR service. The ~2.2–2.4 s cloud figures in
+> `docs/MEASUREMENTS.md` were collected with the earlier MiniMax `asr-1.0` upload provider, not with
+> the current `stream-cloud` chain.
 
-| 工作台 v0.7（暗色，真实回放 + 实测 HUD） | 成片：中文配音 + 烧录双语字幕 |
+## 🎙️ Providers and voice cloning
+
+| Stage | Default | Options in the repository | Notes |
+|---|---|---|---|
+| **ASR** | local `whisper-server` (`large-v3-turbo-q5`) | whisper `small`, `stream-cloud`, `minimax-cloud`, `mock` | Cloud variants upload audio; the cloud profile falls back to local whisper |
+| **Translation** | `deepseek` (`deepseek-flash`) | `minimax`, `mimo-plan`, `zai`, `ark-plan` | OpenAI-compatible streaming; ordered `translate.chain` failover |
+| **TTS** | MiniMax `speech-2.8-hd` | `macos-say`, `mock` | PCM streaming with warmup and an LRU cache |
+| **Voice cloning** | MiniMax clone, then Volcengine v3 | preset voices | MiniMax Token Plan returns 2061; Volcengine needs a Doubao Speech UUID key |
+
+Configuration precedence and full provider setup are documented in
+[`docs/PROVIDERS.md`](docs/PROVIDERS.md). Clone mode is `clone-first`: clone when the plan allows it,
+otherwise keep interpreting with a preset voice. A clone failure is recorded once per session and
+is not retried for every sentence.
+
+## 📝 Notes, chapters and visual context
+
+Notes live under `data/notes/`; the `/api/notes` endpoints listen on `127.0.0.1` only. The studio
+uses `N` for a new note, the extension uses `Alt+Shift+N`, the macOS overlay uses `⌥N`, and the CLI
+uses `npm run note -- "..."`.
+
+- **Timestamped quotes.** A note stores `t0Ms` / `t1Ms` with the source and translated sentence;
+  clicking a note seeks the player back to that moment.
+- **Visual notes.** Keyframes are sampled every 6 s, deduplicated on a 64×36 grayscale diff (max 24
+  frames), OCR'd with local macOS Vision (tesseract fallback, English only), and summarized with the
+  transcript. The optional VLM path is off by default and takes roughly 20–30 s per frame.
+- **Chapter mode.** Caption gaps over 2.5 s or frame changes split a course into 20–180 s chapters
+  (max 30), generate one visual note per chapter, and maintain a course overview with time anchors.
+- **Obsidian sync.** Configure `notes.obsidian` with a vault directory, `assetsSubdir`, and
+  `autoExport`; notes export as Markdown plus screenshots and `livedub-notes-index.md`.
+- **Visual context for translation.** When enabled, the studio or macOS app pushes OCR text every
+  8–10 s; the engine keeps the latest entry for 120 s and injects it as terminology/context only.
+
+| Studio workbench (v0.7, dark) | Dubbed output: Chinese voice + burned subtitles |
 |---|---|
 | ![studio](docs/assets/ui-dark-home.png) | ![dubbed](docs/assets/demo-bilingual-subtitled.png) |
 
-| Workbench v0.7（light） | 笔记工作区（过滤/分组/双栏） |
+| Notes workspace | Command palette (`⌘K`) |
 |---|---|
-| ![light](docs/assets/ui-light-home.png) | ![notes](docs/assets/ui-notes-workspace.png) |
+| ![notes](docs/assets/ui-notes-workspace.png) | ![command palette](docs/assets/ui-command-palette.png) |
 
-| 命令面板 ⌘K | 窄屏（390×844，单列） |
+| Chrome subtitle overlay | macOS floating overlay |
 |---|---|
-| ![command](docs/assets/ui-command-palette.png) | ![narrow](docs/assets/ui-narrow.png) |
+| ![extension overlay](docs/assets/ui-extension-overlay.png) | ![macOS overlay](docs/assets/ui-macos-overlay.png) |
 
-- 完整演示视频：`demo/dubbed.mp4`（原声自动压低 + 中文 AI 配音 + 双语字幕）
-- 原始英文视频：`demo/original.mp4`；双语字幕：`demo/bilingual.srt`；回放事件流：`demo/session.jsonl`
-- 更多截图与产物说明：[demo/README.md](demo/README.md)
+The full screenshot set, notes workflow, Obsidian example, and troubleshooting table live in
+[`docs/usage.md`](docs/usage.md).
 
-## 界面设计（v0.7）
+## 📊 Measured latency
 
-三端（工作台 / Chrome 扩展 / macOS 悬浮窗）统一设计语言：**沉浸看课 + 学术工具**。
-jade/ink 色板、低饱和、短动效（120–240ms，尊重 `prefers-reduced-motion`）、
-`:focus-visible` 焦点环、aria/tooltip/键盘可达。完整规范：[docs/DESIGN.md](docs/DESIGN.md)。
+| Stage | Quality (default) | Fast | Cloud (MiniMax `asr-1.0` runs) |
+|---|---|---|---|
+| ASR final text | 1837 ms | 922 ms | 954 / 1124 ms |
+| Translation first token | 802 ms | 890 ms | 797 / 1213 ms |
+| TTS first packet | 253 ms | 313 ms | 243 / 219 ms |
+| **End-to-end** | **3001 ms** | **2389 ms** | **2204 / 2385 ms** |
 
-| Chrome 浮层 + 快捷面板 | Chrome popup |
+Medians from [`docs/MEASUREMENTS.md`](docs/MEASUREMENTS.md): a 52.7 s synthetic lecture with 12
+sentences, fed at 1× realtime on an Apple M2 / 16 GB host. Quality and fast used one clean run each;
+cloud used two runs. The same document reports ±10–20% run-to-run variation from network and load.
+
+## 📁 Repository layout
+
+| Path | Contents |
 |---|---|
-| ![extension](docs/assets/ui-extension-overlay.png) | ![popup](docs/assets/ui-extension-popup.png) |
+| `engine/` | Node engine: protocol, session pipeline, ASR, segmenter, translation, TTS, voice, scheduler, WebSocket server |
+| `studio/` | Local workbench (HTML/JS, no build step) with player, subtitle stage, notes workspace and replay |
+| `extension/` | Chrome MV3 extension: tab capture, offscreen audio, subtitle overlay, popup, notes |
+| `apps/macos/` | Swift menu-bar app and floating overlay (ScreenCaptureKit, AVFoundation, AppKit) |
+| `scripts/` | `doctor`, `batch`, demo generation, note CLI, macOS build, OCR build |
+| `tests/` | `node:test` suites: unit, mock end-to-end, extension/studio/macOS static contracts |
+| `config/` | Base configuration plus `livedub.fast.json` and `livedub.cloud.json` overrides |
+| `docs/` | Contracts, architecture, measurements, providers, notes, design, roadmap, usage reference |
+| `demo/` | Synthetic English lecture and real pipeline outputs (MP4, SRT, JSONL, metrics) |
+| `data/` | Generated notes and exports; gitignored |
+| `LICENSE`, `CHANGELOG.md` | MIT license text and release history |
 
-| macOS 悬浮窗（材质 + 状态 pill + 双语） | macOS 设置窗口（即时生效） |
-|---|---|
-| ![macos-overlay](docs/assets/ui-macos-overlay.png) | ![macos-settings](docs/assets/ui-macos-settings.png) |
+Project home: [github.com/LeoLin990405/livedub](https://github.com/LeoLin990405/livedub) ·
+Releases: [GitHub Releases](https://github.com/LeoLin990405/livedub/releases).
 
-| 图文/章节生成分步进度 | Replay 页（统一 token） |
-|---|---|
-| ![progress](docs/assets/ui-progress.png) | ![replay](docs/assets/ui-replay.png) |
+## 🛠️ Development
 
-工作台交互速览：`⌘K`（命令面板）、`?`（快捷键帮助）、`N`（新建笔记）、
-Tab rail 切换「字幕 / 笔记 / 设置」，窄屏自动变底部 sheet；笔记图片可点开 lightbox。
+```sh
+npm run doctor          # read-only environment probe
+npm test                # offline node:test suites
+npm run lint            # syntax check for all JS
+npm run check           # lint + tests
 
-## 快速开始
-
-### 0. 依赖
-
-- macOS（Apple Silicon 推荐），Node.js **≥ 22**
-- `ffmpeg` / `ffprobe`（`brew install ffmpeg`）
-- `whisper-server` + 模型
-  ```bash
-  brew install whisper-cpp
-  # 模型（约 547MB，放到项目 models/ 下；或改 config.asr.whisper.models 指向已有模型）
-  curl -L -o models/ggml-large-v3-turbo-q5_0.bin \
-    https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-turbo-q5_0.bin
-  ```
-- 翻译/TTS 的 API Key：默认复用你 `~/.sayless/config.json` 里已配置的 provider（只读）；也可以自己写进 `config/livedub.config.json` 的 `providers`，或用环境变量 `LIVEDUB_PROVIDER_<NAME>_API_KEY`。
-
-### 1. 体检
-
-```bash
-cd livedub
-npm run doctor              # 只读检查；--probe 会做一次极小样本真实探测
-npm test                    # 零外部依赖单元测试
+LIVEDUB_INTEGRATION=1 node --test tests/asr.test.mjs
+LIVEDUB_INTEGRATION=1 node --test tests/tts.test.mjs
 ```
 
-### 2. 本地工作台（最稳的试用方式）
+The CI workflow [`.github/workflows/ci.yml`](.github/workflows/ci.yml) runs lint and the offline unit
+suite on Node 22 and 24, a non-fatal doctor probe, a contract-doc presence check, a basic secret scan,
+and a macOS Swift build check. Runtime code and tests have no npm dependencies. The optional
+integration tests start real whisper or call real providers and are skipped by default.
 
-```bash
-npm start                   # 或 npm run studio（会打开浏览器）
-# 打开 http://127.0.0.1:8787/studio/
-```
+## 🧭 Scope, limits and roadmap
 
-选择一个本地课程视频，或粘贴课程页 / 直接视频地址 → 开始播放 → 你会看到双语字幕、听到中文配音、原声自动压低。
-直接的 mp4 / webm / mp3 会进播放器。YouTube、B 站和带字幕的网页会解析出标题和带时间轴的字幕（观看页本身的视频文件不会被当成可播放地址；配音仍用扩展抓标签页声音）。
-工作台还提供：延迟 HUD、术语表编辑、音色模式、导出双语 SRT。
+livedub is a local tool for lecture-style video. It does not provide accounts, cloud storage, or DRM
+handling, and it does not claim production-scale multi-user behavior.
 
-### 3. Chrome 扩展（看任意网页视频）
+- **Platform.** macOS is the primary platform. The desktop overlay needs macOS 14+; Linux CI runs the
+  test suite but cannot exercise tab capture, system audio capture, or `say` fallback.
+- **Tab capture.** Chrome `tabCapture` requires a user gesture and cannot be automated; DRM-protected
+  media may not be capturable.
+- **System audio.** ScreenCaptureKit cannot mute the original system output, so the macOS overlay
+  plays its dub alongside the original. Ducking exists only in the browser and studio clients.
+- **Voice cloning.** Cloning depends on a TTS plan that supports it. MiniMax Token Plan returns error
+  2061 and falls back to a preset; Volcengine requires a Doubao Speech UUID key, not an Ark key.
+- **Cloud ASR.** The cloud profile uploads audio to the provider. Local whisper keeps audio on device.
+  Visual context and VLM captions can send OCR text or screenshots to configured cloud providers.
+- **Partial captions.** ASR partial is off by default; the repo's A/B measured about +0.8 s end-to-end
+  when enabled, because partial inference shares the whisper queue.
+- **Latency.** The figures above are medians from one machine and one 52.7 s clip. There is no
+  sub-2-second guarantee for a full-length lecture; weak networks favor subtitles without dubbing.
+- **Notes sync.** Obsidian sync is a one-way export. Notes stay on the local machine unless the user
+  puts `data/notes/` into their own sync folder.
 
-1. Chrome 打开 `chrome://extensions` → 打开「开发者模式」→「加载已解压的扩展程序」→ 选 `extension/` 目录；
-2. 打开 B站 / YouTube / 网课页面，点扩展图标开始（`tabCapture` 需要这次点击手势）；
-3. 页面底部出现双语字幕浮层与状态胶囊；再点一次停止。
-   排障见 `extension/README.md`。
+Roadmap:
 
-### 4. 离线批处理 / 生成演示
+- [ ] Add desktop-level ducking through a virtual audio device on macOS
+- [ ] Continue reducing end-to-end latency without promising a fixed bound
+- [ ] Publish through the Chrome Web Store and a signed/notarized Homebrew Cask
+- [ ] Improve glossary import and formula/code handling
+- [ ] Add bidirectional Obsidian/Notion sync and multi-device notes
+- [ ] Run real-device latency regression baselines on a macOS CI runner
 
-```bash
-npm run demo:video                   # 生成 demo/original.mp4（英文公开课示例）
-npm run batch                        # 真实管线跑一遍 demo/original.mp4
-# 产出：
-#   demo/dubbed.mp4      原声压低 + 中文配音 + 烧录双语字幕
-#   demo/bilingual.srt   双语字幕
-#   demo/session.jsonl   引擎事件回放（studio/replay.html 可加载）
-#   demo/metrics.json    每句延迟指标
-```
+## 🤝 Contributing
 
-回放（演示/截图用）：
+Issues and pull requests are welcome. Before opening a PR:
 
-```bash
-npm start
-# http://127.0.0.1:8787/replay/?session=/demo/session.jsonl&video=/demo/original.mp4
-```
+1. run `npm test`, `npm run lint`, and `npm run check`;
+2. do not commit API keys, personal paths, model weights, or `demo/tmp/` artifacts;
+3. update [`docs/CONTRACTS.md`](docs/CONTRACTS.md) when a cross-module interface changes.
 
-低延迟「快速档」（ASR 换 small 模型，实测 e2e **3.0s → 2.4s**，术语准确率略降）：
+Read [`CONTRIBUTING.md`](CONTRIBUTING.md) for code conventions. Report security issues privately as
+described in [`SECURITY.md`](SECURITY.md); do not open a public issue for them.
 
-```bash
-npm run start:fast      # 工作台，等价于 LIVEDUB_PROFILE=fast npm start
-npm run batch:fast      # 成片批处理，输出到 demo-fast/
-```
+If livedub is useful to you, consider leaving a ⭐ — it helps others find the project.
 
-最低延迟「云端档」（ASR 走 MiniMax 云端，**e2e ~2.2–2.4s**；音频会上传，失败自动降级本地）：
+## 📄 License and attribution
 
-```bash
-npm run start:cloud     # 工作台，等价于 LIVEDUB_PROFILE=cloud npm start
-npm run batch:cloud     # 成片批处理，输出到 demo-cloud/
-```
+livedub is licensed under the [MIT License](LICENSE), copyright (c) 2026 livedub contributors. No
+NOTICE file is included. The engine reuses provider credentials from `~/.sayless/config.json`
+read-only; sayless is an independent local voice-engine project and livedub is not affiliated with
+it. Whisper ggml model weights and third-party media are not bundled; the demo media is synthetic.
 
-macOS 桌面悬浮窗（抓系统/应用音频，覆盖 Zoom/腾讯会议/本地播放器）：
+## ⭐ Star history
 
-```bash
-bash scripts/build-macos.sh   # 生成 apps/macos/build/livedub.app
-open apps/macos/build/livedub.app
-# 首次使用在 系统设置 → 隐私与安全 → 屏幕录制 中授权
-```
+<div align="center">
 
-完整实测数字、逐句延迟、模型对比见 [docs/MEASUREMENTS.md](docs/MEASUREMENTS.md)。
+<a href="https://star-history.com/#LeoLin990405/livedub&Date">
+  <img src="https://api.star-history.com/svg?repos=LeoLin990405/livedub&type=Date" alt="Star history" width="640">
+</a>
 
-## 边看边实现 + 学习笔记（v0.4）
-
-看视频 → 跟着敲代码 → 随时记笔记，互不打断：
-
-```bash
-# 1) 工作台里：画中画播放视频 + 右侧「学习笔记」面板（N 新建，插入当前句/截图/代码块，导出 Markdown）
-npm start            # http://127.0.0.1:8787/studio/
-
-# 2) 在 VSCode 里边看边实现：全局快捷键记录「当前这句字幕 + 时间戳」
-#    Chrome 扩展：Alt+Shift+N     macOS App：⌥N
-
-# 3) 终端/快捷键工具：一句话记进笔记库（引擎没启动会自动写本地 Markdown）
-npm run note -- "反向传播 = 链式法则 + 计算图"
-npm run note -- "这里为什么要 detach？" --video "MIT 6.S191" --time 12:34 --tag todo
-```
-
-- 笔记带**视频时间戳**，列表点击直接跳回对应画面；
-- 自动附带**中英双语原句**、可插**视频截图**与**代码块**；
-- **图文笔记（画面理解）**：一键按画面变化抽关键帧 → 本地 OCR 提取幻灯片/代码文字 →（可选）VLM 理解画面 → 和字幕一起生成「音频+画面+总结」的图文笔记；
-- **按章节生成图文笔记**：字幕停顿 + 画面切换自动分章，逐章生成图文笔记，并自动维护一篇「课程总览」；
-- **Obsidian 自动同步**：在 config 配置 vault 目录后，导出 Markdown + 截图资产 + `livedub-notes-index.md`，笔记保存后自动同步；
-- **画面 OCR 辅助翻译**：开启后每 8–10s 把当前画面文字推给引擎，翻译时参考幻灯片术语/公式（默认关闭，仅实时会话）；
-- 一键生成按时间轴的**课程大纲**，导出 Markdown（YAML front matter）到 `data/exports/`，可直接放进 Obsidian；
-- 详细用法与隐私说明：[docs/NOTES.md](docs/NOTES.md)。
-
-| 工作台笔记抽屉（真实会话 + 截图/大纲/快捷摘录） | Markdown 预览 |
-|---|---|
-| ![notes](docs/assets/studio-notes.png) | ![notes-preview](docs/assets/studio-notes-preview.png) |
-
-| 图文笔记（真实 OCR + 真实总结） | 图文预览/画廊（幻灯片截图 + OCR 原文） |
-|---|---|
-| ![visual-notes](docs/assets/studio-visual-note.png) | ![visual-gallery](docs/assets/studio-visual-gallery.png) |
-
-| 章节图文笔记（第 2/2 章） | 课程总览（章节时间锚点） |
-|---|---|
-| ![chapter](docs/assets/studio-chapter-note.png) | ![overview](docs/assets/studio-course-overview.png) |
-
-| Obsidian 自动同步状态（vault + 索引） |
-|---|
-| ![obsidian](docs/assets/studio-obsidian-sync.png) |
-
-### Obsidian 自动同步（可选）
-
-```json
-// config/livedub.config.json
-"notes": {
-  "obsidian": { "enabled": true, "dir": "~/Obsidian/课程笔记", "assetsSubdir": "livedub-assets", "autoExport": true }
-}
-```
-
-配置后重新启动 `npm start`：工作台笔记抽屉会显示「已启用 → 路径 · 最近同步」；生成/编辑笔记后自动导出 Markdown + 截图到 vault，
-并维护 `livedub-notes-index.md`。也可随时点「同步 Obsidian」手动导出。
-
-## 目录结构
-
-```text
-livedub/
-├── engine/                 本地引擎（Node，零依赖）
-│   ├── protocol.mjs        线协议：WS 事件 + 二进制音频帧
-│   ├── config.mjs          配置分层 + 复用 ~/.sayless providers
-│   ├── pipeline.mjs        Session 编排：ASR→翻译→TTS→调度→事件
-│   ├── asr/                流式 ASR（本地 whisper-server / mock）
-│   ├── segmenter.mjs       VAD 切分/滚动 partial
-│   ├── translate/          增量翻译（流式 LLM、术语、上下文、failover）
-│   ├── page/parse.mjs      课程页：标题 / 直接视频 / 带时间轴字幕
-│   ├── subtitles.mjs       SRT / 双语排版 / CPS
-│   ├── tts/                TTS（MiniMax 流式 / macOS say / mock）
-│   ├── voice.mjs           克隆优先 → 自动降级
-│   ├── dub/scheduler.mjs   配音调度（落后加速/丢弃策略）
-│   ├── ws.mjs              极简 RFC6455 服务端
-│   └── server.mjs          HTTP + WS + 静态工作台
-├── studio/                 本地工作台（HTML/JS，零依赖，暗色 UI）
-├── extension/              Chrome MV3 扩展（抓声 + 浮层 + 配音 + 全局限定压音）
-├── apps/macos/             macOS 原生桌面悬浮窗（Swift + ScreenCaptureKit）
-├── scripts/                doctor / batch / make-demo / 图层渲染
-├── tests/                  node:test（含 mock 端到端）
-├── config/                 livedub.config.json + fast/cloud 档位覆盖
-└── docs/                   CONTRACTS / ARCHITECTURE / PROVIDERS / NOTES / DESIGN / ROADMAP / MEASUREMENTS
-```
-
-## 设计要点（为什么能做到「像原声」）
-
-1. **本地 ASR 常驻**：whisper 模型常驻 `whisper-server`，VAD 按句切分 + 滚动 partial，句子结束 0.5–1s 内出最终文本；声音不出本机。
-2. **增量翻译**：每句一拿到就流式翻译，译文 token 边到边推给字幕/配音，不等整段。
-3. **子句级 TTS**：长句按标点/长度切块，第一块译完就开始合成，配音领先整句完成时间出声。
-4. **音色克隆优雅降级**：会话开始收集讲师语音样本 → 尝试克隆 → 失败一次就记住原因并换 preset，不打断会话。
-5. **调度与压音**：配音落后超过阈值时按策略加速（≤1.25x）或丢弃；原声在配音期间自动 duck 到 18%，视觉/听觉都不打架。
-
-更完整的原理、时序和失败模式见 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)；provider 与克隆开通方式见 [docs/PROVIDERS.md](docs/PROVIDERS.md)。
-
-## 隐私
-
-- ASR 默认**完全本地**（whisper），声音不出机器；
-- 翻译/TTS 会把**文本**发给你配置的云服务（deepseek / MiniMax 等），是否使用由你配置决定；
-- 引擎只监听 `127.0.0.1`，默认不落盘音频/转写（`privacy.persistAudio=false`）。
-
-## 已知限制 / 下一步
-
-- 声音克隆需要按量付费 TTS 套餐（见 `docs/PROVIDERS.md`）；当前默认 key 会降级为高质量 preset 音色。
-- 扩展的 `tabCapture` 依赖用户手势，不能全自动启动；受 DRM 保护的页面可能抓不到声音。
-- 默认关闭 ASR partial（会占用 whisper 队列拖慢 final，实测 +0.8s e2e）；想要「字幕边听边长」可在 config 开启 `asr.whisper.partial.enabled`。
-- 实时字幕延迟受翻译/配音网络影响，弱网时建议关配音只用字幕。
-- 计划：桌面悬浮窗（任意播放器/网课客户端）、云端流式 ASR 适配器、幻灯片 OCR 上下文、课程术语自动学习。详见 [docs/ROADMAP.md](docs/ROADMAP.md)。
-
-## 开源
-
-- 许可证：MIT（[LICENSE](LICENSE)）
-- 贡献指南：[CONTRIBUTING.md](CONTRIBUTING.md) · 行为准则：[CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md)
-- 安全报告：[SECURITY.md](SECURITY.md)（请勿公开 Issue）
-- 变更历史：[CHANGELOG.md](CHANGELOG.md) · 路线图：[docs/ROADMAP.md](docs/ROADMAP.md)
-- CI：GitHub Actions（Node 22/24；语法检查 + 离线单测 + 密钥扫描）
-- 运行时**零 npm 依赖**（只用 Node 内置能力），测试用 `node:test`
-
-欢迎 Issue / PR：尤其欢迎新的 TTS/ASR provider 适配器、桌面端（ScreenCaptureKit）实现、
-以及真实课程场景的延迟/质量评测。
-
-## 致谢与许可
-
-- 复用用户已有的 `~/.sayless/config.json` provider 配置（只读）；`sayless` 为本地语音引擎项目，与本项目无隶属关系。
-- MIT License。
+</div>
